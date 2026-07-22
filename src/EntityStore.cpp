@@ -30,6 +30,7 @@
 #include "Transform.hpp"
 #include "WorldServices.hpp"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -40,13 +41,23 @@ constexpr const char* LOG_SUBSYSTEM = "NPC";
 // Default greeting seeded into a spawned NPC's simple dialogue when the record carries no text.
 constexpr const char* DEFAULT_NPC_TEXT = "Hello! How are you today?";
 
-// Monotonic source of per-session NPC instance ids. Gives each NPC a stable identity distinct
-// from its entity handle, so dialogue, editor and console references survive despawn and undo.
-// Single-threaded, because NPCs are only created on the game thread. Never serialized.
+// Session-local NPC ID source; spawn only on the game thread.
 std::uint64_t NextNpcInstanceId()
 {
     static std::uint64_t s_Next = 1;
     return s_Next++;
+}
+
+std::vector<entt::entity> CollectNpcEntities(const entt::registry& world)
+{
+    const auto view = world.view<const NpcTag>();
+    std::vector<entt::entity> entities;
+    entities.reserve(view.size());
+    for (const entt::entity entity : view)
+    {
+        entities.push_back(entity);
+    }
+    return entities;
 }
 }  // namespace
 
@@ -63,7 +74,6 @@ void SetNpcTile(Transform& xf,
     patrol.tileX = tileX;
     patrol.tileY = tileY;
 
-    // Position at bottom-center of tile.
     xf.position.x = tileX * tileSize + tileSize * 0.5f;
     xf.position.y = tileY * tileSize + static_cast<float>(tileSize);
 
@@ -76,11 +86,9 @@ void SetNpcTile(Transform& xf,
     }
 }
 
-ecs::entity SpawnNpc(ecs::registry& world, const NpcRecord& record, IRenderer* uploadVia)
+entt::entity SpawnNpc(entt::registry& world, const NpcRecord& record, IRenderer* uploadVia)
 {
-    // Services come from globals and each lookup tolerates a null, because tests may run
-    // without WorldServices published.
-    const WorldServices* svc = world.globals().find<WorldServices>();
+    const WorldServices* svc = world.ctx().find<WorldServices>();
     TextureStore* textures = (svc != nullptr) ? svc->textures : nullptr;
     DialogueStore* dialogue = (svc != nullptr) ? svc->dialogue : nullptr;
     AssetRegistry* assets = (svc != nullptr) ? svc->assets : nullptr;
@@ -97,7 +105,7 @@ ecs::entity SpawnNpc(ecs::registry& world, const NpcRecord& record, IRenderer* u
         if (!textures->IsValid(sheet))
         {
             Logger::ErrorF(LOG_SUBSYSTEM, "SpawnNpc: failed to load NPC sprite: {}", spritePath);
-            return ecs::entity{};
+            return entt::null;
         }
         accent = textures->SampleAccent(sheet, ambience::DIALOGUE_ACCENT_FALLBACK);
     }
@@ -111,7 +119,7 @@ ecs::entity SpawnNpc(ecs::registry& world, const NpcRecord& record, IRenderer* u
     Transform xf{};
     Patrol patrol{};
     PatrolRoute route{};
-    SetNpcTile(xf, patrol, route, record.tileX, record.tileY, record.tileSize, /*preserve=*/false);
+    SetNpcTile(xf, patrol, route, record.tileX, record.tileY, record.tileSize, false);
 
     Facing facing{};
     facing.dir = record.facing;
@@ -134,18 +142,19 @@ ecs::entity SpawnNpc(ecs::registry& world, const NpcRecord& record, IRenderer* u
     Identity identity;
     identity.instanceId = (record.instanceId != 0) ? record.instanceId : NextNpcInstanceId();
 
-    const ecs::entity e = world.create(std::move(xf),
-                                       Elevation{},
-                                       facing,
-                                       AnimationState{},
-                                       speed,
-                                       identity,
-                                       std::move(sprite),
-                                       std::move(dialogueComp),
-                                       NpcIdle{},
-                                       std::move(patrol),
-                                       std::move(route));
-    world.add<NpcTag>(e);
+    const entt::entity e = world.create();
+    world.emplace<Transform>(e, std::move(xf));
+    world.emplace<Elevation>(e);
+    world.emplace<Facing>(e, facing);
+    world.emplace<AnimationState>(e);
+    world.emplace<Speed>(e, speed);
+    world.emplace<Identity>(e, identity);
+    world.emplace<NpcSprite>(e, std::move(sprite));
+    world.emplace<Dialogue>(e, std::move(dialogueComp));
+    world.emplace<NpcIdle>(e);
+    world.emplace<Patrol>(e, std::move(patrol));
+    world.emplace<PatrolRoute>(e, std::move(route));
+    world.emplace<NpcTag>(e);
 
     if (uploadVia != nullptr && textures != nullptr)
     {
@@ -154,7 +163,7 @@ ecs::entity SpawnNpc(ecs::registry& world, const NpcRecord& record, IRenderer* u
     return e;
 }
 
-NpcRecord SnapshotNpc(const ecs::registry& world, ecs::entity e)
+NpcRecord SnapshotNpc(const entt::registry& world, entt::entity e)
 {
     NpcRecord rec;
     const Dialogue& dialogue = world.get<Dialogue>(e);
@@ -167,14 +176,12 @@ NpcRecord SnapshotNpc(const ecs::registry& world, ecs::entity e)
     rec.text = dialogue.text;
     rec.tileX = patrol.tileX;
     rec.tileY = patrol.tileY;
-    // Hardcoded 16, not read from the project manifest. The snapshot stores only a tile index,
-    // so the round trip is exact on a 16px project. On any other tile size SpawnNpc re-places the
-    // NPC using this stale size and the respawned feet land in the wrong world position.
+    // Snapshot coordinates assume 16 px tiles; another tile size breaks the respawn round trip.
     rec.tileSize = 16;
-    rec.instanceId = identity.instanceId;  // preserve identity across respawn (undo/redo).
+    rec.instanceId = identity.instanceId;
     rec.facing = facing.dir;
 
-    const WorldServices* svc = world.globals().find<WorldServices>();
+    const WorldServices* svc = world.ctx().find<WorldServices>();
     if (svc != nullptr && svc->dialogue != nullptr && svc->dialogue->HasTree(dialogue.tree))
     {
         rec.tree = svc->dialogue->Get(dialogue.tree);
@@ -183,7 +190,7 @@ NpcRecord SnapshotNpc(const ecs::registry& world, ecs::entity e)
     return rec;
 }
 
-ecs::entity SpawnPlayer(ecs::registry& world, glm::vec2 spawnPos)
+entt::entity SpawnPlayer(entt::registry& world, glm::vec2 spawnPos)
 {
     Transform xf{};
     xf.position = spawnPos;
@@ -194,113 +201,110 @@ ecs::entity SpawnPlayer(ecs::registry& world, glm::vec2 spawnPos)
     PlayerMovementState movement{};
     movement.lastSafeTileCenter = spawnPos;
 
-    // No Identity component. The player is referenced only by its m_PlayerEntity handle, never
-    // by a despawn-surviving instanceId the way NPCs are, so the stable-id indirection would be
-    // dead weight here.
-    const ecs::entity e = world.create(std::move(xf),
-                                       Elevation{},
-                                       Facing{},
-                                       AnimationState{},
-                                       speed,
-                                       std::move(appearance),
-                                       PlayerModes{},
-                                       PlayerInputState{},
-                                       std::move(movement),
-                                       Motor{},
-                                       PlayerSprite{},
-                                       Hitbox{});
-    world.add<PlayerTag>(e);
+    const entt::entity e = world.create();
+    world.emplace<Transform>(e, std::move(xf));
+    world.emplace<Elevation>(e);
+    world.emplace<Facing>(e);
+    world.emplace<AnimationState>(e);
+    world.emplace<Speed>(e, speed);
+    world.emplace<Appearance>(e, std::move(appearance));
+    world.emplace<PlayerModes>(e);
+    world.emplace<PlayerInputState>(e);
+    world.emplace<PlayerMovementState>(e, std::move(movement));
+    world.emplace<Motor>(e);
+    world.emplace<PlayerSprite>(e);
+    world.emplace<Hitbox>(e);
+    world.emplace<PlayerTag>(e);
     return e;
 }
 
-void Remove(ecs::registry& world, ecs::entity e)
+void Remove(entt::registry& world, entt::entity e)
 {
-    if (world.alive(e))
+    if (world.valid(e))
     {
         world.destroy(e);
     }
 }
 
-void Clear(ecs::registry& world)
+void Clear(entt::registry& world)
 {
-    // Collect first, then destroy: mutating a pool while iterating it is a fault.
-    const std::vector<ecs::entity> doomed = Entities(world);
-    for (const ecs::entity e : doomed)
+    const std::vector<entt::entity> doomed = CollectNpcEntities(world);
+    for (const entt::entity e : doomed)
     {
         world.destroy(e);
     }
 }
 
-std::size_t Count(ecs::registry& world)
+std::size_t Count(entt::registry& world)
 {
-    return world.view<NpcTag>().count();
+    return world.view<NpcTag>().size();
 }
 
-std::vector<ecs::entity> Entities(ecs::registry& world)
+std::vector<entt::entity> Entities(const entt::registry& world)
 {
-    std::vector<ecs::entity> out;
-    out.reserve(world.view<NpcTag>().count());
-    world.each<NpcTag>([&out](ecs::entity e) { out.push_back(e); });
-    return out;
+    const auto view = world.view<const Identity, const NpcTag>();
+    std::vector<entt::entity> entities;
+    entities.reserve(view.size_hint());
+    for (const entt::entity entity : view)
+    {
+        entities.push_back(entity);
+    }
+    std::ranges::sort(entities,
+                      {},
+                      [&world](const entt::entity entity)
+                      { return world.get<Identity>(entity).instanceId; });
+    return entities;
 }
 
-ecs::entity FindById(ecs::registry& world, std::uint64_t instanceId)
+entt::entity FindById(entt::registry& world, std::uint64_t instanceId)
 {
     if (instanceId == 0)
     {
-        return ecs::entity{};
+        return entt::null;
     }
-    ecs::entity found{};
-    world.each<const Identity, const NpcTag>(
-        [&](ecs::entity e, const Identity& id)
+    for (auto [entity, identity] : world.view<const Identity, const NpcTag>().each())
+    {
+        if (identity.instanceId == instanceId)
         {
-            if (id.instanceId == instanceId)
-            {
-                found = e;
-                return false;  // instanceId is unique: stop at the first match.
-            }
-            return true;
-        });
-    return found;
+            return entity;
+        }
+    }
+    return entt::null;
 }
 
-ecs::entity FindById(const ecs::registry& world, std::uint64_t instanceId)
+entt::entity FindById(const entt::registry& world, std::uint64_t instanceId)
 {
     if (instanceId == 0)
     {
-        return ecs::entity{};
+        return entt::null;
     }
-    ecs::entity found{};
-    world.each<const Identity, const NpcTag>(
-        [&](ecs::entity e, const Identity& id)
+    for (auto [entity, identity] : world.view<const Identity, const NpcTag>().each())
+    {
+        if (identity.instanceId == instanceId)
         {
-            if (id.instanceId == instanceId)
-            {
-                found = e;
-                return false;  // instanceId is unique: stop at the first match.
-            }
-            return true;
-        });
-    return found;
+            return entity;
+        }
+    }
+    return entt::null;
 }
 }  // namespace EntityStore
 
-void BuildNpcFeet(ecs::registry& world, std::vector<glm::vec2>& out)
+void BuildNpcFeet(entt::registry& world, std::vector<glm::vec2>& out)
 {
     out.clear();
-    out.reserve(world.view<NpcTag>().count());
-    world.each<const Transform, const NpcTag>([&out](const Transform& xf)
-                                              { out.push_back(xf.position); });
+    out.reserve(world.view<NpcTag>().size());
+    world.view<const Transform, const NpcTag>().each([&out](const Transform& transform)
+                                                     { out.push_back(transform.position); });
 }
 
-void BuildNpcCollisionBodies(ecs::registry& world, std::vector<CharacterCollisionBody>& out)
+void BuildNpcCollisionBodies(entt::registry& world, std::vector<CharacterCollisionBody>& out)
 {
     out.clear();
-    out.reserve(world.view<NpcTag>().count());
-    world.each<const Transform, const Elevation, const NpcTag>(
-        [&out](const Transform& xf, const Elevation& elevation)
+    out.reserve(world.view<NpcTag>().size());
+    world.view<const Transform, const Elevation, const NpcTag>().each(
+        [&out](const Transform& transform, const Elevation& elevation)
         {
             out.push_back(
-                CharacterCollisionBody{xf.position, {elevation.surface, elevation.plane}});
+                CharacterCollisionBody{transform.position, {elevation.surface, elevation.plane}});
         });
 }
