@@ -3,7 +3,7 @@
 #include "Billboard.hpp"
 #include "CharacterDirection.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <glm/glm.hpp>
 
@@ -18,80 +18,57 @@ struct AnimationState;
 struct NpcSprite;
 
 /**
- * @brief Free-function NPC sprite rendering over granular components.
- * @author Alex (https://github.com/lextpf)
+ * @brief NPC rendering resolves TextureStore through WorldServices; absent services yield an empty
+ * texture.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * The half-draw mechanics behind the Y-sort pass: sheet resolution, sprite-cell
- * lookup, and the top/bottom half draws. They operate purely on the granular
- * components (read by reference) plus the @c TextureStore resolved from
- * @c world.globals().find<WorldServices>(), so the Y-sort render pass can draw
- * an NPC from its entity handle without any NPC object. Both the bundle and its
- * @c textures pointer are nullable; a world that publishes neither resolves to a
- * shared empty texture instead of failing. Renderer-touching but only via
- * @ref IRenderer, so it links into the test library.
+ * The Y-sort pass supplies granular components from one entity. Helpers resolve a sheet and cell,
+ * then submit through IRenderer without retaining entity or texture references across frames.
  */
 namespace NpcRender
 {
 /**
- * @brief Sprite-sheet cell origin (pixels) for a frame + facing (NPC row map).
+ * @fn glm::vec2 SpriteCoords(int frame, CharacterDirection dir)
+ * @brief Cell origin in pixels, with rows counted from the flipped texture bottom.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Column is `frame % CharacterConstants::WALK_FRAME_COUNT`; the row comes
- * straight from the facing via the sheet's own order, RIGHT=0, LEFT=1, DOWN=2,
- * UP=3, counted upward from the bottom of the stbi-flipped texture. Unrecognised
- * facings fall back to DOWN.
+ * Rows are RIGHT=0, LEFT=1, DOWN=2, UP=3; unknown directions use DOWN.
+ * Frame wraps to WALK_FRAME_COUNT. Pass flipY = false to CharacterRender.
  *
- * There is deliberately no `requiresYFlip` parameter here, unlike
- * @ref PlayerRender::SpriteCoords - that order is the flipped order, so there is
- * nothing left to permute. PlayerRender needs the flag only because it starts
- * from a logical order ({DOWN, UP, LEFT, RIGHT}) and remaps into this same
- * physical layout. Callers pass the result to CharacterRender with
- * `flipY = false` either way.
- *
- * @param frame Animation frame; wrapped to the walk frame count.
- * @param dir   Facing direction.
- * @return Cell origin in pixels, Y counted as GL rows from the texture bottom.
+ * The sheet rows already use the flipped artwork order, so there is no requiresYFlip remapping
+ * step here. PlayerRender starts from a different logical direction order.
  */
 glm::vec2 SpriteCoords(int frame, CharacterDirection dir);
 
 /**
- * @brief Select the draw sheet (shared tile atlas when bound, else the per-NPC
- * sheet from the TextureStore in globals) and, when atlas-bound, fold the atlas
- * offset into @p spriteCoords.
+ * @fn const Texture& ResolveRenderSheet(const entt::registry& world, const NpcSprite& sprite, \
+ * glm::vec2& spriteCoords)
+ * @brief Borrow the atlas or NPC sheet for this draw only.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @warning The returned reference is a non-owning borrow, valid for the current
- * draw only: an atlas re-pack or a map reload replaces the target's contents.
- *
- * @return The shared atlas when @c sprite.atlas is bound; otherwise the per-NPC
- *         sheet from the TextureStore in globals; or a shared empty texture when
- *         no store is published - the NPC then draws nothing.
+ * Add the atlas pixel offset to spriteCoords when bound. Missing TextureStore returns
+ * an empty texture. Atlas repacks and map reloads invalidate the borrowed contents.
  */
-const Texture& ResolveRenderSheet(const ecs::registry& world,
+const Texture& ResolveRenderSheet(const entt::registry& world,
                                   const NpcSprite& sprite,
                                   glm::vec2& spriteCoords);
 
 /**
- * @brief Draw the top or bottom half of an NPC sprite for the Y-sort pass.
+ * @fn void DrawHalf(const entt::registry& world, IRenderer& renderer, glm::vec2 cameraPos, bool \
+ * topHalf, const Transform& xf, const Elevation& elev, const Facing& facing, const \
+ * AnimationState& anim, const NpcSprite& sprite)
+ * @brief Draw the selected half of a character in the flat view.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Reads the five render components; resolves sheet + UVs; defers projection and
- * the sprite-region draw to @ref CharacterRender.
+ * Submit both halves consecutively from one render-list entry to prevent interleaved tiles.
+ * `cameraPos` is the viewport top-left in world pixels. `topHalf` selects the upper screen
+ * band. Only elev.offset supplies visual height.
  *
- * @note Submit both halves back-to-back from one render-list entry (see
- * RenderDrawable.cpp). Split across two entries, a tile can sort between the
- * feet and the head.
- *
- * @param world     Registry the sheet / atlas is resolved from.
- * @param renderer  Backend the sprite is submitted to.
- * @param cameraPos Viewport top-left corner in world pixels, not the camera
- *                  centre.
- * @param topHalf   True draws the upper screen band, false the lower one.
- * @param xf        Transform supplying the feet position.
- * @param elev      Elevation; only the cosmetic @c offset lifts the sprite.
- * @param facing    Facing direction, selecting the sheet row.
- * @param anim      Animation state, selecting the walk frame.
- * @param sprite    Per-NPC sprite sheet and atlas offset.
+ * xf.position is the feet anchor. facing selects the sheet row and anim selects the walk frame;
+ * CharacterRender applies projection and half selection.
  */
-void DrawHalf(const ecs::registry& world,
+void DrawHalf(const entt::registry& world,
               IRenderer& renderer,
               glm::vec2 cameraPos,
               bool topHalf,
@@ -102,23 +79,16 @@ void DrawHalf(const ecs::registry& world,
               const NpcSprite& sprite);
 
 /**
- * @brief Draw an NPC as a world-space billboard.
+ * @fn void Draw3D(const entt::registry& world, IRenderer& renderer, const \
+ * billboard::Orientation& orientation, const Transform& xf, const Elevation& elev, const Facing& \
+ * facing, const AnimationState& anim, const NpcSprite& sprite)
+ * @brief Draw one world-space billboard from the feet anchor.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * The 3D counterpart to @ref DrawHalf; one call rather than two, because the
- * depth buffer removes the reason for the top/bottom split (see
- * @ref CharacterRender::DrawBillboard).
- *
- * @param world       Registry the sprite sheet / atlas is resolved from.
- * @param renderer    Backend the quad is submitted to.
- * @param orientation Damped billboard orientation for the Character role.
- * @param xf          Transform supplying the feet position.
- * @param elev        Elevation; only the cosmetic @c offset is used as height,
- *                    never the plane index.
- * @param facing      Facing direction, selecting the sheet row.
- * @param anim        Animation state, selecting the walk frame.
- * @param sprite      Per-NPC sprite sheet and atlas offset.
+ * Use elev.offset for visual height and the damped Character-role orientation. Depth testing
+ * replaces the flat top/bottom split; facing and animation select the same sheet cell as DrawHalf.
  */
-void Draw3D(const ecs::registry& world,
+void Draw3D(const entt::registry& world,
             IRenderer& renderer,
             const billboard::Orientation& orientation,
             const Transform& xf,
@@ -129,22 +99,17 @@ void Draw3D(const ecs::registry& world,
 }  // namespace NpcRender
 
 /**
- * @brief Pure string utility: the NPC type identifier from a sprite path.
- * @author Alex (https://github.com/lextpf)
+ * @brief NPC type names derived from sprite filenames.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Entities
- *
- * Filename without the @c .png extension. Carries no asset-table state of its
- * own; resolution lives in @ref AssetRegistry.
  */
 namespace NpcType
 {
 /**
- * @brief NPC type identifier for a sprite path.
- *
- * @param path Sprite path, with forward or back slashes.
- * @return The filename with any directory prefix dropped and a trailing `.png`
- *         removed case-insensitively. Any other name is returned unchanged,
- *         including one with a different extension and the bare name `.png`.
+ * @fn std::string FromSpritePath(const std::string& path)
+ * @brief Strip either directory separator and a case-insensitive .png suffix; keep other suffixes
+ * and bare .png.
+ * @author Alex (<https://github.com/lextpf>)
  */
 std::string FromSpritePath(const std::string& path);
 }  // namespace NpcType
