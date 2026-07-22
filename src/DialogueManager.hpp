@@ -2,45 +2,35 @@
 
 #include "DialogueTypes.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <string>
 #include <vector>
 
-// Forward declarations
 class GameStateManager;
 
 /**
  * @class DialogueManager
- * @brief Runtime dialogue controller for NPC conversations.
- * @author Alex (https://github.com/lextpf)
+ * @brief Dialogue state, option filtering and consequences.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Dialogue
  *
- * DialogueManager orchestrates dialogue interactions between the player
- * and NPCs. It maintains conversation state, filters available options based
- * on game conditions, and executes consequences when choices are made.
- * Dialogue trees are owned centrally by the @ref DialogueStore in the registry's
- * globals; @ref StartDialogue resolves the NPC's @ref DialogueHandle through it and
- * copies the tree into @c m_ActiveTree for the duration of the conversation.
+ * Copies the NPC tree from DialogueStore for the conversation. Removing or changing the
+ * NPC does not update this copy. Call from the main thread.
  *
- * @par Key responsibilities
- * - Managing active conversation state (current tree, node, options)
- * - Evaluating conditions to filter visible options
- * - Executing consequences (flag changes)
- * - Providing UI state for rendering (selected option, visible choices)
+ * Visible options are cached on node entry. External flag changes do not refresh an
+ * open node, and confirming a cached option does not evaluate its conditions again.
  *
- * @par Conversation flow
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * stateDiagram-v2
  *     classDef idle fill:#1e3a5f,stroke:#3b82f6,color:#e2e8f0
  *     classDef active fill:#134e3a,stroke:#10b981,color:#e2e8f0
  *     classDef done fill:#4a2020,stroke:#ef4444,color:#e2e8f0
  *
  *     state "Idle" as Idle:::idle
- *     state "Showing Node" as Show:::active
- *     state "Awaiting Input" as Wait:::active
- *     state "Executing Consequences" as Exec:::active
+ *     state "Showing node" as Show:::active
+ *     state "Awaiting input" as Wait:::active
+ *     state "Executing consequences" as Exec:::active
  *     state "Ended" as Done:::done
  *
  *     [*] --> Idle
@@ -55,10 +45,8 @@ class GameStateManager;
  *     Show --> Done: EndDialogue
  *     Wait --> Done: EndDialogue
  *     Done --> Idle
- * </pre>
- * @endhtmlonly
+ * ```
  *
- * @par Usage example
  * @code{.cpp}
  * DialogueManager d;
  * d.Initialize(&stateManager);
@@ -84,105 +72,55 @@ class GameStateManager;
  *     }
  * }
  * @endcode
- *
- * @par Thread safety
- * Not thread-safe. Call every method from
- * the main game thread.
- *
- * @see DialogueTree, DialogueNode, DialogueOption
- * @see GameStateManager for flag storage
  */
 class DialogueManager
 {
 public:
-    /**
-     * @brief Default constructor.
-     *
-     * Creates an inactive dialogue manager. Call Initialize() before use.
-     */
     DialogueManager();
 
     /**
-     * @brief Initialize with references to game systems.
+     * @fn void DialogueManager::Initialize(GameStateManager* stateManager)
+     * @brief Borrows the flag store; it must outlive this manager.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Must be called before using any other DialogueManager methods.
-     * The manager stores non-owning pointers to these systems for
-     * condition evaluation and consequence execution.
-     *
-     * @param stateManager Non-owning pointer to the game state manager used for flag
-     *                     evaluation. Must outlive this manager; if it is null,
-     *                     @ref StartDialogue refuses to start a conversation.
+     * A null store prevents StartDialogue and makes consequence execution a no-op.
      */
     void Initialize(GameStateManager* stateManager);
 
     /**
-     * @name Dialogue flow control
-     * @brief Methods for starting, advancing, and ending conversations.
-     * @{
+     * @fn bool DialogueManager::StartDialogue(entt::entity npc, const entt::registry& world)
+     * @brief Copies the NPC tree and enters its start node.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * Returns false if a conversation is active, the flag store is null, the NPC is invalid,
+     * or its Dialogue handle does not resolve to a nonempty tree with a start node.
+     * Active-dialogue and missing-start failures are logged. World is not retained.
      */
+    bool StartDialogue(entt::entity npc, const entt::registry& world);
 
     /**
-     * @brief Start dialogue with an NPC using their assigned tree.
-     *
-     * Resolves @p npc 's @c Dialogue component and its @ref DialogueHandle through the
-     * @ref DialogueStore published in @p world 's globals, then copies that tree into
-     * @c m_ActiveTree and enters the tree's start node. The copy is what lets the node
-     * and option pointers stay valid if the NPC is despawned mid-conversation.
-     *
-     * @param npc   Entity handle (a value, not a pointer) of the NPC to converse with.
-     * @param world Registry the handle belongs to. Required: it is used to liveness-
-     *              check @p npc, to fetch the @c Dialogue component, and to reach the
-     *              @ref DialogueStore in @c globals(). Not retained.
-     * @return True if dialogue started successfully; false on any failed
-     *         prerequisite (all of which are silent except the two logged below).
-     *
-     * @par Prerequisites
-     * - No dialogue currently active (logs an error and fails)
-     * - @p npc alive in @p world, and @ref Initialize already called
-     * - @p npc has a @c Dialogue component whose handle resolves to a non-empty tree
-     * - that tree has a start node (logs an error and fails)
-     */
-    bool StartDialogue(ecs::entity npc, const ecs::registry& world);
-
-    /**
-     * @brief End the current dialogue.
-     *
-     * Immediately terminates the conversation, resetting all
-     * dialogue state. Safe to call even if no dialogue is active.
+     * @fn void DialogueManager::EndDialogue()
+     * @brief Clears conversation state; safe while inactive.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void EndDialogue();
 
-    /// @}
-
-    /**
-     * @name Selection and state queries
-     * @brief Methods for reading dialogue state and for moving the option cursor.
-     * @{
-     */
-
-    /**
-     * @brief Check if dialogue is currently active.
-     *
-     * @return True if a conversation is in progress
-     */
     [[nodiscard]] bool IsActive() const { return m_Active; }
 
     /**
-     * @brief Get the current dialogue node.
-     *
-     * @return Pointer to current node, or nullptr if inactive
+     * @fn const DialogueNode* DialogueManager::GetCurrentNode() const
+     * @brief Returns nullptr while inactive.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] const DialogueNode* GetCurrentNode() const { return m_CurrentNode; }
 
     /**
-     * @brief Get visible options (filtered by conditions).
+     * @fn const std::vector<const DialogueOption*>& DialogueManager::GetVisibleOptions() const
+     * @brief Read the options admitted when the current node was entered.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Returns only the options whose conditions are currently met.
-     * This list is refreshed whenever the current node changes. Pointers
-     * remain valid until the next refresh because the dialogue tree is
-     * stored locally while a conversation is active.
-     *
-     * @return Vector of pointers to visible options
+     * The vector is borrowed and is rebuilt on node changes. Its pointers refer to the
+     * manager's active tree. EndDialogue or a new conversation invalidates those pointers.
      */
     [[nodiscard]] const std::vector<const DialogueOption*>& GetVisibleOptions() const
     {
@@ -190,39 +128,46 @@ public:
     }
 
     /**
-     * @brief Get currently selected option index.
-     *
-     * @return Index of highlighted option (0-based)
+     * @fn int DialogueManager::GetSelectedOptionIndex() const
+     * @brief Zero-based index into the visible options.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] int GetSelectedOptionIndex() const { return m_SelectedOption; }
 
     /**
+     * @fn void DialogueManager::SelectPrevious()
      * @brief Move selection up (previous option).
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Wraps around to last option if at the top.
      */
     void SelectPrevious();
 
     /**
+     * @fn void DialogueManager::SelectNext()
      * @brief Move selection down (next option).
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Wraps around to first option if at the bottom.
      */
     void SelectNext();
 
     /**
-     * @brief Confirm current selection.
+     * @fn void DialogueManager::ConfirmSelection()
+     * @brief Apply the selected option and enter its target node.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Executes the selected option's consequences and transitions
-     * to the next node. Ends dialogue if no options available.
+     * Consequences run in order before resolving the target. An empty or unknown target
+     * ends the conversation; an unknown target logs an error. Applied flag changes remain.
+     * With no visible options, the conversation ends without running consequences.
      */
     void ConfirmSelection();
 
-    /// @}
-
 private:
     /**
+     * @fn void DialogueManager::SelectOption(int optionIndex)
      * @brief Select a dialogue option by index.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Triggers the selected option's consequences and transitions
      * to the next node. If the option's nextNodeId is empty,
@@ -233,7 +178,10 @@ private:
     void SelectOption(int optionIndex);
 
     /**
+     * @fn void DialogueManager::ExecuteConsequences(const std::vector<DialogueConsequence>& \
+     *     consequences)
      * @brief Execute consequences for a selected option.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Processes each consequence in order, modifying game state flags.
      *
@@ -242,7 +190,9 @@ private:
     void ExecuteConsequences(const std::vector<DialogueConsequence>& consequences);
 
     /**
+     * @fn void DialogueManager::RefreshVisibleOptions()
      * @brief Refresh the visible options list based on current conditions.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Evaluates each option's conditions against the current game state
      * and populates m_VisibleOptions with those that pass all checks.
@@ -250,45 +200,27 @@ private:
     void RefreshVisibleOptions();
 
     /**
-     * @brief Transition to a specific node.
+     * @fn void DialogueManager::TransitionToNode(const std::string& nodeId)
+     * @brief Enters a node and resets selection to zero.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * An empty @p nodeId ends the dialogue, and so does a null current tree. A
-     * non-empty id that the active tree does not contain is not a no-op: it logs an
-     * error and ends the dialogue as well.
-     *
-     * @param nodeId ID of node to transition to (empty string ends dialogue)
-     *
-     * @post On success the selection resets to index 0 and the visible-option list
-     *       is rebuilt.
+     * Rebuilds visible options on success. An empty ID or missing tree ends the dialogue;
+     * an unknown nonempty ID also ends it and logs an error.
      */
     void TransitionToNode(const std::string& nodeId);
 
-    /// @name Game system references
-    /// @{
-
-    /// Non-owning flag store set by @ref Initialize; must outlive this manager. Null
-    /// blocks @ref StartDialogue and makes consequence execution a no-op.
+    /**
+     * @brief Non-owning flag store set by Initialize; must outlive this manager. Null
+     * blocks `StartDialogue` and makes consequence execution a no-op.
+     */
     GameStateManager* m_StateManager = nullptr;
 
-    /// @}
-
-    /// @name Active dialogue state
-    /// @{
-
     DialogueTree
-        m_ActiveTree;       ///< Owned copy of active dialogue tree (avoids dangling NPC pointers).
-    bool m_Active = false;  ///< True while a conversation is in progress.
-    const DialogueTree* m_CurrentTree = nullptr;  ///< Points into m_ActiveTree.
-    const DialogueNode* m_CurrentNode = nullptr;  ///< Current node being displayed.
+        m_ActiveTree;  ///< Owned copy of active dialogue tree (avoids dangling NPC pointers).
+    bool m_Active = false;
+    const DialogueTree* m_CurrentTree = nullptr;
+    const DialogueNode* m_CurrentNode = nullptr;
 
-    /// @}
-
-    /// @name UI state
-    /// @{
-
-    std::vector<const DialogueOption*>
-        m_VisibleOptions;      ///< Pointers into m_ActiveTree nodes; rebuilt on node change.
+    std::vector<const DialogueOption*> m_VisibleOptions;
     int m_SelectedOption = 0;  ///< Index of highlighted option in m_VisibleOptions.
-
-    /// @}
 };
