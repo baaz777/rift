@@ -1,6 +1,4 @@
-// Tests for the free-function command implementations. Each command is
-// invoked through CommandContext with hand-built dependency references, so
-// the tests never need a Game instance. No GLFW or renderer involvement.
+// each CommandContext contains only the services needed by that handler.
 
 #include <gtest/gtest.h>
 
@@ -28,7 +26,7 @@
 #include "../src/Transform.hpp"
 #include "../src/WorldServices.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <string>
 #include <string_view>
@@ -36,8 +34,7 @@
 
 namespace
 {
-// Build a span<string_view> from string literals, keeping the underlying
-// strings alive in `storage` so the views remain valid for the call.
+// storage keeps the argument strings alive for the span.
 struct ArgPack
 {
     std::vector<std::string> storage;
@@ -63,7 +60,6 @@ struct ArgPack
     }
 };
 
-// True if any line in the buffer contains `needle`.
 bool BufferContains(const ConsoleBuffer& buf, std::string_view needle)
 {
     for (const auto& line : buf.Lines())
@@ -76,11 +72,9 @@ bool BufferContains(const ConsoleBuffer& buf, std::string_view needle)
     return false;
 }
 
-// Spawn `n` default NPCs into `world` (the ctx.npcs registry). The npc.*
-// commands address NPCs by index in registry dense order; NpcAt resolves
-// such an index to its entity the same way the commands do. No WorldServices
-// are published, so the NPCs have no sprite - fine for the component reads here.
-void SpawnNpcs(ecs::registry& world, int n)
+// commands address NPCs in Identity order. no WorldServices are published, so
+// these entities have no sprite.
+void SpawnNpcs(entt::registry& world, int n)
 {
     for (int i = 0; i < n; ++i)
     {
@@ -88,15 +82,11 @@ void SpawnNpcs(ecs::registry& world, int n)
     }
 }
 
-ecs::entity NpcAt(ecs::registry& world, std::size_t index)
+entt::entity NpcAt(entt::registry& world, std::size_t index)
 {
     return EntityStore::Entities(world)[index];
 }
 }  // namespace
-
-// ---------------------------------------------------------------------------
-// help
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, HelpListsRegisteredCommands)
 {
@@ -124,10 +114,6 @@ TEST(ConsoleCommandsTests, HelpFailsWithoutRegistry)
     EXPECT_FALSE(Cmd_Help(args.span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// clear
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, ClearEmptiesScrollback)
 {
     ConsoleBuffer buf;
@@ -139,14 +125,10 @@ TEST(ConsoleCommandsTests, ClearEmptiesScrollback)
     EXPECT_TRUE(buf.Lines().empty());
 }
 
-// ---------------------------------------------------------------------------
-// teleport
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TeleportUpdatesPlayerTilePosition)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -163,20 +145,19 @@ TEST(ConsoleCommandsTests, TeleportUpdatesPlayerTilePosition)
 
 TEST(ConsoleCommandsTests, TeleportRejectsBadArgs)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     const glm::vec2 before = world.get<Transform>(player).position;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
     ctx.playerEntity = player;
 
-    // Wrong arg count
     {
         ArgPack args({"5"});
         EXPECT_FALSE(Cmd_Teleport(args.span(), ctx));
     }
-    // Non-numeric
+
     {
         ArgPack args({"foo", "bar"});
         EXPECT_FALSE(Cmd_Teleport(args.span(), ctx));
@@ -191,10 +172,6 @@ TEST(ConsoleCommandsTests, TeleportFailsWithoutPlayer)
     ArgPack args({"1", "2"});
     EXPECT_FALSE(Cmd_Teleport(args.span(), ctx));
 }
-
-// ---------------------------------------------------------------------------
-// flag.set / flag.get
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, FlagSetGetRoundtrip)
 {
@@ -239,10 +216,6 @@ TEST(ConsoleCommandsTests, FlagSetWrongArityRejected)
     EXPECT_FALSE(state.HasFlag("only_name"));
 }
 
-// ---------------------------------------------------------------------------
-// time.set
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TimeSetUpdatesTimeOfDay)
 {
     TimeManager time;
@@ -266,18 +239,10 @@ TEST(ConsoleCommandsTests, TimeSetRejectsNonNumeric)
     EXPECT_FALSE(Cmd_TimeSet(args.span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// state.dump (read-only summary)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// noclip
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, NoClipDefaultArgTogglesState)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ASSERT_FALSE(world.get<PlayerModes>(player).noClip);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -294,8 +259,8 @@ TEST(ConsoleCommandsTests, NoClipDefaultArgTogglesState)
 
 TEST(ConsoleCommandsTests, NoClipExplicitOnOff)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -312,8 +277,8 @@ TEST(ConsoleCommandsTests, NoClipExplicitOnOff)
 
 TEST(ConsoleCommandsTests, NoClipRejectsBadArg)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -324,14 +289,10 @@ TEST(ConsoleCommandsTests, NoClipRejectsBadArg)
     EXPECT_FALSE(world.get<PlayerModes>(player).noClip);
 }
 
-// ---------------------------------------------------------------------------
-// player.speed
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, PlayerSpeedSetsMultiplier)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ASSERT_FLOAT_EQ(world.get<PlayerModes>(player).speedMultiplier, 1.0f);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -346,8 +307,8 @@ TEST(ConsoleCommandsTests, PlayerSpeedSetsMultiplier)
 
 TEST(ConsoleCommandsTests, PlayerSpeedNoArgPrintsCurrentWithoutMutating)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     world.get<PlayerModes>(player).speedMultiplier = 1.5f;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -362,8 +323,8 @@ TEST(ConsoleCommandsTests, PlayerSpeedNoArgPrintsCurrentWithoutMutating)
 
 TEST(ConsoleCommandsTests, PlayerSpeedRejectsNonPositive)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     world.get<PlayerModes>(player).speedMultiplier = 2.0f;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -383,8 +344,8 @@ TEST(ConsoleCommandsTests, PlayerSpeedRejectsNonPositive)
 
 TEST(ConsoleCommandsTests, PlayerSpeedRejectsBadFloat)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -397,8 +358,8 @@ TEST(ConsoleCommandsTests, PlayerSpeedRejectsBadFloat)
 
 TEST(ConsoleCommandsTests, PlayerSpeedRejectsTooManyArgs)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -415,10 +376,6 @@ TEST(ConsoleCommandsTests, PlayerSpeedFailsWithoutPlayer)
     ArgPack args({"2.0"});
     EXPECT_FALSE(Cmd_PlayerSpeed(args.span(), ctx));
 }
-
-// ---------------------------------------------------------------------------
-// time.freeze
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, TimeFreezeTogglesByDefault)
 {
@@ -473,8 +430,8 @@ TEST(ConsoleCommandsTests, TimeFreezeFailsWithoutTime)
 
 TEST(ConsoleCommandsTests, StateDumpPrintsSummary)
 {
-    ecs::registry npcs;  // empty is fine for the dump
-    ecs::entity player = EntityStore::SpawnPlayer(npcs);
+    entt::registry npcs;  // empty is fine for the dump
+    entt::entity player = EntityStore::SpawnPlayer(npcs);
     PlayerSystem::SetTilePosition(npcs, player, 3, 4);
     GameStateManager state;
     state.SetFlag("done", true);
@@ -494,10 +451,6 @@ TEST(ConsoleCommandsTests, StateDumpPrintsSummary)
     EXPECT_TRUE(BufferContains(buf, "time"));
     EXPECT_TRUE(BufferContains(buf, "npcs"));
 }
-
-// ---------------------------------------------------------------------------
-// editor [on|off|toggle]
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, EditorEmptyArgTogglesActive)
 {
@@ -553,10 +506,6 @@ TEST(ConsoleCommandsTests, EditorFailsWithoutEditorRef)
     EXPECT_FALSE(Cmd_Editor(ArgPack({}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// debug.info / debug.overlays
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, DebugInfoToggle)
 {
     Editor editor;
@@ -592,10 +541,6 @@ TEST(ConsoleCommandsTests, DebugOverlaysMirrorsAnchorVisibility)
     EXPECT_FALSE(editor.IsShowNoProjectionAnchors());
 }
 
-// ---------------------------------------------------------------------------
-// time.next
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TimeNextAdvancesThroughPresets)
 {
     TimeManager time;
@@ -603,9 +548,7 @@ TEST(ConsoleCommandsTests, TimeNextAdvancesThroughPresets)
     CommandContext ctx{buf};
     ctx.time = &time;
 
-    // Function-local static persists across tests; roll until we land on a
-    // known phase by looking at the printed name, then advance one and verify
-    // the next preset matches the documented cycle.
+    // the function-local phase persists across tests; find it from the printed name.
     std::vector<std::string_view> presets = {"Dawn (06:00)",
                                              "Morning (08:30)",
                                              "Midday (13:00)",
@@ -614,9 +557,7 @@ TEST(ConsoleCommandsTests, TimeNextAdvancesThroughPresets)
                                              "Evening (21:00)",
                                              "Night (01:00)",
                                              "Late Night (04:30)"};
-    // Advance up to 8 times, recording the phase at each step. The cycle is
-    // periodic with period 8, so within 9 calls we always see at least one
-    // wrap and can verify the consecutive-pair invariant.
+    // the cycle has eight phases; nine calls include a wrap and all adjacent pairs.
     std::vector<size_t> seen;
     for (int i = 0; i < 9; ++i)
     {
@@ -682,15 +623,12 @@ TEST(ConsoleCommandsTests, TimeAddRejectsInvalidInputs)
     EXPECT_TRUE(BufferContains(buf, "time.add: hours must be a finite number"));
 }
 
-// ---------------------------------------------------------------------------
-// character.set / character.next (parse paths only - sprite assets may be
-// missing in the test working dir, so SwitchCharacter success is best-effort)
-// ---------------------------------------------------------------------------
+// sprite assets may be absent here; these cases check character command parsing.
 
 TEST(ConsoleCommandsTests, CharacterSetUnknownNameRejected)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -703,8 +641,8 @@ TEST(ConsoleCommandsTests, CharacterSetUnknownNameRejected)
 
 TEST(ConsoleCommandsTests, CharacterNextRejectsArgs)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -712,10 +650,7 @@ TEST(ConsoleCommandsTests, CharacterNextRejectsArgs)
     EXPECT_FALSE(Cmd_CharacterNext(ArgPack({"foo"}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// appearance.copy / appearance.restore (failure paths only - success path
-// requires a live IRenderer for UploadTextures and is integration-only)
-// ---------------------------------------------------------------------------
+// appearance success paths upload textures and need a live renderer.
 
 TEST(ConsoleCommandsTests, AppearanceCopyFailsWithoutRefs)
 {
@@ -730,10 +665,6 @@ TEST(ConsoleCommandsTests, AppearanceRestoreFailsWithoutRefs)
     CommandContext ctx{buf};
     EXPECT_FALSE(Cmd_AppearanceRestore(ArgPack({}).span(), ctx));
 }
-
-// ---------------------------------------------------------------------------
-// postfx [on|off|toggle]
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, PostFXTogglesViaPointer)
 {
@@ -762,14 +693,10 @@ TEST(ConsoleCommandsTests, PostFXFailsWithoutPointer)
     EXPECT_FALSE(Cmd_PostFX(ArgPack({}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// player.pos / player.bicycle / player.run
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, PlayerPosPrintsTileWorldFacing)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     PlayerSystem::SetTilePosition(world, player, 3, 4);
     world.get<Facing>(player).dir = CharacterDirection::LEFT;
     ConsoleBuffer buf;
@@ -789,8 +716,8 @@ TEST(ConsoleCommandsTests, PlayerPosFailsWithoutPlayerOrExtraArgs)
         CommandContext ctx{buf};
         EXPECT_FALSE(Cmd_PlayerPos(ArgPack({}).span(), ctx));
     }
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -800,8 +727,8 @@ TEST(ConsoleCommandsTests, PlayerPosFailsWithoutPlayerOrExtraArgs)
 
 TEST(ConsoleCommandsTests, PlayerBicycleToggle)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ASSERT_FALSE(world.get<PlayerModes>(player).isBicycling);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -817,8 +744,8 @@ TEST(ConsoleCommandsTests, PlayerBicycleToggle)
 
 TEST(ConsoleCommandsTests, PlayerRunToggle)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ASSERT_FALSE(world.get<PlayerModes>(player).isRunning);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -838,16 +765,10 @@ TEST(ConsoleCommandsTests, PlayerRunFailsWithoutPlayer)
     EXPECT_FALSE(Cmd_PlayerRun(ArgPack({"on"}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// move.accel / move.decel / move.lookahead / move.dump
-// (accel/decel write the player Motor's MotorParams; lookahead drives the
-// CameraController. No-arg prints current; out-of-range/garbage is rejected.)
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, MoveAccelNoArgPrintsDefaultWithoutMutating)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -860,8 +781,8 @@ TEST(ConsoleCommandsTests, MoveAccelNoArgPrintsDefaultWithoutMutating)
 
 TEST(ConsoleCommandsTests, MoveAccelSetsParam)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -874,8 +795,8 @@ TEST(ConsoleCommandsTests, MoveAccelSetsParam)
 
 TEST(ConsoleCommandsTests, MoveAccelRejectsNonPositiveAndBadArgs)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -897,8 +818,8 @@ TEST(ConsoleCommandsTests, MoveAccelFailsWithoutPlayer)
 
 TEST(ConsoleCommandsTests, MoveDecelNoArgPrintsThenSets)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -914,8 +835,8 @@ TEST(ConsoleCommandsTests, MoveDecelNoArgPrintsThenSets)
 
 TEST(ConsoleCommandsTests, MoveDecelRejectsNonPositiveAndBadArgs)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -958,7 +879,7 @@ TEST(ConsoleCommandsTests, MoveLookaheadSetsDistanceAndAllowsZero)
     EXPECT_FLOAT_EQ(cam.GetLookAheadDistance(), 40.0f);
     EXPECT_TRUE(BufferContains(buf, "move.lookahead: 40.0"));
 
-    // Zero is a valid distance (disables look-ahead), unlike accel/decel.
+    // zero is a valid distance (disables look-ahead), unlike accel/decel.
     EXPECT_TRUE(Cmd_MoveLookahead(ArgPack({"0"}).span(), ctx));
     EXPECT_FLOAT_EQ(cam.GetLookAheadDistance(), 0.0f);
 }
@@ -986,8 +907,8 @@ TEST(ConsoleCommandsTests, MoveLookaheadFailsWithoutCamera)
 
 TEST(ConsoleCommandsTests, MoveDumpPrintsAllTunables)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     world.get<Motor>(player).params.accel = 900.0f;
     world.get<Motor>(player).params.decel = 300.0f;
     CameraController cam;
@@ -1032,13 +953,9 @@ TEST(ConsoleCommandsTests, MoveDumpRejectsArgsAndFailsWhenAllUnavailable)
     }
 }
 
-// ---------------------------------------------------------------------------
-// npc.list / npc.tp / npc.spawn / npc.despawn / npc.freeze / npc.dialog
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, NpcListPrintsCount)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 2);
     npcs.get<Dialogue>(NpcAt(npcs, 0)).name = "Anna";
     npcs.get<Dialogue>(NpcAt(npcs, 1)).name = "Bob";
@@ -1054,7 +971,7 @@ TEST(ConsoleCommandsTests, NpcListPrintsCount)
 
 TEST(ConsoleCommandsTests, NpcListEmptyVector)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &npcs;
@@ -1064,7 +981,7 @@ TEST(ConsoleCommandsTests, NpcListEmptyVector)
 
 TEST(ConsoleCommandsTests, NpcTpUpdatesPosition)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 1);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1077,7 +994,7 @@ TEST(ConsoleCommandsTests, NpcTpUpdatesPosition)
 
 TEST(ConsoleCommandsTests, NpcTpRejectsBadIndexAndArity)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 1);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1090,27 +1007,26 @@ TEST(ConsoleCommandsTests, NpcTpRejectsBadIndexAndArity)
 
 TEST(ConsoleCommandsTests, NpcSpawnRejectsBadArgsAndUnknownType)
 {
-    ecs::registry npcs;
-    // Publish real services so SpawnNpc actually attempts a sprite load: an
-    // unknown type resolves to a missing file -> invalid sheet -> SpawnNpc
-    // returns no_entity -> the command reports failure.
+    entt::registry npcs;
+    // publish services to exercise sprite-load failure: missing file -> invalid sheet
+    // -> entt::null -> command failure.
     TextureStore textures;
     AssetRegistry assets;
-    npcs.globals().obtain<WorldServices>() = WorldServices{&textures, nullptr, &assets};
+    npcs.ctx().insert_or_assign(WorldServices{&textures, nullptr, &assets});
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &npcs;
 
     EXPECT_FALSE(Cmd_NpcSpawn(ArgPack({}).span(), ctx));
     EXPECT_FALSE(Cmd_NpcSpawn(ArgPack({"BW1_NPC1", "abc", "1"}).span(), ctx));
-    // Unknown type with no asset on disk: the sprite load fails, command returns false.
+
     EXPECT_FALSE(Cmd_NpcSpawn(ArgPack({"definitely_not_a_real_npc_type", "5", "5"}).span(), ctx));
     EXPECT_EQ(EntityStore::Count(npcs), 0u);
 }
 
 TEST(ConsoleCommandsTests, NpcDespawnRemovesAndBoundsCheck)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 2);
     npcs.get<Dialogue>(NpcAt(npcs, 0)).name = "First";
     npcs.get<Dialogue>(NpcAt(npcs, 1)).name = "Second";
@@ -1127,7 +1043,7 @@ TEST(ConsoleCommandsTests, NpcDespawnRemovesAndBoundsCheck)
 
 TEST(ConsoleCommandsTests, NpcFreezePerIndex)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 2);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1143,23 +1059,23 @@ TEST(ConsoleCommandsTests, NpcFreezePerIndex)
 
 TEST(ConsoleCommandsTests, NpcFreezeAll)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 3);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &npcs;
 
     EXPECT_TRUE(Cmd_NpcFreeze(ArgPack({"all", "on"}).span(), ctx));
-    npcs.each<const NpcIdle, const NpcTag>([](const NpcIdle& idle)
-                                           { EXPECT_TRUE(idle.isStopped); });
+    npcs.view<const NpcIdle, const NpcTag>().each([](const NpcIdle& idle)
+                                                  { EXPECT_TRUE(idle.isStopped); });
     EXPECT_TRUE(Cmd_NpcFreeze(ArgPack({"all", "off"}).span(), ctx));
-    npcs.each<const NpcIdle, const NpcTag>([](const NpcIdle& idle)
-                                           { EXPECT_FALSE(idle.isStopped); });
+    npcs.view<const NpcIdle, const NpcTag>().each([](const NpcIdle& idle)
+                                                  { EXPECT_FALSE(idle.isStopped); });
 }
 
 TEST(ConsoleCommandsTests, NpcFreezeRejectsBadArgs)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 1);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1172,7 +1088,7 @@ TEST(ConsoleCommandsTests, NpcFreezeRejectsBadArgs)
 
 TEST(ConsoleCommandsTests, NpcDialogSetsTextWithMultiToken)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 1);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1184,7 +1100,7 @@ TEST(ConsoleCommandsTests, NpcDialogSetsTextWithMultiToken)
 
 TEST(ConsoleCommandsTests, NpcDialogRejectsBadArgs)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     SpawnNpcs(npcs, 1);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1193,10 +1109,6 @@ TEST(ConsoleCommandsTests, NpcDialogRejectsBadArgs)
     EXPECT_FALSE(Cmd_NpcDialog(ArgPack({"0"}).span(), ctx));
     EXPECT_FALSE(Cmd_NpcDialog(ArgPack({"99", "hi"}).span(), ctx));
 }
-
-// ---------------------------------------------------------------------------
-// dialogue.active / dialogue.end / dialogue.skip
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, DialogueActiveReportsInactive)
 {
@@ -1232,10 +1144,6 @@ TEST(ConsoleCommandsTests, DialogueSkipRefusesWhenInactive)
 
     EXPECT_FALSE(Cmd_DialogueSkip(ArgPack({}).span(), ctx));
 }
-
-// ---------------------------------------------------------------------------
-// flag.list / flag.unset
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, FlagListDumpsAllFlags)
 {
@@ -1285,10 +1193,6 @@ TEST(ConsoleCommandsTests, FlagUnsetNoOpForUnknown)
     EXPECT_TRUE(BufferContains(buf, "was not set"));
 }
 
-// ---------------------------------------------------------------------------
-// time.scale / time.weather / time.status
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TimeScaleSetsAndRejectsNonPositive)
 {
     TimeManager tm;
@@ -1307,8 +1211,7 @@ TEST(ConsoleCommandsTests, TimeScaleSetsAndRejectsNonPositive)
 
 TEST(ConsoleCommandsTests, TimeWeatherSetsValidStates)
 {
-    // Names are now case-sensitive (canonical EnumTraits spelling). Tab
-    // completion makes the correct casing discoverable.
+    // weather names use the case-sensitive EnumTraits spelling.
     TimeManager tm;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1320,11 +1223,11 @@ TEST(ConsoleCommandsTests, TimeWeatherSetsValidStates)
     EXPECT_EQ(tm.GetWeather(), WeatherState::Clear);
     EXPECT_TRUE(Cmd_TimeWeather(ArgPack({"Blizzard"}).span(), ctx));
     EXPECT_EQ(tm.GetWeather(), WeatherState::Blizzard);
-    // Lowercase is rejected.
+
     EXPECT_FALSE(Cmd_TimeWeather(ArgPack({"clear"}).span(), ctx));
-    // Garbage still rejected.
+
     EXPECT_FALSE(Cmd_TimeWeather(ArgPack({"NotARealState"}).span(), ctx));
-    // Removed weathers (Overcast / Snow / Mist) are no longer valid states.
+
     EXPECT_FALSE(Cmd_TimeWeather(ArgPack({"Overcast"}).span(), ctx));
     EXPECT_FALSE(Cmd_TimeWeather(ArgPack({"Snow"}).span(), ctx));
     EXPECT_FALSE(Cmd_TimeWeather(ArgPack({"Mist"}).span(), ctx));
@@ -1344,10 +1247,6 @@ TEST(ConsoleCommandsTests, TimeStatusPrintsKeyFields)
     EXPECT_TRUE(BufferContains(buf, "HeavyRain"));
 }
 
-// ---------------------------------------------------------------------------
-// particle.spawn / particle.list / particle.kill_all
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, ParticleSpawnAddsParticle)
 {
     ParticleSystem ps;
@@ -1362,11 +1261,7 @@ TEST(ConsoleCommandsTests, ParticleSpawnAddsParticle)
 
 TEST(ConsoleCommandsTests, ParticleSpawnSurvivesUpdateTickWithoutZones)
 {
-    // Regression: particles spawned via the console use zoneIndex = -1 to
-    // mark themselves as zoneless. The Update() orphan-cleanup pass must
-    // leave them alone so the user actually sees the particle for its
-    // natural lifetime. Previously every type except DriftingLeaf/DustMote/
-    // Pollen died on the very next frame.
+    // zoneIndex = -1 marks console particles as zoneless; orphan cleanup must keep them alive.
     ParticleSystem ps;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1431,10 +1326,6 @@ TEST(ConsoleCommandsTests, ParticleCommandsFailWithoutSystem)
     EXPECT_FALSE(Cmd_ParticleKillAll(ArgPack({}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// camera.freecam / camera.zoom / camera.follow / camera.info
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, CameraFreecamToggle)
 {
     CameraController cam;
@@ -1494,10 +1385,6 @@ TEST(ConsoleCommandsTests, CameraInfoPrintsState)
     EXPECT_TRUE(BufferContains(buf, "zoom=1.500"));
 }
 
-// ---------------------------------------------------------------------------
-// map.size / map.collision (map.save success path writes to disk - skipped)
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, MapSizePrintsDimensions)
 {
     Tilemap tm;
@@ -1547,11 +1434,6 @@ TEST(ConsoleCommandsTests, MapSaveFailsWithoutRefs)
     EXPECT_FALSE(Cmd_MapSave(ArgPack({"unused.json"}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// perf - exercises the no-game error path; the success path needs Game which
-// isn't linked into rift_tests. The handler signature is still validated.
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, PerfFailsWithoutGame)
 {
     ConsoleBuffer buf;
@@ -1563,28 +1445,16 @@ TEST(ConsoleCommandsTests, PerfRejectsArgs)
 {
     ConsoleBuffer buf;
     CommandContext ctx{buf};
-    // Without a game ref the missing-pointer error path triggers first; that's
-    // fine - just confirm extra args also lead to a false return.
+
     EXPECT_FALSE(Cmd_Perf(ArgPack({"oops"}).span(), ctx));
 }
 
-// renderer.set is intentionally not unit-tested. Cmd_RendererSet calls
-// Game::SwitchRenderer, whose definition lives in Game.cpp (not in the test
-// link). The success path requires a live Game + GLFW window + renderer
-// factory, so this command is integration-only.
-
-// ===========================================================================
-// Wave 1 introspection commands
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// layers.list
-// ---------------------------------------------------------------------------
+// renderer.set needs Game::SwitchRenderer and a live window; the test binary uses a stub.
 
 TEST(ConsoleCommandsTests, LayersListPrintsAllLayers)
 {
     Tilemap m;
-    m.SetTilemapSize(8, 8, /*generateMap=*/false);
+    m.SetTilemapSize(8, 8, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1601,14 +1471,10 @@ TEST(ConsoleCommandsTests, LayersListFailsWithoutTilemap)
     EXPECT_FALSE(Cmd_LayersList(args.span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// tile.info
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TileInfoOutOfBoundsRejected)
 {
     Tilemap m;
-    m.SetTilemapSize(5, 5, /*generateMap=*/false);
+    m.SetTilemapSize(5, 5, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1619,8 +1485,8 @@ TEST(ConsoleCommandsTests, TileInfoOutOfBoundsRejected)
 TEST(ConsoleCommandsTests, TileInfoReportsLayerData)
 {
     Tilemap m;
-    m.SetTilemapSize(8, 8, /*generateMap=*/false);
-    m.SetLayerTile(3, 4, /*layer=*/2, /*tileID=*/42);
+    m.SetTilemapSize(8, 8, false);
+    m.SetLayerTile(3, 4, 2, 42);
     m.SetTileCollision(3, 4, true);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1632,14 +1498,10 @@ TEST(ConsoleCommandsTests, TileInfoReportsLayerData)
     EXPECT_TRUE(BufferContains(buf, "collision=y"));
 }
 
-// ---------------------------------------------------------------------------
-// tile.find
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TileFindReturnsAllMatches)
 {
     Tilemap m;
-    m.SetTilemapSize(5, 5, /*generateMap=*/false);
+    m.SetTilemapSize(5, 5, false);
     m.SetLayerTile(1, 1, 0, 7);
     m.SetLayerTile(2, 3, 0, 7);
     ConsoleBuffer buf;
@@ -1654,7 +1516,7 @@ TEST(ConsoleCommandsTests, TileFindReturnsAllMatches)
 TEST(ConsoleCommandsTests, TileFindLayerFilter)
 {
     Tilemap m;
-    m.SetTilemapSize(5, 5, /*generateMap=*/false);
+    m.SetTilemapSize(5, 5, false);
     m.SetLayerTile(1, 1, 0, 9);
     m.SetLayerTile(2, 2, 5, 9);
     ConsoleBuffer buf;
@@ -1666,14 +1528,10 @@ TEST(ConsoleCommandsTests, TileFindLayerFilter)
     EXPECT_FALSE(BufferContains(buf, "(1,1)"));
 }
 
-// ---------------------------------------------------------------------------
-// map.stats
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, MapStatsPrintsLabels)
 {
     Tilemap m;
-    m.SetTilemapSize(8, 8, /*generateMap=*/false);
+    m.SetTilemapSize(8, 8, false);
     m.SetTileCollision(0, 0, true);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1685,14 +1543,10 @@ TEST(ConsoleCommandsTests, MapStatsPrintsLabels)
     EXPECT_TRUE(BufferContains(buf, "navigable"));
 }
 
-// ---------------------------------------------------------------------------
-// tileset.info
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, TilesetInfoPrintsDimensions)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1701,14 +1555,10 @@ TEST(ConsoleCommandsTests, TilesetInfoPrintsDimensions)
     EXPECT_TRUE(BufferContains(buf, "tile"));
 }
 
-// ---------------------------------------------------------------------------
-// anim.list
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, AnimListEmptyByDefault)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1717,14 +1567,10 @@ TEST(ConsoleCommandsTests, AnimListEmptyByDefault)
     EXPECT_TRUE(BufferContains(buf, "0 animations"));
 }
 
-// ---------------------------------------------------------------------------
-// struct.list / struct.info / struct.goto
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, StructListEmptyByDefault)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1736,7 +1582,7 @@ TEST(ConsoleCommandsTests, StructListEmptyByDefault)
 TEST(ConsoleCommandsTests, StructInfoInvalidIdRejected)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1747,7 +1593,7 @@ TEST(ConsoleCommandsTests, StructInfoInvalidIdRejected)
 TEST(ConsoleCommandsTests, StructGotoInvalidIdRejected)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     CameraController cam;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1757,14 +1603,10 @@ TEST(ConsoleCommandsTests, StructGotoInvalidIdRejected)
     EXPECT_FALSE(Cmd_StructGoto(args.span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// zone.list / zone.goto / light.goto
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, ZoneListEmptyByDefault)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1776,7 +1618,7 @@ TEST(ConsoleCommandsTests, ZoneListEmptyByDefault)
 TEST(ConsoleCommandsTests, ZoneGotoInvalidIdxRejected)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     CameraController cam;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1789,7 +1631,7 @@ TEST(ConsoleCommandsTests, ZoneGotoInvalidIdxRejected)
 TEST(ConsoleCommandsTests, LightGotoInvalidIdxRejected)
 {
     Tilemap m;
-    m.SetTilemapSize(4, 4, /*generateMap=*/false);
+    m.SetTilemapSize(4, 4, false);
     CameraController cam;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1799,14 +1641,10 @@ TEST(ConsoleCommandsTests, LightGotoInvalidIdxRejected)
     EXPECT_FALSE(Cmd_LightGoto(args.span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// nav.path / nav.reachable
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, NavPathStraightLine)
 {
     Tilemap m;
-    m.SetTilemapSize(10, 10, /*generateMap=*/false);
+    m.SetTilemapSize(10, 10, false);
     for (int y = 0; y < 10; ++y)
     {
         for (int x = 0; x < 10; ++x)
@@ -1825,7 +1663,7 @@ TEST(ConsoleCommandsTests, NavPathStraightLine)
 TEST(ConsoleCommandsTests, NavPathUnreachable)
 {
     Tilemap m;
-    m.SetTilemapSize(5, 5, /*generateMap=*/false);
+    m.SetTilemapSize(5, 5, false);
     m.SetNavigation(0, 0, true);
     m.SetNavigation(4, 4, true);
     ConsoleBuffer buf;
@@ -1839,7 +1677,7 @@ TEST(ConsoleCommandsTests, NavPathUnreachable)
 TEST(ConsoleCommandsTests, NavReachableCount)
 {
     Tilemap m;
-    m.SetTilemapSize(5, 5, /*generateMap=*/false);
+    m.SetTilemapSize(5, 5, false);
     for (int y = 0; y < 3; ++y)
     {
         for (int x = 0; x < 3; ++x)
@@ -1855,13 +1693,9 @@ TEST(ConsoleCommandsTests, NavReachableCount)
     EXPECT_TRUE(BufferContains(buf, "9 tiles"));
 }
 
-// ---------------------------------------------------------------------------
-// npc.path / npc.goto / npc.nearest
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, NpcPathInvalidIdxRejected)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &npcs;
@@ -1871,7 +1705,7 @@ TEST(ConsoleCommandsTests, NpcPathInvalidIdxRejected)
 
 TEST(ConsoleCommandsTests, NpcGotoInvalidIdxRejected)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     CameraController cam;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
@@ -1883,7 +1717,7 @@ TEST(ConsoleCommandsTests, NpcGotoInvalidIdxRejected)
 
 TEST(ConsoleCommandsTests, NpcNearestEmptyList)
 {
-    ecs::registry npcs;
+    entt::registry npcs;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &npcs;
@@ -1892,10 +1726,6 @@ TEST(ConsoleCommandsTests, NpcNearestEmptyList)
     EXPECT_TRUE(Cmd_NpcNearest(args.span(), ctx));
     EXPECT_TRUE(BufferContains(buf, "no NPCs"));
 }
-
-// ---------------------------------------------------------------------------
-// quest.list / quest.give / quest.complete
-// ---------------------------------------------------------------------------
 
 TEST(ConsoleCommandsTests, QuestGiveStores)
 {
@@ -1949,10 +1779,6 @@ TEST(ConsoleCommandsTests, QuestListShowsQuestGiveWithoutQuestSuffix)
     EXPECT_TRUE(BufferContains(buf, "[ACTIVE] ufo"));
 }
 
-// ---------------------------------------------------------------------------
-// version / renderer.info / mem.stats / config.dump
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, VersionPrintsExpectedString)
 {
     ConsoleBuffer buf;
@@ -1973,8 +1799,8 @@ TEST(ConsoleCommandsTests, RendererInfoFailsWithoutRenderer)
 TEST(ConsoleCommandsTests, MemStatsPrintsLabels)
 {
     Tilemap m;
-    m.SetTilemapSize(8, 8, /*generateMap=*/false);
-    ecs::registry npcs;
+    m.SetTilemapSize(8, 8, false);
+    entt::registry npcs;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.tilemap = &m;
@@ -1997,49 +1823,10 @@ TEST(ConsoleCommandsTests, ConfigDumpProducesScriptableLines)
     EXPECT_TRUE(BufferContains(buf, "time.scale"));
 }
 
-// ---------------------------------------------------------------------------
-// ecs.validate (on-demand registry integrity check over registry::validate)
-// ---------------------------------------------------------------------------
-
-TEST(ConsoleCommandsTests, EcsValidateOkOnHealthyRegistry)
-{
-    ecs::registry world;
-    EntityStore::SpawnPlayer(world);
-    SpawnNpcs(world, 3);  // populate component pools with several entities
-    ConsoleBuffer buf;
-    CommandContext ctx{buf};
-    ctx.npcs = &world;
-
-    EXPECT_TRUE(Cmd_EcsValidate(ArgPack({}).span(), ctx));
-    EXPECT_TRUE(BufferContains(buf, "ecs.validate: OK"));
-}
-
-TEST(ConsoleCommandsTests, EcsValidateRejectsArgs)
-{
-    ecs::registry world;
-    ConsoleBuffer buf;
-    CommandContext ctx{buf};
-    ctx.npcs = &world;
-    EXPECT_FALSE(Cmd_EcsValidate(ArgPack({"x"}).span(), ctx));
-    EXPECT_TRUE(BufferContains(buf, "usage"));
-}
-
-TEST(ConsoleCommandsTests, EcsValidateFailsWithoutRegistry)
-{
-    ConsoleBuffer buf;
-    CommandContext ctx{buf};
-    EXPECT_FALSE(Cmd_EcsValidate(ArgPack({}).span(), ctx));
-    EXPECT_TRUE(BufferContains(buf, "registry unavailable"));
-}
-
-// ---------------------------------------------------------------------------
-// bookmark.set / bookmark.tp / bookmark.list
-// ---------------------------------------------------------------------------
-
 TEST(ConsoleCommandsTests, BookmarkSetStoresPlayerTile)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     PlayerSystem::SetTilePosition(world, player, 7, 11);
     std::unordered_map<std::string, glm::ivec2> bookmarks;
     ConsoleBuffer buf;
@@ -2054,8 +1841,8 @@ TEST(ConsoleCommandsTests, BookmarkSetStoresPlayerTile)
 
 TEST(ConsoleCommandsTests, BookmarkTpUnknownNameRejected)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     std::unordered_map<std::string, glm::ivec2> bookmarks;
     ConsoleBuffer buf;
     CommandContext ctx{buf};
