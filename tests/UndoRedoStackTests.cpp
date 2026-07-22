@@ -1,9 +1,4 @@
-// Tests for UndoRedoStack and the PlaceTilesCmd command.
-//
-// The stack is exercised with a StubCmd that mutates a captured int counter so
-// we can verify Apply / Revert / Push semantics without a Tilemap. PlaceTilesCmd
-// is exercised against a real (data-only) Tilemap. Per the test infra contract,
-// no GL or Vulkan context is created here.
+// StubCmd isolates stack state from map edits; command round-trips use a real Tilemap.
 
 #include <gtest/gtest.h>
 
@@ -16,7 +11,7 @@
 #include "../src/Tilemap.hpp"
 #include "../src/UndoRedoStack.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <memory>
 #include <string>
@@ -24,9 +19,7 @@
 
 namespace
 {
-// Minimal command for stack-mechanics tests. Adds m_Delta to *m_Counter on
-// Apply, subtracts on Revert. Lets us test push / pop / capacity / redo-clear
-// without touching Tilemap or NPC code.
+
 class StubCmd : public EditorCommand
 {
 public:
@@ -36,8 +29,8 @@ public:
     {
     }
 
-    void Apply(Tilemap&, ecs::registry&) override { *m_Counter += m_Delta; }
-    void Revert(Tilemap&, ecs::registry&) override { *m_Counter -= m_Delta; }
+    void Apply(Tilemap&, entt::registry&) override { *m_Counter += m_Delta; }
+    void Revert(Tilemap&, entt::registry&) override { *m_Counter -= m_Delta; }
     [[nodiscard]] std::string DebugLabel() const override { return "Stub"; }
 
 private:
@@ -46,14 +39,12 @@ private:
 };
 }  // namespace
 
-// --- Stack mechanics ---------------------------------------------------------
-
 class UndoRedoStackTest : public ::testing::Test
 {
 protected:
     UndoRedoStack stack;
     Tilemap tilemap;  // unused by StubCmd but required by the API
-    ecs::registry npcs;
+    entt::registry npcs;
     int counter = 0;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
@@ -149,14 +140,12 @@ TEST_F(UndoRedoStackTest, Clear_RemovesAll)
 
 TEST_F(UndoRedoStackTest, Push_DoesNotApplyButAddsToUndo)
 {
-    // Stroke-commit semantics: caller already mutated state during the drag,
-    // so Push must not re-Apply (would double-mutate).
+    // Push records an already-applied drag; applying again would duplicate the edit.
     counter = 10;  // simulate already-applied state
     stack.Push(Stub(10));
     EXPECT_EQ(counter, 10);  // not re-applied
     EXPECT_EQ(stack.UndoSize(), 1u);
 
-    // But Undo should still revert it normally.
     stack.Undo(tilemap, npcs);
     EXPECT_EQ(counter, 0);
 }
@@ -200,21 +189,18 @@ TEST_F(UndoRedoStackTest, Execute_Undo_Redo_Sequence_PreservesOrder)
     EXPECT_FALSE(stack.CanRedo());
 }
 
-// --- PlaceTilesCmd round-trip ------------------------------------------------
-
 class PlaceTilesCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
 
 TEST_F(PlaceTilesCmdTest, Apply_SetsTileAndRotation)
 {
-    PlaceTilesCmd cmd{std::vector<PlaceTilesCmd::Entry>{
-        {3, 4, 0, /*oldId=*/-1, /*oldRot=*/0.0f, /*newId=*/42, /*newRot=*/90.0f}}};
+    PlaceTilesCmd cmd{std::vector<PlaceTilesCmd::Entry>{{3, 4, 0, -1, 0.0f, 42, 90.0f}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetLayerTile(3, 4, 0), 42);
     EXPECT_FLOAT_EQ(tilemap.GetLayerRotation(3, 4, 0), 90.0f);
@@ -238,7 +224,7 @@ TEST_F(PlaceTilesCmdTest, MultiTile_ApplyRevert_RestoresAllToDefault)
 {
     std::vector<PlaceTilesCmd::Entry> entries;
     for (int i = 0; i < 5; ++i)
-        entries.push_back({i, 0, 0, /*oldId=*/-1, 0.0f, i + 100, 0.0f});
+        entries.push_back({i, 0, 0, -1, 0.0f, i + 100, 0.0f});
 
     PlaceTilesCmd cmd{std::move(entries)};
     cmd.Apply(tilemap, npcs);
@@ -304,21 +290,18 @@ TEST_F(PlaceTilesCmdTest, AcrossMultipleLayers_EachLayerTracked)
     EXPECT_EQ(tilemap.GetLayerTile(0, 0, 2), -1);
 }
 
-// --- CollisionToggleCmd ------------------------------------------------------
-
 class CollisionToggleCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
 
 TEST_F(CollisionToggleCmdTest, Apply_TogglesCollision)
 {
-    CollisionToggleCmd cmd{
-        std::vector<CollisionToggleCmd::Entry>{{4, 4, /*old=*/false, /*new=*/true}}};
+    CollisionToggleCmd cmd{std::vector<CollisionToggleCmd::Entry>{{4, 4, false, true}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_TRUE(tilemap.GetTileCollision(4, 4));
 }
@@ -326,8 +309,7 @@ TEST_F(CollisionToggleCmdTest, Apply_TogglesCollision)
 TEST_F(CollisionToggleCmdTest, Revert_RestoresOriginal)
 {
     tilemap.SetTileCollision(2, 3, true);
-    CollisionToggleCmd cmd{
-        std::vector<CollisionToggleCmd::Entry>{{2, 3, /*old=*/true, /*new=*/false}}};
+    CollisionToggleCmd cmd{std::vector<CollisionToggleCmd::Entry>{{2, 3, true, false}}};
     cmd.Apply(tilemap, npcs);
     ASSERT_FALSE(tilemap.GetTileCollision(2, 3));
     cmd.Revert(tilemap, npcs);
@@ -348,20 +330,18 @@ TEST_F(CollisionToggleCmdTest, MultiTile_RoundTrip)
         EXPECT_FALSE(tilemap.GetTileCollision(i, 0));
 }
 
-// --- ElevationSetCmd ---------------------------------------------------------
-
 class ElevationSetCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
 
 TEST_F(ElevationSetCmdTest, Apply_SetsElevation)
 {
-    ElevationSetCmd cmd{std::vector<ElevationSetCmd::Entry>{{1, 1, /*old=*/0, /*new=*/12}}};
+    ElevationSetCmd cmd{std::vector<ElevationSetCmd::Entry>{{1, 1, 0, 12}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetElevation(1, 1), 12);
 }
@@ -385,13 +365,9 @@ TEST_F(ElevationSetCmdTest, ApplyRevertApply_Idempotent)
     EXPECT_EQ(tilemap.GetElevation(3, 3), 16);
 }
 
-// --- PlaceNPCCmd / RemoveNPCCmd ---------------------------------------------
-
 namespace
 {
-// Blueprint for an NPC at given coords. No sprite is loaded (tests run without
-// services / a GL context); SpawnNpc tolerates that and still sets Transform +
-// Patrol from the tile.
+
 NpcRecord MakeStubNPC(int tileX, int tileY)
 {
     NpcRecord rec;
@@ -401,8 +377,8 @@ NpcRecord MakeStubNPC(int tileX, int tileY)
     return rec;
 }
 
-// The NPC registry's first entity in dense order (tests assert a single NPC).
-ecs::entity FirstNpc(ecs::registry& world)
+// the tests that use this helper contain one NPC.
+entt::entity FirstNpc(entt::registry& world)
 {
     return EntityStore::Entities(world).front();
 }
@@ -412,7 +388,7 @@ class NPCCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
@@ -494,14 +470,12 @@ TEST_F(NPCCmdTest, RemoveNPCCmd_NoNPCAtTile_NoOpApply)
     EXPECT_EQ(EntityStore::Count(npcs), 0u);
 }
 
-// --- Stroke accumulators -----------------------------------------------------
-
 class StrokeAccumulatorTest : public ::testing::Test
 {
 protected:
     UndoRedoStack stack;
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
@@ -512,7 +486,6 @@ TEST_F(StrokeAccumulatorTest, TilePlace_FiveTiles_RevertedAtomically)
     accum.Begin();
     for (int i = 0; i < 5; ++i)
     {
-        // Simulate the editor: capture old, mutate, register touch.
         int oldId = tilemap.GetLayerTile(i, 0, 0);
         float oldRot = tilemap.GetLayerRotation(i, 0, 0);
         tilemap.SetLayerTile(i, 0, 0, 100 + i);
@@ -532,21 +505,21 @@ TEST_F(StrokeAccumulatorTest, TilePlace_FiveTiles_RevertedAtomically)
 
 TEST_F(StrokeAccumulatorTest, TilePlace_RepeatedTouch_PreservesOriginalOldValue)
 {
-    // Pre-stroke state: tile = 2, rotation = 0
+    // pre-stroke state: tile = 2, rotation = 0
     tilemap.SetLayerTile(3, 3, 0, 2);
     tilemap.SetLayerRotation(3, 3, 0, 0.0f);
 
     TilePlaceStrokeAccum accum;
     accum.Begin();
 
-    // First touch: paint over old=2 with new=5
+    // first touch: paint over old=2 with new=5
     int oldId1 = tilemap.GetLayerTile(3, 3, 0);
     float oldRot1 = tilemap.GetLayerRotation(3, 3, 0);
     tilemap.SetLayerTile(3, 3, 0, 5);
     tilemap.SetLayerRotation(3, 3, 0, 90.0f);
     accum.Touch(3, 3, 0, oldId1, oldRot1, 5, 90.0f);
 
-    // Second touch on same tile mid-stroke: paint over current=5 with new=8
+    // second touch on same tile mid-stroke: paint over current=5 with new=8
     int oldId2 = tilemap.GetLayerTile(3, 3, 0);  // = 5 now
     float oldRot2 = tilemap.GetLayerRotation(3, 3, 0);
     tilemap.SetLayerTile(3, 3, 0, 8);
@@ -555,10 +528,9 @@ TEST_F(StrokeAccumulatorTest, TilePlace_RepeatedTouch_PreservesOriginalOldValue)
 
     accum.Commit(stack);
 
-    // Live state should reflect the final new value.
     EXPECT_EQ(tilemap.GetLayerTile(3, 3, 0), 8);
 
-    // Revert must restore the ORIGINAL old (2 / 0.0f), not the intermediate 5.
+    // undo restores 2 / 0.0f, not the intermediate tile 5.
     stack.Undo(tilemap, npcs);
     EXPECT_EQ(tilemap.GetLayerTile(3, 3, 0), 2);
     EXPECT_FLOAT_EQ(tilemap.GetLayerRotation(3, 3, 0), 0.0f);
@@ -637,9 +609,7 @@ TEST_F(StrokeAccumulatorTest, Elevation_RoundTripDrag)
 
 TEST_F(StrokeAccumulatorTest, ElevationAndRole_CommitAsOneUndoEntry)
 {
-    // H mode paints a height and a role in one click, so ONE Ctrl+Z must undo
-    // both. Two separate undo entries would make the author press undo twice to
-    // reverse a single action.
+    // height and role form one editor action and must undo together.
     ElevationStrokeAccum accum;
     accum.Begin();
     accum.Touch(1, 1, 0, 6);
@@ -657,8 +627,6 @@ TEST_F(StrokeAccumulatorTest, ElevationAndRole_CommitAsOneUndoEntry)
 
 TEST_F(StrokeAccumulatorTest, ElevationOnlyStrokeStillCommitsASingleCommand)
 {
-    // The height-only path must be unchanged - Elevation_RoundTripDrag depends on
-    // it, and a stroke that touched no role must not gain a pointless composite.
     ElevationStrokeAccum accum;
     accum.Begin();
     accum.Touch(2, 2, 0, 4);
@@ -672,7 +640,6 @@ TEST_F(StrokeAccumulatorTest, ElevationOnlyStrokeStillCommitsASingleCommand)
 
 TEST_F(StrokeAccumulatorTest, Multiple_LayersIndependentlyTracked)
 {
-    // Same (x, y) on different layers should not dedup against each other.
     TilePlaceStrokeAccum accum;
     accum.Begin();
     accum.Touch(0, 0, 0, -1, 0.0f, 1, 0.0f);
@@ -689,18 +656,16 @@ TEST_F(StrokeAccumulatorTest, Multiple_LayersIndependentlyTracked)
     EXPECT_EQ(tilemap.GetLayerTile(0, 0, 2), -1);
 }
 
-// --- NavigationStrokeCmd ----------------------------------------------------
-
 class NavigationStrokeCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override
     {
         tilemap.SetTilemapSize(8, 8, false);
-        // Mark all tiles walkable initially so NPCs survive.
+
         for (int y = 0; y < 8; ++y)
             for (int x = 0; x < 8; ++x)
                 tilemap.SetNavigation(x, y, true);
@@ -709,8 +674,8 @@ protected:
 
 TEST_F(NavigationStrokeCmdTest, NoNPCs_RoundTripPreservesNav)
 {
-    NavigationStrokeCmd cmd{std::vector<NavigationStrokeCmd::Entry>{
-        {3, 3, /*old=*/true, /*new=*/false}, {3, 4, /*old=*/true, /*new=*/false}}};
+    NavigationStrokeCmd cmd{
+        std::vector<NavigationStrokeCmd::Entry>{{3, 3, true, false}, {3, 4, true, false}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_FALSE(tilemap.GetNavigation(3, 3));
     EXPECT_FALSE(tilemap.GetNavigation(3, 4));
@@ -724,8 +689,7 @@ TEST_F(NavigationStrokeCmdTest, NPCDisplaced_RestoredOnRevert)
 {
     EntityStore::SpawnNpc(npcs, MakeStubNPC(4, 4));
 
-    NavigationStrokeCmd cmd{
-        std::vector<NavigationStrokeCmd::Entry>{{4, 4, /*old=*/true, /*new=*/false}}};
+    NavigationStrokeCmd cmd{std::vector<NavigationStrokeCmd::Entry>{{4, 4, true, false}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(EntityStore::Count(npcs), 0u);  // NPC erased
 
@@ -743,7 +707,7 @@ TEST_F(NavigationStrokeCmdTest, ApplyRevertApply_NoNPCDuplication)
     NavigationStrokeCmd cmd{std::vector<NavigationStrokeCmd::Entry>{{2, 2, true, false}}};
     cmd.Apply(tilemap, npcs);
     cmd.Revert(tilemap, npcs);
-    cmd.Apply(tilemap, npcs);  // Redo
+    cmd.Apply(tilemap, npcs);
 
     EXPECT_EQ(EntityStore::Count(npcs), 0u);  // NPC erased again on Redo, not duplicated
 
@@ -787,21 +751,19 @@ TEST_F(NavigationStrokeCmdTest, StackIntegration_UndoRedoSequence)
     EXPECT_FALSE(tilemap.GetNavigation(5, 5));
 }
 
-// --- Mode flag commands (B/Y/O) ---------------------------------------------
-
 class FlagToggleCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
 
 TEST_F(FlagToggleCmdTest, Stance_RoundTrip)
 {
-    SetTileStancesCmd cmd{std::vector<LayerStanceEntry>{
-        {2, 2, 0, /*old=*/TileStance::Flat, /*new=*/TileStance::Structure}}};
+    SetTileStancesCmd cmd{
+        std::vector<LayerStanceEntry>{{2, 2, 0, TileStance::Flat, TileStance::Structure}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetLayerStance(2, 2, 0), TileStance::Structure);
     cmd.Revert(tilemap, npcs);
@@ -810,12 +772,10 @@ TEST_F(FlagToggleCmdTest, Stance_RoundTrip)
 
 TEST_F(FlagToggleCmdTest, Stance_RoundTripBetweenTwoNonFlatValues)
 {
-    // Undo has to restore the PREVIOUS stance, not just clear the cell. A bool
-    // flag could only ever go back to false; re-marking a Wall as a Prop and
-    // undoing must give the Wall back.
+    // undo restores the previous stance, including Wall when a cell was changed to Prop.
     tilemap.SetLayerStance(4, 4, 2, TileStance::Wall);
-    SetTileStancesCmd cmd{std::vector<LayerStanceEntry>{
-        {4, 4, 2, /*old=*/TileStance::Wall, /*new=*/TileStance::Prop}}};
+    SetTileStancesCmd cmd{
+        std::vector<LayerStanceEntry>{{4, 4, 2, TileStance::Wall, TileStance::Prop}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetLayerStance(4, 4, 2), TileStance::Prop);
     cmd.Revert(tilemap, npcs);
@@ -825,7 +785,7 @@ TEST_F(FlagToggleCmdTest, Stance_RoundTripBetweenTwoNonFlatValues)
 TEST_F(FlagToggleCmdTest, YSortPlus_RoundTrip)
 {
     tilemap.SetLayerYSortPlus(3, 3, 1, true);
-    YSortPlusToggleCmd cmd{std::vector<LayerFlagEntry>{{3, 3, 1, /*old=*/true, /*new=*/false}}};
+    YSortPlusToggleCmd cmd{std::vector<LayerFlagEntry>{{3, 3, 1, true, false}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_FALSE(tilemap.GetLayerYSortPlus(3, 3, 1));
     cmd.Revert(tilemap, npcs);
@@ -834,7 +794,7 @@ TEST_F(FlagToggleCmdTest, YSortPlus_RoundTrip)
 
 TEST_F(FlagToggleCmdTest, YSortMinus_RoundTrip)
 {
-    YSortMinusToggleCmd cmd{std::vector<LayerFlagEntry>{{4, 4, 2, /*old=*/false, /*new=*/true}}};
+    YSortMinusToggleCmd cmd{std::vector<LayerFlagEntry>{{4, 4, 2, false, true}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_TRUE(tilemap.GetLayerYSortMinus(4, 4, 2));
     cmd.Revert(tilemap, npcs);
@@ -855,13 +815,11 @@ TEST_F(FlagToggleCmdTest, MultipleEntries_AllRoundTrip)
         EXPECT_EQ(tilemap.GetLayerStance(i, 0, 0), TileStance::Flat);
 }
 
-// --- SetTileAnimationCmd ----------------------------------------------------
-
 class SetTileAnimationCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
@@ -875,17 +833,14 @@ TEST_F(SetTileAnimationCmdTest, RemoveAnimation_RestoresTile)
 
     tilemap.SetLayerTile(2, 2, 0, 99);
     tilemap.SetTileAnimation(2, 2, 0, animId);
-    // After SetTileAnimation, tile id is now anim.frames[0] = 1.
+
     ASSERT_EQ(tilemap.GetLayerTile(2, 2, 0), 1);
 
-    // Build cmd that captures the tile id BEFORE animation set the anim
-    // (oldTileId = 99, the user's chosen tile pre-animation-apply).
-    SetTileAnimationCmd cmd{std::vector<SetTileAnimationCmd::Entry>{
-        {2, 2, 0, /*oldAnim=*/animId, /*newAnim=*/-1, /*oldTileId=*/99}}};
+    // capture tile 99 before SetTileAnimation replaces it with the first frame.
+    SetTileAnimationCmd cmd{std::vector<SetTileAnimationCmd::Entry>{{2, 2, 0, animId, -1, 99}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetTileAnimation(2, 2, 0), -1);
 
-    // Revert reapplies animation AND restores oldTileId.
     cmd.Revert(tilemap, npcs);
     EXPECT_EQ(tilemap.GetTileAnimation(2, 2, 0), animId);
     EXPECT_EQ(tilemap.GetLayerTile(2, 2, 0), 99);
@@ -899,8 +854,7 @@ TEST_F(SetTileAnimationCmdTest, ApplyAnimation_RoundTrip)
     int animId = tilemap.AddAnimatedTile(anim);
 
     tilemap.SetLayerTile(0, 0, 0, 5);
-    SetTileAnimationCmd cmd{std::vector<SetTileAnimationCmd::Entry>{
-        {0, 0, 0, /*oldAnim=*/-1, /*newAnim=*/animId, /*oldTileId=*/5}}};
+    SetTileAnimationCmd cmd{std::vector<SetTileAnimationCmd::Entry>{{0, 0, 0, -1, animId, 5}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetTileAnimation(0, 0, 0), animId);
 
@@ -909,14 +863,12 @@ TEST_F(SetTileAnimationCmdTest, ApplyAnimation_RoundTrip)
     EXPECT_EQ(tilemap.GetLayerTile(0, 0, 0), 5);
 }
 
-// --- SetTileStructureIdsCmd -------------------------------------------------
-
 TEST_F(FlagToggleCmdTest, SetTileStructureIds_RoundTrip)
 {
     int sid = tilemap.AddNoProjectionStructure({0, 0}, {64, 64});
 
-    SetTileStructureIdsCmd cmd{std::vector<SetTileStructureIdsCmd::Entry>{
-        {2, 2, 1, /*old=*/-1, /*new=*/sid}, {3, 3, 1, -1, sid}}};
+    SetTileStructureIdsCmd cmd{
+        std::vector<SetTileStructureIdsCmd::Entry>{{2, 2, 1, -1, sid}, {3, 3, 1, -1, sid}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetTileStructureId(2, 2, 1), sid);
     EXPECT_EQ(tilemap.GetTileStructureId(3, 3, 1), sid);
@@ -926,12 +878,10 @@ TEST_F(FlagToggleCmdTest, SetTileStructureIds_RoundTrip)
     EXPECT_EQ(tilemap.GetTileStructureId(3, 3, 1), -1);
 }
 
-// --- SetElevationRolesCmd ----------------------------------------------------
-
 TEST_F(FlagToggleCmdTest, ElevationRole_RoundTrip)
 {
     SetElevationRolesCmd cmd{std::vector<LayerElevationRoleEntry>{
-        {2, 2, 0, /*old=*/ElevationRole::Ground, /*new=*/ElevationRole::Raised}}};
+        {2, 2, 0, ElevationRole::Ground, ElevationRole::Raised}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetLayerElevationRole(2, 2, 0), ElevationRole::Raised);
     cmd.Revert(tilemap, npcs);
@@ -940,9 +890,7 @@ TEST_F(FlagToggleCmdTest, ElevationRole_RoundTrip)
 
 TEST_F(FlagToggleCmdTest, ElevationRole_RoundTripBetweenTwoNonGroundValues)
 {
-    // Undo must restore the PREVIOUS role, not merely clear the cell. A bool pair
-    // could only ever go back to Ground; re-marking a Raised cell as a Ramp and
-    // undoing has to give Raised back. This is why the entry carries an enum pair.
+    // undo restores the previous role, including Raised when a cell was changed to Ramp.
     tilemap.SetLayerElevationRole(4, 4, 2, ElevationRole::Raised);
     SetElevationRolesCmd cmd{std::vector<LayerElevationRoleEntry>{
         {4, 4, 2, ElevationRole::Raised, ElevationRole::Ramp}}};
@@ -954,15 +902,12 @@ TEST_F(FlagToggleCmdTest, ElevationRole_RoundTripBetweenTwoNonGroundValues)
 
 TEST_F(FlagToggleCmdTest, ElevationRole_IsPerLayer)
 {
-    // The entry carries a layer index; writing one layer must not disturb another.
     SetElevationRolesCmd cmd{std::vector<LayerElevationRoleEntry>{
         {5, 5, 3, ElevationRole::Ground, ElevationRole::Ramp}}};
     cmd.Apply(tilemap, npcs);
     EXPECT_EQ(tilemap.GetLayerElevationRole(5, 5, 3), ElevationRole::Ramp);
     EXPECT_EQ(tilemap.GetLayerElevationRole(5, 5, 0), ElevationRole::Ground);
 }
-
-// --- CompositeCmd -----------------------------------------------------------
 
 TEST_F(FlagToggleCmdTest, CompositeCmd_AppliesAllInOrder)
 {
@@ -984,13 +929,11 @@ TEST_F(FlagToggleCmdTest, CompositeCmd_AppliesAllInOrder)
     EXPECT_EQ(tilemap.GetTileStructureId(1, 1, 1), -1);
 }
 
-// --- AddStructureCmd / RemoveStructureCmd -----------------------------------
-
 class StructureCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
@@ -1062,7 +1005,7 @@ TEST_F(StructureCmdTest, RemoveStructure_MidVector_PreservesHigherStructures)
 
     RemoveStructureCmd cmd{b};
     cmd.Apply(tilemap, npcs);
-    // After remove, C shifted from id=2 to id=1.
+    // after remove, C shifted from id=2 to id=1.
     EXPECT_EQ(tilemap.GetNoProjectionStructure(0)->name, "A");
     EXPECT_EQ(tilemap.GetNoProjectionStructure(1)->name, "C");
 
@@ -1073,13 +1016,11 @@ TEST_F(StructureCmdTest, RemoveStructure_MidVector_PreservesHigherStructures)
     EXPECT_EQ(tilemap.GetNoProjectionStructure(2)->name, "C");
 }
 
-// --- AddParticleZoneCmd / RemoveParticleZoneCmd -----------------------------
-
 class ParticleZoneCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 
@@ -1118,7 +1059,7 @@ TEST_F(ParticleZoneCmdTest, RemoveZone_PreservesIndex)
     RemoveParticleZoneCmd cmd{1};
     cmd.Apply(tilemap, npcs);
     ASSERT_EQ(tilemap.GetParticleZones()->size(), 2u);
-    // After removal, the zone that was at idx 2 shifts to idx 1.
+    // after removal, the zone that was at idx 2 shifts to idx 1.
     EXPECT_FLOAT_EQ((*tilemap.GetParticleZones())[1].position.x, 20.0f);
 
     cmd.Revert(tilemap, npcs);
@@ -1128,13 +1069,11 @@ TEST_F(ParticleZoneCmdTest, RemoveZone_PreservesIndex)
     EXPECT_FLOAT_EQ((*tilemap.GetParticleZones())[2].position.x, 20.0f);
 }
 
-// --- PasteRegionCmd ---------------------------------------------------------
-
 class PasteRegionCmdTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(8, 8, false); }
 };
@@ -1156,14 +1095,12 @@ TEST_F(PasteRegionCmdTest, Snapshot_CapturesAllFields)
 
 TEST_F(PasteRegionCmdTest, Paste_WritesAndRevertRestores)
 {
-    // Source region: 2x2 with mixed data.
     tilemap.SetLayerTile(0, 0, 0, 11);
     tilemap.SetLayerTile(1, 0, 0, 12);
     tilemap.SetLayerTile(0, 1, 0, 21);
     tilemap.SetLayerTile(1, 1, 0, 22);
     auto region = PasteRegionCmd::SnapshotRegion(tilemap, 0, 0, 2, 2);
 
-    // Pre-paste destination: tile at (5,5) is set to 99.
     tilemap.SetLayerTile(5, 5, 0, 99);
     tilemap.SetLayerTile(6, 5, 0, 88);
     tilemap.SetLayerTile(5, 6, 0, 77);
@@ -1188,7 +1125,7 @@ TEST_F(PasteRegionCmdTest, Paste_OutOfBounds_ClampsAndRevertWorks)
     tilemap.SetLayerTile(0, 0, 0, 5);
     auto region = PasteRegionCmd::SnapshotRegion(tilemap, 0, 0, 2, 2);
 
-    // Paste at (7, 7) - half the region would land out-of-bounds (8x8 map).
+    // paste at (7, 7) - half the region would land out-of-bounds (8x8 map).
     tilemap.SetLayerTile(7, 7, 0, 999);
     PasteRegionCmd cmd{7, 7, region};
     cmd.Apply(tilemap, npcs);
