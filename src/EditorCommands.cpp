@@ -2,7 +2,6 @@
 
 #include "EntityStore.hpp"
 #include "NavigationRecalc.hpp"
-#include "NpcTag.hpp"
 #include "Patrol.hpp"
 #include "Tilemap.hpp"
 
@@ -12,9 +11,6 @@
 #include <string>
 #include <utility>
 
-// Two passes: first move the cells to their mirrored positions, then fix up each cell's
-// own orientation. Both are needed - swapping positions alone mirrors the layout but
-// leaves every individual tile facing the wrong way.
 void ReflectClipboardRegion(ClipboardRegion& region, bool flipXAxis)
 {
     const int W = region.width;
@@ -45,11 +41,7 @@ void ReflectClipboardRegion(ClipboardRegion& region, bool flipXAxis)
         }
     }
 
-    // Per-cell orientation fix-up. A mirror reverses the sense of a rotation - reflecting
-    // a tile drawn at r degrees looks the same as drawing it at -r and then mirroring it
-    // (M * R(r) == R(-r) * M). So each layer both toggles its flip flag on the reflected
-    // axis and negates its rotation; doing only one of the two leaves rotated tiles
-    // visibly wrong. Together they make the transform an involution.
+    // Mirror tile orientation as well as cell positions: M * R(r) == R(-r) * M.
     for (auto& cell : region.cells)
     {
         for (auto& layer : cell.layers)
@@ -68,7 +60,7 @@ void ReflectClipboardRegion(ClipboardRegion& region, bool flipXAxis)
     }
 }
 
-void PlaceTilesCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void PlaceTilesCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
     {
@@ -79,7 +71,7 @@ void PlaceTilesCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
     }
 }
 
-void PlaceTilesCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void PlaceTilesCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
     {
@@ -95,13 +87,13 @@ std::string PlaceTilesCmd::DebugLabel() const
     return "Place " + std::to_string(m_Entries.size()) + " tile(s)";
 }
 
-void CollisionToggleCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void CollisionToggleCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetTileCollision(e.tileX, e.tileY, e.newCollision);
 }
 
-void CollisionToggleCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void CollisionToggleCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetTileCollision(e.tileX, e.tileY, e.oldCollision);
@@ -112,13 +104,13 @@ std::string CollisionToggleCmd::DebugLabel() const
     return "Toggle collision (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void ElevationSetCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void ElevationSetCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetElevation(e.tileX, e.tileY, e.newElevation);
 }
 
-void ElevationSetCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void ElevationSetCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetElevation(e.tileX, e.tileY, e.oldElevation);
@@ -131,22 +123,21 @@ std::string ElevationSetCmd::DebugLabel() const
 
 namespace
 {
-// Entity of the NPC standing on (tileX, tileY), or nullopt. Tile-coord
-// uniqueness is invariant in the editor's NPC click handler.
-std::optional<ecs::entity> FindNPCAtTile(ecs::registry& npcs, int tileX, int tileY)
+
+std::optional<entt::entity> FindNPCAtTile(entt::registry& npcs, int tileX, int tileY)
 {
-    std::optional<ecs::entity> found;
-    npcs.each<const Patrol, const NpcTag>(
-        [&](ecs::entity e, const Patrol& patrol)
+    std::optional<entt::entity> found;
+    for (const entt::entity entity : EntityStore::Entities(npcs))
+    {
+        const Patrol& patrol = npcs.get<Patrol>(entity);
+        if (patrol.tileX == tileX && patrol.tileY == tileY)
         {
-            if (patrol.tileX == tileX && patrol.tileY == tileY)
-            {
-                found = e;
-            }
-        });
+            found = entity;
+        }
+    }
     return found;
 }
-}  // namespace
+}  // Namespace
 
 PlaceNPCCmd::PlaceNPCCmd(NpcRecord npc)
     : m_TileX(npc.tileX),
@@ -155,7 +146,7 @@ PlaceNPCCmd::PlaceNPCCmd(NpcRecord npc)
 {
 }
 
-void PlaceNPCCmd::Apply(Tilemap& /*tilemap*/, ecs::registry& npcs)
+void PlaceNPCCmd::Apply(Tilemap&, entt::registry& npcs)
 {
     if (!m_Held.has_value())
         return;
@@ -163,9 +154,9 @@ void PlaceNPCCmd::Apply(Tilemap& /*tilemap*/, ecs::registry& npcs)
     m_Held.reset();
 }
 
-void PlaceNPCCmd::Revert(Tilemap& /*tilemap*/, ecs::registry& npcs)
+void PlaceNPCCmd::Revert(Tilemap&, entt::registry& npcs)
 {
-    std::optional<ecs::entity> e = FindNPCAtTile(npcs, m_TileX, m_TileY);
+    std::optional<entt::entity> e = FindNPCAtTile(npcs, m_TileX, m_TileY);
     if (!e.has_value())
         return;
     m_Held = EntityStore::SnapshotNpc(npcs, *e);
@@ -177,16 +168,16 @@ std::string PlaceNPCCmd::DebugLabel() const
     return "Place NPC (" + std::to_string(m_TileX) + ", " + std::to_string(m_TileY) + ")";
 }
 
-void RemoveNPCCmd::Apply(Tilemap& /*tilemap*/, ecs::registry& npcs)
+void RemoveNPCCmd::Apply(Tilemap&, entt::registry& npcs)
 {
-    std::optional<ecs::entity> e = FindNPCAtTile(npcs, m_TileX, m_TileY);
+    std::optional<entt::entity> e = FindNPCAtTile(npcs, m_TileX, m_TileY);
     if (!e.has_value())
         return;
     m_Held = EntityStore::SnapshotNpc(npcs, *e);
     EntityStore::Remove(npcs, *e);
 }
 
-void RemoveNPCCmd::Revert(Tilemap& /*tilemap*/, ecs::registry& npcs)
+void RemoveNPCCmd::Revert(Tilemap&, entt::registry& npcs)
 {
     if (!m_Held.has_value())
         return;
@@ -199,19 +190,16 @@ std::string RemoveNPCCmd::DebugLabel() const
     return "Remove NPC (" + std::to_string(m_TileX) + ", " + std::to_string(m_TileY) + ")";
 }
 
-void NavigationStrokeCmd::Apply(Tilemap& tilemap, ecs::registry& npcs)
+void NavigationStrokeCmd::Apply(Tilemap& tilemap, entt::registry& npcs)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetNavigation(e.tileX, e.tileY, e.newWalkable);
 
-    // Snapshot any NPCs now displaced by tiles becoming non-walkable. The
-    // snapshot is rebuilt fresh each Apply so Redo after intervening commands
-    // still captures the right NPCs.
     m_ErasedNPCs = SnapshotAndEraseNPCsOnNonWalkable(tilemap, npcs);
     RebuildPatrolRoutes(tilemap, npcs);
 }
 
-void NavigationStrokeCmd::Revert(Tilemap& tilemap, ecs::registry& npcs)
+void NavigationStrokeCmd::Revert(Tilemap& tilemap, entt::registry& npcs)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetNavigation(e.tileX, e.tileY, e.oldWalkable);
@@ -225,13 +213,13 @@ std::string NavigationStrokeCmd::DebugLabel() const
     return "Toggle navigation (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void SetTileStancesCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetTileStancesCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerStance(e.tileX, e.tileY, e.layer, e.newStance);
 }
 
-void SetTileStancesCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetTileStancesCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerStance(e.tileX, e.tileY, e.layer, e.oldStance);
@@ -242,13 +230,13 @@ std::string SetTileStancesCmd::DebugLabel() const
     return "Set tile stance (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void SetElevationRolesCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetElevationRolesCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerElevationRole(e.tileX, e.tileY, e.layer, e.newRole);
 }
 
-void SetElevationRolesCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetElevationRolesCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerElevationRole(e.tileX, e.tileY, e.layer, e.oldRole);
@@ -259,13 +247,13 @@ std::string SetElevationRolesCmd::DebugLabel() const
     return "Set elevation role (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void YSortPlusToggleCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void YSortPlusToggleCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerYSortPlus(e.tileX, e.tileY, e.layer, e.newFlag);
 }
 
-void YSortPlusToggleCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void YSortPlusToggleCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerYSortPlus(e.tileX, e.tileY, e.layer, e.oldFlag);
@@ -276,13 +264,13 @@ std::string YSortPlusToggleCmd::DebugLabel() const
     return "Toggle Y-sort-plus (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void YSortMinusToggleCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void YSortMinusToggleCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerYSortMinus(e.tileX, e.tileY, e.layer, e.newFlag);
 }
 
-void YSortMinusToggleCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void YSortMinusToggleCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetLayerYSortMinus(e.tileX, e.tileY, e.layer, e.oldFlag);
@@ -293,18 +281,15 @@ std::string YSortMinusToggleCmd::DebugLabel() const
     return "Toggle Y-sort-minus (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void SetTileAnimationCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetTileAnimationCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetTileAnimation(e.tileX, e.tileY, e.layer, e.newAnimId);
 }
 
-void SetTileAnimationCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetTileAnimationCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
-    // SetTileAnimation may stomp tiles[idx] when assigning a non-empty
-    // animation - in particular, restoring an animId of -1 leaves tiles[idx]
-    // at whatever value the prior animation set it to. So after restoring
-    // animation, also explicitly restore the original tile id.
+    // Restore tile ID after animation assignment, which can overwrite it.
     for (const Entry& e : m_Entries)
     {
         tilemap.SetTileAnimation(e.tileX, e.tileY, e.layer, e.oldAnimId);
@@ -317,13 +302,13 @@ std::string SetTileAnimationCmd::DebugLabel() const
     return "Set animation (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void SetTileStructureIdsCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetTileStructureIdsCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetTileStructureId(e.tileX, e.tileY, e.layer, e.newStructId);
 }
 
-void SetTileStructureIdsCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void SetTileStructureIdsCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     for (const Entry& e : m_Entries)
         tilemap.SetTileStructureId(e.tileX, e.tileY, e.layer, e.oldStructId);
@@ -334,26 +319,24 @@ std::string SetTileStructureIdsCmd::DebugLabel() const
     return "Set structure id (" + std::to_string(m_Entries.size()) + " tile(s))";
 }
 
-void CompositeCmd::Apply(Tilemap& tilemap, ecs::registry& npcs)
+void CompositeCmd::Apply(Tilemap& tilemap, entt::registry& npcs)
 {
     for (auto& child : m_Children)
         child->Apply(tilemap, npcs);
 }
 
-void CompositeCmd::Revert(Tilemap& tilemap, ecs::registry& npcs)
+void CompositeCmd::Revert(Tilemap& tilemap, entt::registry& npcs)
 {
-    // Reverse order so child2.Revert undoes child2.Apply against the state
-    // that existed after child1.Apply ran.
     for (auto it = m_Children.rbegin(); it != m_Children.rend(); ++it)
         (*it)->Revert(tilemap, npcs);
 }
 
-void AddStructureCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void AddStructureCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     m_StructureId = tilemap.AddNoProjectionStructure(m_LeftAnchor, m_RightAnchor, m_Name);
 }
 
-void AddStructureCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void AddStructureCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     if (m_StructureId < 0)
         return;
@@ -365,7 +348,7 @@ std::string AddStructureCmd::DebugLabel() const
     return "Add structure";
 }
 
-void RemoveStructureCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void RemoveStructureCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     const NoProjectionStructure* s = tilemap.GetNoProjectionStructure(m_Id);
     if (!s)
@@ -373,12 +356,8 @@ void RemoveStructureCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
 
     m_Snapshot = *s;
 
-    // Capture per-tile structureId references pointing at this id before
-    // RemoveNoProjectionStructure clears them. Iterate all layers / tiles -
-    // expensive but rare (right-click clear in G mode).
-    // The loop counter is a 0-based layer index but GetTileStructureId/SetTileStructureId
-    // take a 1-based one, so this scan is shifted by a layer relative to the editor call
-    // sites (which pass m_CurrentLayer + 1).
+    // Capture membership before removal clears and renumbers IDs. The structure accessor is
+    // one-based, but this loop passes zero-based indices and therefore scans one layer low.
     m_TileRefs.clear();
     int w = tilemap.GetMapWidth();
     int h = tilemap.GetMapHeight();
@@ -397,7 +376,7 @@ void RemoveStructureCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
     tilemap.RemoveNoProjectionStructure(m_Id);
 }
 
-void RemoveStructureCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void RemoveStructureCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     if (!m_Captured)
         return;
@@ -411,12 +390,12 @@ std::string RemoveStructureCmd::DebugLabel() const
     return "Remove structure " + std::to_string(m_Id);
 }
 
-void AddParticleZoneCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void AddParticleZoneCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     tilemap.AddParticleZone(m_Zone);
 }
 
-void AddParticleZoneCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void AddParticleZoneCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     // LIFO invariant: this command's zone is the last one in the vector.
     auto* zones = tilemap.GetParticleZonesMutable();
@@ -429,7 +408,7 @@ std::string AddParticleZoneCmd::DebugLabel() const
     return "Add particle zone";
 }
 
-void RemoveParticleZoneCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void RemoveParticleZoneCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     const auto* zones = tilemap.GetParticleZones();
     if (!zones || m_Index >= zones->size())
@@ -439,7 +418,7 @@ void RemoveParticleZoneCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
     tilemap.RemoveParticleZone(m_Index);
 }
 
-void RemoveParticleZoneCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void RemoveParticleZoneCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     if (!m_Captured)
         return;
@@ -451,12 +430,12 @@ std::string RemoveParticleZoneCmd::DebugLabel() const
     return "Remove particle zone " + std::to_string(m_Index);
 }
 
-void AddAnimatedTileCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void AddAnimatedTileCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     m_AnimId = tilemap.AddAnimatedTile(m_Anim);
 }
 
-void AddAnimatedTileCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void AddAnimatedTileCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     tilemap.PopLastAnimatedTile();
 }
@@ -487,25 +466,13 @@ ClipboardRegion PasteRegionCmd::SnapshotRegion(
                               static_cast<std::size_t>(dx);
             if (tx >= 0 && tx < mapW && ty >= 0 && ty < mapH)
                 region.cells[idx] = ReadCellFrom(tm, tx, ty);
-            // out-of-bounds source cells remain default (paste into clamped
-            // dest will skip them too).
+            // Out-of-bounds source cells remain empty snapshots. A later paste
+            // can write those empty values if the destination cell is in bounds.
         }
     }
     return region;
 }
 
-// Snapshot one cell. The loop bound is ClipboardCell::LAYER_COUNT (a fixed 10), not
-// tm.GetLayerCount(), because the destination struct is a fixed-size array. On a map with
-// more than 10 dynamicLayers the extra layers are silently not copied - and WriteCellInto
-// below is bounded the same way, so they are also not overwritten on paste. Reads past the
-// tilemap's real layer count are safe: the Tilemap getters return field defaults for an
-// out-of-range layer.
-//
-// Note the odd one out: `layer` is 0-based for every accessor here EXCEPT
-// GetTileStructureId, which takes a 1-based index (it reads internal layer `layer - 1`).
-// WriteCellInto has the same asymmetry, so a copy/paste round-trip is self-consistent, but
-// the structureId a cell carries is the one from the layer below it: slot 0 always holds
-// -1, and layer 9's structureId is never copied at all.
 ClipboardCell PasteRegionCmd::ReadCellFrom(const Tilemap& tm, int x, int y)
 {
     ClipboardCell cell;
@@ -549,7 +516,7 @@ void PasteRegionCmd::WriteCellInto(Tilemap& tm, int destX, int destY, const Clip
     tm.SetElevation(destX, destY, cell.elevation);
 }
 
-void PasteRegionCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void PasteRegionCmd::Apply(Tilemap& tilemap, entt::registry&)
 {
     if (m_Source.Empty())
         return;
@@ -557,8 +524,7 @@ void PasteRegionCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
     int mapW = tilemap.GetMapWidth();
     int mapH = tilemap.GetMapHeight();
 
-    // Capture destination state on first Apply only (Redo reuses the same
-    // snapshot so repeated round-trips don't drift).
+    // Capture once; redo reuses the original destination state.
     if (!m_Captured)
     {
         m_DestSnapshot.width = m_Source.width;
@@ -576,14 +542,13 @@ void PasteRegionCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
                     static_cast<std::size_t>(dx);
                 if (x >= 0 && x < mapW && y >= 0 && y < mapH)
                     m_DestSnapshot.cells[idx] = ReadCellFrom(tilemap, x, y);
-                // out-of-bounds dest cells stay default-constructed; Revert
+                // Out-of-bounds dest cells stay default-constructed; Revert
                 // skips them via the same bounds check below.
             }
         }
         m_Captured = true;
     }
 
-    // Write source cells into destination (clamped to map bounds).
     for (int dy = 0; dy < m_Source.height; ++dy)
     {
         for (int dx = 0; dx < m_Source.width; ++dx)
@@ -599,7 +564,7 @@ void PasteRegionCmd::Apply(Tilemap& tilemap, ecs::registry& /*npcs*/)
     }
 }
 
-void PasteRegionCmd::Revert(Tilemap& tilemap, ecs::registry& /*npcs*/)
+void PasteRegionCmd::Revert(Tilemap& tilemap, entt::registry&)
 {
     if (!m_Captured)
         return;
