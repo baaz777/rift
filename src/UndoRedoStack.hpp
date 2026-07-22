@@ -2,6 +2,8 @@
 
 #include "EditorCommand.hpp"
 
+#include <entt/entt.hpp>
+
 #include <cstddef>
 #include <deque>
 #include <memory>
@@ -12,29 +14,18 @@
 class Tilemap;
 
 /**
- * @brief Bounded undo/redo stack of EditorCommand pointers.
- * @author Alex (https://github.com/lextpf)
+ * @brief Owns command history with oldest-first eviction.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Editor
  *
- * Standard command-pattern history with FIFO eviction at capacity. Holds two
- * deques: undo (most recent action at the back) and redo (cleared on every
- * new mutation). Default capacity is 100 entries.
+ * Execute applies before recording; Push records an already-applied command.
+ * A non-null command clears redo history. Null commands leave both histories unchanged.
+ * Eviction and Clear destroy snapshots without reverting world mutations.
+ * Apply and Revert must use the world in which the command was recorded. Clear history
+ * when replacing that world; the stack does not detect a different tilemap or registry.
  *
- * Two ways to add a command:
- *  - Execute(cmd, tm, npcs): runs cmd->Apply, pushes to undo. Use for single-
- *    shot actions that have not been applied yet (single click, paste, etc.).
- *  - Push(cmd): pushes to undo without calling Apply. Use for stroke commits
- *    where the Touch path already mutated the tilemap during the drag - re-
- *    Applying would double-mutate.
- *
- * Commands are owned by the stack (via unique_ptr) and evicted oldest-first
- * once the undo deque exceeds the capacity. Every mutating call is null-safe:
- * a null command is a no-op.
- *
- * Eviction and redo-clearing destroy the command, not the mutation: the
- * tilemap keeps the applied change and it can no longer be reverted. Any state
- * a reverted command holds outside the world - PlaceNPCCmd's detached
- * NpcRecord, RemoveStructureCmd's tile snapshot - is discarded with it.
+ * Command callbacks run synchronously. Exceptions propagate without rollback. Undo and
+ * Redo remove the command from its source history before invoking the callback.
  */
 class UndoRedoStack
 {
@@ -42,18 +33,14 @@ public:
     /// Undo-history depth used when no capacity is passed to the constructor.
     static constexpr std::size_t DEFAULT_CAPACITY = 100;
 
-    /// Construct a stack holding up to @ref DEFAULT_CAPACITY undo entries.
     UndoRedoStack() = default;
 
     /**
-     * @brief Construct a stack with an explicit undo-history depth.
+     * @fn UndoRedoStack::UndoRedoStack(std::size_t capacity)
+     * @brief Limit the number of retained undo entries.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * @pre capacity >= 1. A capacity of 0 is accepted without a clamp or a
-     * diagnostic, and makes Push discard the command in the same call, so
-     * nothing is ever undoable.
-     *
-     * @param capacity Maximum number of undo entries retained before the
-     *                 oldest is evicted.
+     * @param capacity Maximum entries. Zero disables history but Execute still applies changes.
      */
     explicit UndoRedoStack(std::size_t capacity)
         : m_Capacity(capacity)
@@ -61,16 +48,15 @@ public:
     }
 
     /**
-     * @brief Apply the command immediately, then push it onto the undo stack.
+     * @fn void UndoRedoStack::Execute(std::unique_ptr<EditorCommand> cmd, Tilemap& tilemap, \
+     *     entt::registry& npcs)
+     * @brief Apply a command and transfer it to undo history.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Clears the redo stack. Use for single-shot actions that have not been
-     * applied yet (single click, paste, etc.). A null @p cmd is ignored.
-     *
-     * @param cmd     Command to apply and record (ownership transferred).
-     * @param tilemap Target tilemap forwarded to EditorCommand::Apply.
-     * @param npcs    NPC registry forwarded to EditorCommand::Apply.
+     * Apply runs before history changes, so it can capture prior state. A null command
+     * has no effect. A successful non-null call discards redo history.
      */
-    void Execute(std::unique_ptr<EditorCommand> cmd, Tilemap& tilemap, ecs::registry& npcs)
+    void Execute(std::unique_ptr<EditorCommand> cmd, Tilemap& tilemap, entt::registry& npcs)
     {
         if (!cmd)
             return;
@@ -79,14 +65,12 @@ public:
     }
 
     /**
-     * @brief Record an already-applied command onto the undo stack.
+     * @fn void UndoRedoStack::Push(std::unique_ptr<EditorCommand> cmd)
+     * @brief Record a command for a mutation that is already applied.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Pushes @p cmd without calling Apply (e.g. a stroke accumulator that
-     * already mutated the tilemap during the drag; re-applying would double-
-     * mutate). Clears the redo stack and evicts the oldest entry once the undo
-     * deque exceeds @ref Capacity. A null @p cmd is ignored.
-     *
-     * @param cmd Already-applied command to record (ownership transferred).
+     * The command must hold complete undo data. Push never calls Apply, including for
+     * commands that normally capture snapshots there. A null command has no effect.
      */
     void Push(std::unique_ptr<EditorCommand> cmd)
     {
@@ -99,12 +83,14 @@ public:
     }
 
     /**
-     * @brief Revert the most recent command and move it to the redo stack.
-     * @param tilemap Target tilemap forwarded to EditorCommand::Revert.
-     * @param npcs    NPC registry forwarded to EditorCommand::Revert.
-     * @return `false` if the undo stack was empty (nothing to revert).
+     * @fn bool UndoRedoStack::Undo(Tilemap& tilemap, entt::registry& npcs)
+     * @brief Revert the newest command and move it to redo history.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * @return True when a command was dispatched; false when undo history is empty.
+     * A dispatched command can itself have no effect.
      */
-    bool Undo(Tilemap& tilemap, ecs::registry& npcs)
+    bool Undo(Tilemap& tilemap, entt::registry& npcs)
     {
         if (m_Undo.empty())
             return false;
@@ -116,12 +102,14 @@ public:
     }
 
     /**
-     * @brief Re-apply the most recently reverted command and move it back to undo.
-     * @param tilemap Target tilemap forwarded to EditorCommand::Apply.
-     * @param npcs    NPC registry forwarded to EditorCommand::Apply.
-     * @return `false` if the redo stack was empty (nothing to re-apply).
+     * @fn bool UndoRedoStack::Redo(Tilemap& tilemap, entt::registry& npcs)
+     * @brief Reapply the newest reverted command and move it to undo history.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * @return True when a command was dispatched; false when redo history is empty.
+     * A dispatched command can itself have no effect.
      */
-    bool Redo(Tilemap& tilemap, ecs::registry& npcs)
+    bool Redo(Tilemap& tilemap, entt::registry& npcs)
     {
         if (m_Redo.empty())
             return false;
@@ -132,27 +120,39 @@ public:
         return true;
     }
 
-    /// Drop all history, leaving both the undo and redo stacks empty.
+    /**
+     * @fn void UndoRedoStack::Clear()
+     * @brief Drop all history, leaving both the undo and redo stacks empty.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void Clear()
     {
         m_Undo.clear();
         m_Redo.clear();
     }
 
-    [[nodiscard]] bool CanUndo() const { return !m_Undo.empty(); }  ///< Undo available.
-    [[nodiscard]] bool CanRedo() const { return !m_Redo.empty(); }  ///< Redo available.
+    [[nodiscard]] bool CanUndo() const { return !m_Undo.empty(); }
+    [[nodiscard]] bool CanRedo() const { return !m_Redo.empty(); }
 
-    [[nodiscard]] std::size_t UndoSize() const { return m_Undo.size(); }  ///< Undo entry count.
-    [[nodiscard]] std::size_t RedoSize() const { return m_Redo.size(); }  ///< Redo entry count.
-    [[nodiscard]] std::size_t Capacity() const { return m_Capacity; }     ///< Max undo entries.
+    [[nodiscard]] std::size_t UndoSize() const { return m_Undo.size(); }
+    [[nodiscard]] std::size_t RedoSize() const { return m_Redo.size(); }
+    [[nodiscard]] std::size_t Capacity() const { return m_Capacity; }
 
-    /// Label of the next-to-undo command, or empty string if none.
+    /**
+     * @fn std::string UndoRedoStack::UndoLabel() const
+     * @brief Label of the next-to-undo command, or empty string if none.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::string UndoLabel() const
     {
         return m_Undo.empty() ? std::string{} : m_Undo.back()->DebugLabel();
     }
 
-    /// Label of the next-to-redo command, or empty string if none.
+    /**
+     * @fn std::string UndoRedoStack::RedoLabel() const
+     * @brief Label of the next-to-redo command, or empty string if none.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::string RedoLabel() const
     {
         return m_Redo.empty() ? std::string{} : m_Redo.back()->DebugLabel();
