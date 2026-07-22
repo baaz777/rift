@@ -9,7 +9,7 @@
 namespace
 {
 constexpr const char* LOG_SUBSYSTEM = "Dialogue";
-}  // namespace
+}  // Namespace
 
 namespace
 {
@@ -25,10 +25,6 @@ bool EvaluateCondition(const GameStateManager& state, const DialogueCondition& c
 
         case DialogueCondition::Type::FLAG_EQUALS:
             return state.GetFlagValue(condition.key) == condition.value;
-
-            // No default case - the compiler will warn if a new
-            // DialogueCondition::Type enumerator is added without
-            // a corresponding case here.
     }
     return false;
 }
@@ -45,16 +41,14 @@ bool EvaluateConditions(const GameStateManager& state,
     }
     return true;
 }
-}  // namespace
+}  // Namespace
 
-// Invariants: when active, m_CurrentTree points at m_ActiveTree and
-// m_VisibleOptions stores pointers into that owned copy.
 DialogueManager::DialogueManager()
-    : m_StateManager(nullptr),  // Set by Initialize() - evaluates conditions and stores flags
-      m_Active(false),          // No conversation in progress until StartDialogue()
-      m_CurrentTree(nullptr),   // Points to m_ActiveTree when dialogue is active
-      m_CurrentNode(nullptr),   // Current position in the dialogue tree
-      m_SelectedOption(0)       // UI cursor position in the options list
+    : m_StateManager(nullptr),
+      m_Active(false),
+      m_CurrentTree(nullptr),
+      m_CurrentNode(nullptr),
+      m_SelectedOption(0)
 {
 }
 
@@ -63,31 +57,27 @@ void DialogueManager::Initialize(GameStateManager* stateManager)
     m_StateManager = stateManager;
 }
 
-bool DialogueManager::StartDialogue(ecs::entity npc, const ecs::registry& world)
+bool DialogueManager::StartDialogue(entt::entity npc, const entt::registry& world)
 {
-    // Respect the contract: do not start if a conversation is already active.
     if (m_Active)
     {
         Logger::Error(LOG_SUBSYSTEM, "Dialogue already active; refusing to start a new one");
         return false;
     }
 
-    // Validate required state.
-    if (!world.alive(npc) || !m_StateManager)
+    if (!world.valid(npc) || !m_StateManager)
     {
         return false;
     }
 
-    // Resolve the NPC's dialogue component + its tree from the store in globals.
-    const Dialogue* dialogue = world.find<Dialogue>(npc);
-    const WorldServices* services = world.globals().find<WorldServices>();
+    const Dialogue* dialogue = world.try_get<Dialogue>(npc);
+    const WorldServices* services = world.ctx().find<WorldServices>();
     if (dialogue == nullptr || services == nullptr || services->dialogue == nullptr ||
         !services->dialogue->HasTree(dialogue->tree))
     {
         return false;
     }
 
-    // Get the starting point for this conversation
     const DialogueTree& tree = services->dialogue->Get(dialogue->tree);
     const DialogueNode* startNode = tree.GetStartNode();
     if (!startNode)
@@ -96,7 +86,7 @@ bool DialogueManager::StartDialogue(ecs::entity npc, const ecs::registry& world)
         return false;
     }
 
-    // Copy the tree locally so pointers remain valid even if the NPC is removed
+    // Keep node and option pointers valid if the NPC is removed.
     m_ActiveTree = tree;
     startNode = m_ActiveTree.GetStartNode();
     if (!startNode)
@@ -105,13 +95,11 @@ bool DialogueManager::StartDialogue(ecs::entity npc, const ecs::registry& world)
         return false;
     }
 
-    // Initialize dialogue state
     m_Active = true;
     m_CurrentTree = &m_ActiveTree;
     m_CurrentNode = startNode;
     m_SelectedOption = 0;
 
-    // Build the list of currently available options
     RefreshVisibleOptions();
 
     Logger::InfoF(LOG_SUBSYSTEM, "Started dialogue with NPC '{}'", dialogue->type);
@@ -132,7 +120,6 @@ void DialogueManager::EndDialogue()
 
 void DialogueManager::SelectOption(int optionIndex)
 {
-    // Validate state and bounds
     if (!m_Active || !m_CurrentNode)
     {
         return;
@@ -144,23 +131,19 @@ void DialogueManager::SelectOption(int optionIndex)
 
     const DialogueOption* option = m_VisibleOptions[optionIndex];
 
-    // Apply any game state changes from this choice
     ExecuteConsequences(option->consequences);
 
-    // Move to the next part of the conversation (or end it)
     TransitionToNode(option->nextNodeId);
 }
 
 void DialogueManager::TransitionToNode(const std::string& nodeId)
 {
-    // Empty nodeId means "end dialogue" (terminal option)
     if (nodeId.empty() || !m_CurrentTree)
     {
         EndDialogue();
         return;
     }
 
-    // Look up the next node in the tree
     const DialogueNode* nextNode = m_CurrentTree->GetNode(nodeId);
     if (!nextNode)
     {
@@ -169,7 +152,6 @@ void DialogueManager::TransitionToNode(const std::string& nodeId)
         return;
     }
 
-    // Update state and rebuild options for the new node
     m_CurrentNode = nextNode;
     m_SelectedOption = 0;
     RefreshVisibleOptions();
@@ -185,7 +167,6 @@ void DialogueManager::SelectPrevious()
     m_SelectedOption--;
     if (m_SelectedOption < 0)
     {
-        // Wrap from first to last
         m_SelectedOption = static_cast<int>(m_VisibleOptions.size()) - 1;
     }
 }
@@ -200,7 +181,6 @@ void DialogueManager::SelectNext()
     m_SelectedOption++;
     if (m_SelectedOption >= static_cast<int>(m_VisibleOptions.size()))
     {
-        // Wrap from last to first
         m_SelectedOption = 0;
     }
 }
@@ -210,12 +190,11 @@ void DialogueManager::ConfirmSelection()
     if (m_VisibleOptions.empty())
     {
         // No options available: treat as end of dialogue. No consequences run here.
-        // TODO: support non-choice nodes (e.g., auto-advance) instead of always ending here.
+        // TODO: Support non-choice nodes (e.g., auto-advance) instead of always ending here.
         EndDialogue();
     }
     else
     {
-        // Process the currently highlighted option
         SelectOption(m_SelectedOption);
     }
 }
@@ -232,20 +211,19 @@ void DialogueManager::ExecuteConsequences(const std::vector<DialogueConsequence>
         switch (cons.type)
         {
             case DialogueConsequence::Type::SET_FLAG:
-                // Mark a boolean flag as true (e.g., "quest_accepted"). cons.value is
-                // ignored here, so the JSON "flag:text" form loses its text.
+                // SET_FLAG ignores cons.value; the JSON flag:text form loses its payload.
                 m_StateManager->SetFlag(cons.key, true);
                 Logger::InfoF(LOG_SUBSYSTEM, "Set flag '{}' = true", cons.key);
                 break;
 
             case DialogueConsequence::Type::CLEAR_FLAG:
-                // Remove/unset a flag key entirely (e.g., "has_item")
+
                 m_StateManager->ClearFlag(cons.key);
                 Logger::InfoF(LOG_SUBSYSTEM, "Cleared flag '{}'", cons.key);
                 break;
 
             case DialogueConsequence::Type::SET_FLAG_VALUE:
-                // Set a flag to a specific string value (e.g., "reputation" = "friendly")
+
                 m_StateManager->SetFlagValue(cons.key, cons.value);
                 Logger::InfoF(LOG_SUBSYSTEM, "Set flag '{}' = '{}'", cons.key, cons.value);
                 break;
@@ -255,7 +233,7 @@ void DialogueManager::ExecuteConsequences(const std::vector<DialogueConsequence>
                     LOG_SUBSYSTEM, "Unhandled consequence type {}", static_cast<int>(cons.type));
                 break;
         }
-        // TODO: extend consequences to support scripted actions or item grants.
+        // TODO: Extend consequences to support scripted actions or item grants.
     }
 }
 
@@ -268,17 +246,14 @@ void DialogueManager::RefreshVisibleOptions()
         return;
     }
 
-    // Filter options based on their conditions
     for (const auto& option : m_CurrentNode->options)
     {
-        // Only show options where all conditions are satisfied
         if (EvaluateConditions(*m_StateManager, option.conditions))
         {
             m_VisibleOptions.push_back(&option);
         }
     }
 
-    // Ensure selected index is still valid after filtering
     if (m_SelectedOption >= static_cast<int>(m_VisibleOptions.size()))
     {
         m_SelectedOption = std::max(0, static_cast<int>(m_VisibleOptions.size()) - 1);
