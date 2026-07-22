@@ -1,19 +1,10 @@
-// ConsoleCommands - the ~100 built-in developer-console commands.
-//
-// Dispatch path:
-//   console input -> ConsoleCommandRegistry lookup (canonical name or alias)
+// Command dispatch:
+//   Console input -> ConsoleCommandRegistry lookup (canonical name or alias)
 //                 -> makeContext() rebuilds a CommandContext from live Game state
 //                 -> Cmd_*(args, ctx) -> output text into ConsoleBuffer via ctx.out
 //
-// A CommandContext, and every pointer inside it, is valid only for the handler that
-// received it: it aliases Game-owned state and is rebuilt per invocation.
-//
-// Every command's grammar is duplicated in four places that nothing keeps in sync.
-// Adding or changing a command means updating all four together:
-//   1. the one-line doc brief on the declaration in ConsoleCommands.hpp
-//   2. the handler's own usage/error strings
-//   3. the Register() description in RegisterDefaultCommands (this is what `help` prints)
-//   4. SetArgCompletions at the end of that function, when the value set is small and named
+// Context pointers are valid only during the handler. Keep usage strings, registry help
+// and argument completion in sync.
 
 #include "ConsoleCommands.hpp"
 
@@ -66,14 +57,11 @@
 
 namespace
 {
-// Tile size this file assumes for every tile <-> world conversion, matching the 16 that
-// PlayerSystem::SetTilePosition also hardcodes. Tilemap carries the project's real
-// tileWidth/tileHeight (map.size and tileset.info read them), so on a non-16px project
-// every tile coordinate the other commands print or write is wrong. Fix both places together.
+// Tile conversions assume 16 px, as does PlayerSystem::SetTilePosition.
+// Projects with another tile size need both paths changed together.
 constexpr int CONSOLE_TILE_SIZE = 16;
 
-// Parse a decimal integer from text. A leading '-' is accepted, so a caller that needs a
-// non-negative value must range-check the result itself. Returns true on success.
+// Accepts a leading minus; callers enforce nonnegative ranges.
 bool ParseInt(std::string_view text, int& out)
 {
     if (text.empty())
@@ -90,37 +78,29 @@ bool ParseInt(std::string_view text, int& out)
     return true;
 }
 
-// NPC console commands address NPCs by index in npc.list order. Resolve an
-// index to its entity handle, or ecs::entity{} if out of range (callers
-// test the result with operator bool). The order is the registry's dense order and is
-// stable within one command invocation. npc.spawn appends, so existing indices survive
-// it; npc.despawn swap-and-pops, so the last NPC takes the removed slot and every later
-// idx from an earlier npc.list is stale (npc.list prints that warning).
-ecs::entity NpcAtIndex(ecs::registry& world, int idx)
+// Resolve the index in ascending instanceId order; out-of-range returns entt::null.
+entt::entity NpcAtIndex(entt::registry& world, int idx)
 {
     if (idx < 0)
     {
-        return ecs::entity{};
+        return entt::null;
     }
-    const std::vector<ecs::entity> entities = EntityStore::Entities(world);
+    const std::vector<entt::entity> entities = EntityStore::Entities(world);
     if (static_cast<std::size_t>(idx) >= entities.size())
     {
-        return ecs::entity{};
+        return entt::null;
     }
     return entities[static_cast<std::size_t>(idx)];
 }
 
-// Parse a float from text in from_chars' default general format: optional sign, decimal
-// point and optional exponent (`1e3` parses). The whole string must be consumed. The
-// "inf"/"nan" spellings parse, and are rejected by the finiteness check below, not by
-// the parser.
+// Requires the whole string and a finite result; general-format exponents are accepted.
 bool ParseFloat(std::string_view text, float& out)
 {
     if (text.empty())
     {
         return false;
     }
-    // std::from_chars for float is supported by MSVC and recent libstdc++/libc++.
+
     float value = 0.0f;
     auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
     if (ec != std::errc{} || ptr != text.data() + text.size())
@@ -191,10 +171,7 @@ bool ParseRendererAPI(std::string_view text, RendererAPI& out)
     return false;
 }
 
-// Build an ArgCompletionProvider that offers a fixed `values` list for the
-// positional argument at `slot` (0 = first arg after the verb) and nothing
-// for any other slot. Keeps the many on/off/toggle-style commands from each
-// repeating the same lambda.
+// Fixed values for one zero-based argument slot; other slots return no suggestions.
 ConsoleCommandRegistry::ArgCompletionProvider FixedArgValues(std::vector<std::string> values,
                                                              std::size_t slot = 0)
 {
@@ -211,32 +188,17 @@ ConsoleCommandRegistry::ArgCompletionProvider FixedArgValues(std::vector<std::st
 // What a routed weather request actually did, so callers echo honestly.
 enum class WeatherRouteResult : std::uint8_t
 {
-    Transitioned,  // This request started (or retargeted) a blend.
-    Instant,       // Hard cut (seconds <= 0 / director disabled) or bare set.
+    Transitioned,
+    Instant,  // Same-target requests still arm the manual forecast hold.
     // Same-target no-op: transition pair and published weather unchanged. Director
     // state is not fully untouched - RequestWeather arms the manual forecast hold
     // before delegating, so weather.status reports manualHold=yes afterwards.
     NoChange
 };
 
-// Shared route-or-fallback for the three weather-setting commands
-// (time.weather / weather.next / weather.random): route through the
-// director when present, else hard-set via ctx.time. Callers must have
-// already null-checked ctx.time (RequestWeather and SetWeather both
-// dereference it).
-//
-// Returns what this call actually did, derived from a before/after snapshot
-// of the director's transition state. StartWeatherChange's same-target
-// branch is a pure no-op (duration/progress untouched), so a bare post-call
-// IsTransitioning() would attribute an earlier in-flight transition to this
-// request and echo a duration that never took effect:
-//  - Transitioned: this request started or retargeted a blend; the caller's
-//    requested seconds are in effect -> echo "(N.Ns)".
-//  - NoChange: the director ignored the request (already at, or heading to,
-//    the target); transition pair and published weather are exactly as
-//    before -> echo "(no change)".
-//  - Instant: hard cut (seconds <= 0 or director disabled), or the
-//    null-director bare-set fallback -> echo "(instant)".
+// Route through the director, or set ctx.time directly. ctx.time must be non-null.
+// Compare transition state before and after: an already-active transition does not prove
+// this request started one. Report Transitioned, NoChange or Instant accordingly.
 WeatherRouteResult RouteWeatherRequest(CommandContext& ctx, WeatherState target, float seconds)
 {
     if (ctx.weatherDirector == nullptr)
@@ -263,7 +225,6 @@ WeatherRouteResult RouteWeatherRequest(CommandContext& ctx, WeatherState target,
     return WeatherRouteResult::Instant;
 }
 
-// Echo suffix for the three RouteWeatherRequest outcomes, written into buf.
 void WeatherRouteSuffix(WeatherRouteResult result, float seconds, char* buf, std::size_t size)
 {
     switch (result)
@@ -279,15 +240,11 @@ void WeatherRouteSuffix(WeatherRouteResult result, float seconds, char* buf, std
             break;
     }
 }
-}  // namespace
+}  // Namespace
 
-// help - list every registered console command with its aliases and description.
-bool Cmd_Help(std::span<const std::string_view> /*args*/, CommandContext& ctx)
+bool Cmd_Help(std::span<const std::string_view>, CommandContext& ctx)
 {
-    // Bind ctx.out to a local reference up-front so the static analyzer
-    // tracks it independently of the path-sensitive null-state of
-    // ctx.registry below (otherwise it pessimistically flags the PrintError
-    // call as a "Called C++ object pointer is null").
+    // Bind output locally so the analyzer does not conflate its null state with ctx.registry.
     ConsoleBuffer& out = ctx.out;
     const ConsoleCommandRegistry* registry = ctx.registry;
     if (registry == nullptr)
@@ -318,17 +275,15 @@ bool Cmd_Help(std::span<const std::string_view> /*args*/, CommandContext& ctx)
     return true;
 }
 
-// clear - wipe the console output buffer.
-bool Cmd_Clear(std::span<const std::string_view> /*args*/, CommandContext& ctx)
+bool Cmd_Clear(std::span<const std::string_view>, CommandContext& ctx)
 {
     ctx.out.Clear();
     return true;
 }
 
-// teleport <tileX> <tileY> - move the player to the given tile coordinates.
 bool Cmd_Teleport(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("teleport: player unavailable");
         return false;
@@ -351,7 +306,6 @@ bool Cmd_Teleport(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// flag.set <name> <value> - set a game-state flag to a string value.
 bool Cmd_FlagSet(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -371,7 +325,6 @@ bool Cmd_FlagSet(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// flag.get <name> - print a game-state flag's value, or <unset> if absent.
 bool Cmd_FlagGet(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -394,10 +347,8 @@ bool Cmd_FlagGet(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// time.set <hours> - set the time of day. The 0.0-24.0 range in the usage string is
-// advisory: any finite value is accepted and TimeManager::SetTime wraps it into [0, 24).
-// The echo below prints the raw argument, so `time.set 30` reports 30.00h while the clock
-// actually reads 6.00h. time.add echoes the post-wrap clock instead.
+// SetTime wraps finite hours; the echo prints the raw argument.
+// time.set 30 reports 30.00h while the clock reads 6.00h.
 bool Cmd_TimeSet(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -423,8 +374,6 @@ bool Cmd_TimeSet(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// time.add <hours> - advance (or rewind, if negative) the time of day. Crossing midnight
-// moves TimeManager's day count, which shifts the moon phase and the weather forecast.
 bool Cmd_TimeAdd(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -456,7 +405,7 @@ bool Cmd_TimeAdd(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// time.freeze [on|off|toggle] - pause/resume the day-night clock.
+// time.freeze [on|off|toggle] - Pause/resume the day-night clock.
 bool Cmd_TimeFreeze(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -474,14 +423,11 @@ bool Cmd_TimeFreeze(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// map.load <filename> - load a map from JSON, replacing all tilemap and NPC state, and
-// move the player to the map's spawn tile. map.save writes the player's character type
-// into the file, but this path reads it and does not apply it: the player keeps the
-// current sprite. Use character.set to change it.
+// Map load reads but does not apply the saved player character type.
 bool Cmd_MapLoad(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr || ctx.npcs == nullptr ||
-        (ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+        (ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("map.load: world refs unavailable");
         return false;
@@ -510,10 +456,9 @@ bool Cmd_MapLoad(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// state.dump - print player tile/world pos, time, NPC count, and active quests.
-bool Cmd_StateDump(std::span<const std::string_view> /*args*/, CommandContext& ctx)
+bool Cmd_StateDump(std::span<const std::string_view>, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)) || ctx.time == nullptr ||
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)) || ctx.time == nullptr ||
         ctx.gameState == nullptr || ctx.npcs == nullptr)
     {
         ctx.out.PrintError("state.dump: refs unavailable");
@@ -522,10 +467,7 @@ bool Cmd_StateDump(std::span<const std::string_view> /*args*/, CommandContext& c
 
     const glm::vec2 pos = ctx.npcs->get<Transform>(ctx.playerEntity).position;
     const int tileX = TileMath::TileIndex(pos.x, static_cast<float>(CONSOLE_TILE_SIZE));
-    // Standing-tile row (feet nudged up so a boundary-standing player counts as
-    // the tile above) - matches dialogue/teleport tile math. See TileMath.
-    // npc.nearest and bookmark.set use the anchor row instead, so mid-stride the
-    // two readouts can differ by one row.
+    // Standing-row reporting can differ by one row from anchor-row commands mid-stride.
     const int tileY = TileMath::StandingTileRow(pos.y, static_cast<float>(CONSOLE_TILE_SIZE));
 
     const float hours = ctx.time->GetTimeOfDay();
@@ -558,10 +500,9 @@ bool Cmd_StateDump(std::span<const std::string_view> /*args*/, CommandContext& c
     return true;
 }
 
-// player.speed [multiplier] - print or set the player movement speed multiplier (>0).
 bool Cmd_PlayerSpeed(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("player.speed: player unavailable");
         return false;
@@ -599,15 +540,14 @@ bool Cmd_PlayerSpeed(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// noclip [on|off] - toggle player collision-free movement (defaults to toggle).
 bool Cmd_NoClip(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("noclip: player unavailable");
         return false;
     }
-    bool target = !ctx.npcs->get<PlayerModes>(ctx.playerEntity).noClip;  // default: toggle
+    bool target = !ctx.npcs->get<PlayerModes>(ctx.playerEntity).noClip;
     if (args.size() == 1)
     {
         if (args[0] == "on" || args[0] == "1" || args[0] == "true")
@@ -634,7 +574,7 @@ bool Cmd_NoClip(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// editor [on|off|toggle] - enable/disable the in-game level editor.
+// editor [on|off|toggle] - Enable/disable the in-game level editor.
 bool Cmd_Editor(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.editor == nullptr)
@@ -652,10 +592,9 @@ bool Cmd_Editor(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// appearance.copy - copy the sprite of the nearest NPC within 32px onto the player.
 bool Cmd_AppearanceCopy(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)) || ctx.npcs == nullptr ||
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)) || ctx.npcs == nullptr ||
         ctx.renderer == nullptr)
     {
         ctx.out.PrintError("appearance.copy: world refs unavailable");
@@ -673,25 +612,25 @@ bool Cmd_AppearanceCopy(std::span<const std::string_view> args, CommandContext& 
     }
     constexpr float APPEARANCE_COPY_RANGE = 32.0f;
     const glm::vec2 playerPos = ctx.npcs->get<Transform>(ctx.playerEntity).position;
-    ecs::entity nearest{};
+    entt::entity nearest = entt::null;
     float nearestDist = APPEARANCE_COPY_RANGE + 1.0f;
-    ctx.npcs->each<const Transform, const NpcTag>(
-        [&](ecs::entity e, const Transform& xf)
+    for (const entt::entity entity : EntityStore::Entities(*ctx.npcs))
+    {
+        const Transform& xf = ctx.npcs->get<Transform>(entity);
+        const float dist = glm::length(xf.position - playerPos);
+        if (dist < nearestDist && dist <= APPEARANCE_COPY_RANGE)
         {
-            const float dist = glm::length(xf.position - playerPos);
-            if (dist < nearestDist && dist <= APPEARANCE_COPY_RANGE)
-            {
-                nearestDist = dist;
-                nearest = e;
-            }
-        });
-    if (!nearest)
+            nearestDist = dist;
+            nearest = entity;
+        }
+    }
+    if (nearest == entt::null)
     {
         ctx.out.PrintError("appearance.copy: no NPC within 32px");
         return false;
     }
     const std::string& npcType = ctx.npcs->get<Dialogue>(nearest).type;
-    const WorldServices* svc = ctx.npcs->globals().find<WorldServices>();
+    const WorldServices* svc = ctx.npcs->ctx().find<WorldServices>();
     const std::string spritePath = (svc != nullptr && svc->assets != nullptr)
                                        ? svc->assets->ResolveNpcAsset(npcType)
                                        : std::string();
@@ -705,10 +644,9 @@ bool Cmd_AppearanceCopy(std::span<const std::string_view> args, CommandContext& 
     return true;
 }
 
-// appearance.restore - revert the player to their original appearance.
 bool Cmd_AppearanceRestore(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)) || ctx.renderer == nullptr)
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)) || ctx.renderer == nullptr)
     {
         ctx.out.PrintError("appearance.restore: refs unavailable");
         return false;
@@ -729,10 +667,10 @@ bool Cmd_AppearanceRestore(std::span<const std::string_view> args, CommandContex
     return true;
 }
 
-// character.set <BW1_MALE|BW1_FEMALE|BW2_MALE|BW2_FEMALE|CC_FEMALE> - set player character.
+// character.set <BW1_MALE|BW1_FEMALE|BW2_MALE|BW2_FEMALE|CC_FEMALE> - Set player character.
 bool Cmd_CharacterSet(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("character.set: player unavailable");
         return false;
@@ -762,10 +700,9 @@ bool Cmd_CharacterSet(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// character.next - cycle the player to the next character type.
 bool Cmd_CharacterNext(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("character.next: player unavailable");
         return false;
@@ -787,7 +724,6 @@ bool Cmd_CharacterNext(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// renderer.set <opengl|vulkan> - hot-swap the active rendering backend at runtime.
 bool Cmd_RendererSet(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -816,7 +752,7 @@ bool Cmd_RendererSet(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// debug.info [on|off|toggle] - toggle the editor debug-info readout.
+// debug.info [on|off|toggle] - Toggle the editor debug-info readout.
 bool Cmd_DebugInfo(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.editor == nullptr)
@@ -834,7 +770,7 @@ bool Cmd_DebugInfo(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// particles [on|off|toggle] - enable/disable particle rendering.
+// particles [on|off|toggle] - Enable/disable particle rendering.
 bool Cmd_ParticlesToggle(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.particles == nullptr)
@@ -852,7 +788,7 @@ bool Cmd_ParticlesToggle(std::span<const std::string_view> args, CommandContext&
     return true;
 }
 
-// debug.overlays [on|off|toggle] - toggle editor debug overlays.
+// debug.overlays [on|off|toggle] - Toggle editor debug overlays.
 bool Cmd_DebugOverlays(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.editor == nullptr)
@@ -870,7 +806,7 @@ bool Cmd_DebugOverlays(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// fps.cap [on|off|toggle] - cap FPS at 500 or run uncapped.
+// fps.cap [on|off|toggle] - Cap FPS at 500 or run uncapped.
 bool Cmd_FpsCap(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -889,9 +825,6 @@ bool Cmd_FpsCap(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// world3d [on|off|toggle] - render gameplay through the world-space 3D path.
-// Off by default: the flat pipeline and the 3D one coexist while the new look is
-// being evaluated, so this is the switch between them.
 bool Cmd_World3D(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -909,7 +842,7 @@ bool Cmd_World3D(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// cam.preset <classic|ds|free> - select the camera configuration.
+// cam.preset <classic|ds|free> - Select the camera configuration.
 bool Cmd_CamPreset(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -952,8 +885,6 @@ bool Cmd_CamPreset(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// cam.yaw <degrees> / cam.pitch <degrees> - drive the orbit directly. Both imply
-// the Free preset, since Classic and DS pin their angles.
 bool Cmd_CamYaw(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -992,7 +923,6 @@ bool Cmd_CamPitch(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// time.next - step to the next of 8 preset times of day, cycling round.
 bool Cmd_TimeNext(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1014,7 +944,7 @@ bool Cmd_TimeNext(std::span<const std::string_view> args, CommandContext& ctx)
                                                    "Evening (21:00)",
                                                    "Night (01:00)",
                                                    "Late Night (04:30)"};
-    // -1 means the next call lands on index 0 (Dawn). Persists across calls.
+
     static int s_cycle = -1;
     s_cycle = (s_cycle + 1) % 8;
     ctx.time->SetTime(kPresetHours[s_cycle]);
@@ -1022,7 +952,7 @@ bool Cmd_TimeNext(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// postfx [on|off|toggle] - toggle the post-processing effect chain.
+// postfx [on|off|toggle] - Toggle the post-processing effect chain.
 bool Cmd_PostFX(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.postFXEnabled == nullptr)
@@ -1040,10 +970,9 @@ bool Cmd_PostFX(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// player.pos - print player tile/world position and facing direction.
 bool Cmd_PlayerPos(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("player.pos: player unavailable");
         return false;
@@ -1085,10 +1014,10 @@ bool Cmd_PlayerPos(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// player.bicycle [on|off|toggle] - toggle the player's bicycle mode.
+// player.bicycle [on|off|toggle] - Toggle the player's bicycle mode.
 bool Cmd_PlayerBicycle(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("player.bicycle: player unavailable");
         return false;
@@ -1107,10 +1036,10 @@ bool Cmd_PlayerBicycle(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// player.run [on|off|toggle] - toggle the player's running mode.
+// player.run [on|off|toggle] - Toggle the player's running mode.
 bool Cmd_PlayerRun(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("player.run: player unavailable");
         return false;
@@ -1129,10 +1058,9 @@ bool Cmd_PlayerRun(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// move.accel [px/s^2] - print or set the player's acceleration.
 bool Cmd_MoveAccel(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("move.accel: player unavailable");
         return false;
@@ -1165,10 +1093,9 @@ bool Cmd_MoveAccel(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// move.decel [px/s^2] - print or set the player's deceleration.
 bool Cmd_MoveDecel(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("move.decel: player unavailable");
         return false;
@@ -1201,7 +1128,6 @@ bool Cmd_MoveDecel(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// move.lookahead [px] - print or set the camera look-ahead distance.
 bool Cmd_MoveLookahead(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.camera == nullptr)
@@ -1235,7 +1161,6 @@ bool Cmd_MoveLookahead(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// move.dump - print player accel/decel and camera look-ahead distance.
 bool Cmd_MoveDump(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (!args.empty())
@@ -1243,7 +1168,7 @@ bool Cmd_MoveDump(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("move.dump: usage 'move.dump'");
         return false;
     }
-    if (ctx.npcs != nullptr && ctx.npcs->alive(ctx.playerEntity))
+    if (ctx.npcs != nullptr && ctx.npcs->valid(ctx.playerEntity))
     {
         char line[96];
         std::snprintf(line,
@@ -1260,7 +1185,7 @@ bool Cmd_MoveDump(std::span<const std::string_view> args, CommandContext& ctx)
             line, sizeof(line), "move: lookahead %.1f px", ctx.camera->GetLookAheadDistance());
         ctx.out.Print(line);
     }
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)) && ctx.camera == nullptr)
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)) && ctx.camera == nullptr)
     {
         ctx.out.PrintError("move.dump: player and camera unavailable");
         return false;
@@ -1268,7 +1193,6 @@ bool Cmd_MoveDump(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.list - list NPCs with idx, name, type, tile, and patrol/stopped state.
 bool Cmd_NpcList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -1281,7 +1205,7 @@ bool Cmd_NpcList(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("npc.list: usage 'npc.list'");
         return false;
     }
-    const std::vector<ecs::entity> entities = EntityStore::Entities(*ctx.npcs);
+    const std::vector<entt::entity> entities = EntityStore::Entities(*ctx.npcs);
     char header[64];
     std::snprintf(header, sizeof(header), "npc.list: %zu NPC(s)", entities.size());
     ctx.out.Print(header);
@@ -1310,7 +1234,6 @@ bool Cmd_NpcList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.tp <idx> <tileX> <tileY> - teleport the indexed NPC to the given tile.
 bool Cmd_NpcTp(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -1331,8 +1254,8 @@ bool Cmd_NpcTp(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("npc.tp: idx and tile coords must be non-negative integers");
         return false;
     }
-    const ecs::entity npcE = NpcAtIndex(*ctx.npcs, idx);
-    if (!npcE)
+    const entt::entity npcE = NpcAtIndex(*ctx.npcs, idx);
+    if (npcE == entt::null)
     {
         ctx.out.PrintError("npc.tp: idx out of range");
         return false;
@@ -1349,7 +1272,6 @@ bool Cmd_NpcTp(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.spawn <type> <tileX> <tileY> - spawn an NPC of the given type at a tile.
 bool Cmd_NpcSpawn(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -1375,8 +1297,8 @@ bool Cmd_NpcSpawn(std::span<const std::string_view> args, CommandContext& ctx)
     record.tileX = tx;
     record.tileY = ty;
     record.tileSize = CONSOLE_TILE_SIZE;
-    const ecs::entity spawned = EntityStore::SpawnNpc(*ctx.npcs, record, ctx.renderer);
-    if (!spawned)
+    const entt::entity spawned = EntityStore::SpawnNpc(*ctx.npcs, record, ctx.renderer);
+    if (spawned == entt::null)
     {
         ctx.out.PrintError("npc.spawn: failed to load sprite for type '" + type + "'");
         return false;
@@ -1393,7 +1315,6 @@ bool Cmd_NpcSpawn(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.despawn <idx> - remove an NPC; blocked if it's the active dialogue speaker.
 bool Cmd_NpcDespawn(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -1412,13 +1333,13 @@ bool Cmd_NpcDespawn(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("npc.despawn: idx must be a non-negative integer");
         return false;
     }
-    const std::vector<ecs::entity> entities = EntityStore::Entities(*ctx.npcs);
+    const std::vector<entt::entity> entities = EntityStore::Entities(*ctx.npcs);
     if (idx < 0 || static_cast<std::size_t>(idx) >= entities.size())
     {
         ctx.out.PrintError("npc.despawn: idx out of range");
         return false;
     }
-    const ecs::entity target = entities[static_cast<std::size_t>(idx)];
+    const entt::entity target = entities[static_cast<std::size_t>(idx)];
     if (ctx.game != nullptr && ctx.game->IsInSimpleDialogue() &&
         ctx.game->GetDialogueNPCId() == ctx.npcs->get<Identity>(target).instanceId)
     {
@@ -1433,7 +1354,7 @@ bool Cmd_NpcDespawn(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.freeze <idx|all> [on|off|toggle] - stop/resume NPC patrol.
+// npc.freeze <idx|all> [on|off|toggle] - Stop/resume NPC patrol.
 bool Cmd_NpcFreeze(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -1448,10 +1369,10 @@ bool Cmd_NpcFreeze(std::span<const std::string_view> args, CommandContext& ctx)
     }
     const bool isAll = (args[0] == "all");
     int idx = -1;
-    ecs::entity npcE{};
+    entt::entity npcE = entt::null;
     if (!isAll)
     {
-        if (!ParseInt(args[0], idx) || !(npcE = NpcAtIndex(*ctx.npcs, idx)))
+        if (!ParseInt(args[0], idx) || ((npcE = NpcAtIndex(*ctx.npcs, idx)) == entt::null))
         {
             ctx.out.PrintError("npc.freeze: first arg must be 'all' or a valid NPC index");
             return false;
@@ -1467,7 +1388,7 @@ bool Cmd_NpcFreeze(std::span<const std::string_view> args, CommandContext& ctx)
     }
     if (isAll)
     {
-        ctx.npcs->each<NpcIdle, NpcTag>([&](NpcIdle& idle) { idle.isStopped = target; });
+        ctx.npcs->view<NpcIdle, NpcTag>().each([&](NpcIdle& idle) { idle.isStopped = target; });
         ctx.out.Print(std::string("npc.freeze all: ") + (target ? "ON" : "OFF"));
     }
     else
@@ -1480,7 +1401,6 @@ bool Cmd_NpcFreeze(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.dialog <idx> <text...> - set an NPC's simple dialogue text.
 bool Cmd_NpcDialog(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -1494,8 +1414,8 @@ bool Cmd_NpcDialog(std::span<const std::string_view> args, CommandContext& ctx)
         return false;
     }
     int idx = 0;
-    ecs::entity npcE{};
-    if (!ParseInt(args[0], idx) || !(npcE = NpcAtIndex(*ctx.npcs, idx)))
+    entt::entity npcE = entt::null;
+    if (!ParseInt(args[0], idx) || ((npcE = NpcAtIndex(*ctx.npcs, idx)) == entt::null))
     {
         ctx.out.PrintError("npc.dialog: idx out of range");
         return false;
@@ -1516,7 +1436,6 @@ bool Cmd_NpcDialog(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// dialogue.active - print active dialogue (simple text or tree node + visible options).
 bool Cmd_DialogueActive(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.dialogue == nullptr)
@@ -1566,7 +1485,6 @@ bool Cmd_DialogueActive(std::span<const std::string_view> args, CommandContext& 
     return true;
 }
 
-// dialogue.end - close any active dialogue.
 bool Cmd_DialogueEnd(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -1584,7 +1502,6 @@ bool Cmd_DialogueEnd(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// dialogue.skip - confirm/advance the current tree dialogue selection.
 bool Cmd_DialogueSkip(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.dialogue == nullptr)
@@ -1607,7 +1524,6 @@ bool Cmd_DialogueSkip(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// flag.list - list all game-state flags (sorted) with their values.
 bool Cmd_FlagList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -1625,7 +1541,7 @@ bool Cmd_FlagList(std::span<const std::string_view> args, CommandContext& ctx)
     std::snprintf(
         header, sizeof(header), "flag.list: %zu flag(s)", static_cast<std::size_t>(flags.size()));
     ctx.out.Print(header);
-    // Sort for deterministic output (unordered_map iteration order is unstable).
+
     std::vector<std::string> keys;
     keys.reserve(flags.size());
     for (const auto& [k, _v] : flags)
@@ -1641,7 +1557,6 @@ bool Cmd_FlagList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// flag.unset <name> - clear a game-state flag; notes if it wasn't set.
 bool Cmd_FlagUnset(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -1668,7 +1583,6 @@ bool Cmd_FlagUnset(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// time.scale <multiplier> - set day/night time scale (must be > 0).
 bool Cmd_TimeScale(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1699,8 +1613,6 @@ bool Cmd_TimeScale(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// time.weather <name> [seconds] - set weather, blending over the given
-// duration (default ambience::WEATHER_TRANSITION_SECONDS; 0 = hard cut).
 bool Cmd_TimeWeather(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1743,7 +1655,6 @@ bool Cmd_TimeWeather(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// weather.overlay <name|off> - set or clear the manual sky overlay weather.
 bool Cmd_WeatherOverlay(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1780,7 +1691,6 @@ bool Cmd_WeatherOverlay(std::span<const std::string_view> args, CommandContext& 
     return true;
 }
 
-// weather.intensity <0.0-1.0> - set weather effect intensity.
 bool Cmd_WeatherIntensity(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1806,9 +1716,6 @@ bool Cmd_WeatherIntensity(std::span<const std::string_view> args, CommandContext
     return true;
 }
 
-// weather.next [seconds] - cycle to the next weather state in enum order,
-// blending over the given duration (default ambience::WEATHER_TRANSITION_SECONDS;
-// 0 = hard cut).
 bool Cmd_WeatherNext(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1844,9 +1751,6 @@ bool Cmd_WeatherNext(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// weather.random [seconds] - switch to a randomly picked weather state, blending
-// over the given duration (default ambience::WEATHER_TRANSITION_SECONDS; 0 = hard
-// cut).
 bool Cmd_WeatherRandom(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -1886,8 +1790,6 @@ bool Cmd_WeatherRandom(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// weather.forecast [days] - print the upcoming front/night-event forecast
-// (default 3 days, capped at 7).
 bool Cmd_WeatherForecast(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.weatherDirector == nullptr || ctx.time == nullptr)
@@ -1934,8 +1836,6 @@ bool Cmd_WeatherForecast(std::span<const std::string_view> args, CommandContext&
     return true;
 }
 
-// weather.auto [on|off] - toggle forecast-driven autonomy; no arg prints the
-// current state without changing it.
 bool Cmd_WeatherAuto(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.weatherDirector == nullptr)
@@ -1960,7 +1860,7 @@ bool Cmd_WeatherAuto(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// weather.status - current weather, active transition (from->to + progress%),
+// weather.status - Current weather, active transition (from->to + progress%),
 // auto/manual-hold flags, and the wind readout.
 bool Cmd_WeatherStatus(std::span<const std::string_view> args, CommandContext& ctx)
 {
@@ -2021,7 +1921,6 @@ bool Cmd_WeatherStatus(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// weather.wind - gusted wind direction/strength readout.
 bool Cmd_WeatherWind(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.weatherDirector == nullptr)
@@ -2046,13 +1945,8 @@ bool Cmd_WeatherWind(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// light.add <x> <y> [r g b] [radius] [schedule] - add a world light, report its index.
-// x/y are WORLD PIXELS, not tiles, unlike every other coordinate-taking command here.
-// r/g/b are normalized floats around [0, 1] and are not clamped, so 8-bit values like
-// 255 200 100 produce a wildly over-bright light. radius is in world pixels.
-// The optional groups are positional and nested (radius needs r g b, schedule needs
-// radius), which is what the 2/5/6/7 arg forms below enforce. Omitted groups keep the
-// WorldLight defaults: color (1.0, 0.85, 0.55), radius 64, schedule NightOnly.
+// Positions and radius are world pixels. RGB uses normalized floats and is not clamped.
+// Optional groups require 2, 5, 6 or 7 arguments; omitted values keep WorldLight defaults.
 bool Cmd_LightAdd(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2060,8 +1954,7 @@ bool Cmd_LightAdd(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("light.add: tilemap unavailable");
         return false;
     }
-    // Accept: x y [r g b] [radius] [schedule]
-    // Forms: 2, 5, 6, or 7 args.
+
     if (args.size() != 2 && args.size() != 5 && args.size() != 6 && args.size() != 7)
     {
         ctx.out.PrintError("light.add: usage 'light.add <x> <y> [r g b] [radius] [schedule]'");
@@ -2117,7 +2010,6 @@ bool Cmd_LightAdd(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// light.clear - remove all world lights, report how many were removed.
 bool Cmd_LightClear(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2138,7 +2030,6 @@ bool Cmd_LightClear(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// light.list - list all world lights with position, color, radius, schedule.
 bool Cmd_LightList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2175,7 +2066,6 @@ bool Cmd_LightList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// light.remove <index> - remove the world light at the given index.
 bool Cmd_LightRemove(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2205,7 +2095,6 @@ bool Cmd_LightRemove(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// time.status - print time of day, period, weather, day/moon, time scale, pause state.
 bool Cmd_TimeStatus(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.time == nullptr)
@@ -2264,7 +2153,6 @@ bool Cmd_TimeStatus(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// particle.spawn <type> <worldX> <worldY> - spawn one particle of the given type.
 bool Cmd_ParticleSpawn(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.particles == nullptr)
@@ -2310,7 +2198,6 @@ bool Cmd_ParticleSpawn(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// particle.list - print active particle counts per type plus editor zone count.
 bool Cmd_ParticleList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.particles == nullptr)
@@ -2363,7 +2250,6 @@ bool Cmd_ParticleList(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// particle.kill_all - clear all active particles.
 bool Cmd_ParticleKillAll(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.particles == nullptr)
@@ -2381,7 +2267,7 @@ bool Cmd_ParticleKillAll(std::span<const std::string_view> args, CommandContext&
     return true;
 }
 
-// camera.freecam [on|off|toggle] - toggle free-fly camera mode.
+// camera.freecam [on|off|toggle] - Toggle free-fly camera mode.
 bool Cmd_CameraFreecam(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.camera == nullptr)
@@ -2399,7 +2285,6 @@ bool Cmd_CameraFreecam(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// camera.zoom <factor 0.1-10.0> - set the camera zoom factor.
 bool Cmd_CameraZoom(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.camera == nullptr)
@@ -2430,7 +2315,7 @@ bool Cmd_CameraZoom(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// camera.follow [on|off|toggle] - toggle player-follow camera (disables freecam when on).
+// camera.follow [on|off|toggle] - Toggle player-follow camera (disables freecam when on).
 bool Cmd_CameraFollow(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.camera == nullptr)
@@ -2453,8 +2338,6 @@ bool Cmd_CameraFollow(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// camera.info - print camera position, zoom, freecam/follow flags, and the follow target.
-// CameraState carries no tilt and no 3D field; the orbit angles come from cam.yaw/cam.pitch.
 bool Cmd_CameraInfo(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.camera == nullptr)
@@ -2484,11 +2367,10 @@ bool Cmd_CameraInfo(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// map.save [path] - write map JSON (default save path) with player tile and character type.
 bool Cmd_MapSave(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr || ctx.npcs == nullptr ||
-        (ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+        (ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("map.save: world refs unavailable");
         return false;
@@ -2527,7 +2409,6 @@ bool Cmd_MapSave(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// map.size - print map dimensions in tiles and pixels plus the tile size.
 bool Cmd_MapSize(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2558,7 +2439,6 @@ bool Cmd_MapSize(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// map.collision <tileX> <tileY> - report whether the given tile blocks movement.
 bool Cmd_MapCollision(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2590,7 +2470,6 @@ bool Cmd_MapCollision(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// console.copy - copy the console scrollback buffer to the clipboard.
 bool Cmd_ConsoleCopy(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (!args.empty())
@@ -2636,7 +2515,7 @@ bool Cmd_ConsoleCopy(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// renderer.trace [on|off|dump|clear] - capture/inspect per-frame draw-call events.
+// renderer.trace [on|off|dump|clear] - Capture/inspect per-frame draw-call events.
 bool Cmd_RendererTrace(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (args.size() > 1)
@@ -2684,7 +2563,6 @@ bool Cmd_RendererTrace(std::span<const std::string_view> args, CommandContext& c
 
     if (args.empty())
     {
-        // No-arg form: print status + dump if anything captured.
         printStatus();
         if (!DrawTracer::LastFrameEvents().empty())
             dump();
@@ -2719,7 +2597,6 @@ bool Cmd_RendererTrace(std::span<const std::string_view> args, CommandContext& c
     return false;
 }
 
-// perf - print current fps, frame time (ms), draw-call count, and target fps.
 bool Cmd_Perf(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.game == nullptr)
@@ -2746,7 +2623,6 @@ bool Cmd_Perf(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// layers.list - list tile layers with render order, background flag, tile/animated counts.
 bool Cmd_LayersList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2796,7 +2672,6 @@ bool Cmd_LayersList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// tile.info <tx> <ty> - dump a tile's collision/nav/elevation and per-layer id+flags.
 bool Cmd_TileInfo(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2858,7 +2733,6 @@ bool Cmd_TileInfo(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// tile.find <tileID> [layer] - list coords of tiles matching id, optionally one layer.
 bool Cmd_TileFind(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2928,7 +2802,6 @@ bool Cmd_TileFind(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// map.stats - print map size, collision/navigable percentages, and object counts.
 bool Cmd_MapStats(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -2985,7 +2858,6 @@ bool Cmd_MapStats(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// tileset.info - print tileset image size, tile size, and tiles-per-row.
 bool Cmd_TilesetInfo(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3012,7 +2884,6 @@ bool Cmd_TilesetInfo(std::span<const std::string_view> args, CommandContext& ctx
     return true;
 }
 
-// anim.list - list animated tiles with frame count, duration, and map usage count.
 bool Cmd_AnimList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3075,11 +2946,8 @@ bool Cmd_AnimList(std::span<const std::string_view> args, CommandContext& ctx)
 
 namespace
 {
-// Shared by struct.goto / zone.goto / light.goto / npc.goto. CameraState::position is the
-// viewport's top-left corner and worldPos is assigned straight into it, with no half-view-size
-// subtraction, so the target lands at the corner of the view rather than its middle. This also
-// forces free mode and drops the follow target: after any goto the camera stays detached from
-// the player until `camera.follow on`.
+// Goto assigns the viewport corner directly and enters free mode.
+// Use camera.follow on to reacquire the player.
 void CameraSnapTo(CameraController& cam, glm::vec2 worldPos)
 {
     CameraState& s = cam.GetState();
@@ -3088,9 +2956,8 @@ void CameraSnapTo(CameraController& cam, glm::vec2 worldPos)
     s.followTarget = worldPos;
     s.hasFollowTarget = false;
 }
-}  // namespace
+}  // Namespace
 
-// struct.list - list no-projection structures with id, name, and left/right anchors.
 bool Cmd_StructList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3124,7 +2991,6 @@ bool Cmd_StructList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// struct.info <id> - print one no-projection structure's name and anchor points.
 bool Cmd_StructInfo(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3163,8 +3029,6 @@ bool Cmd_StructInfo(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// struct.goto <id> - move the camera's top-left corner to a structure's anchor midpoint
-// (enters free mode; see CameraSnapTo).
 bool Cmd_StructGoto(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr || ctx.camera == nullptr)
@@ -3201,7 +3065,6 @@ bool Cmd_StructGoto(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// zone.list - list particle zones with type, position, size, and noProjection flag.
 bool Cmd_ZoneList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3241,8 +3104,6 @@ bool Cmd_ZoneList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// zone.goto <idx> - move the camera's top-left corner to a particle zone's center
-// (enters free mode; see CameraSnapTo).
 bool Cmd_ZoneGoto(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr || ctx.camera == nullptr)
@@ -3280,8 +3141,6 @@ bool Cmd_ZoneGoto(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// light.goto <idx> - move the camera's top-left corner to a world light's position
-// (enters free mode; see CameraSnapTo).
 bool Cmd_LightGoto(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr || ctx.camera == nullptr)
@@ -3318,9 +3177,7 @@ bool Cmd_LightGoto(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// nav.path <fx> <fy> <tx> <ty> - BFS shortest path on the navigation grid; print the length
-// plus the waypoint chain (first 32 shown). Pathfinding tests navigation only and ignores
-// collision, so a reported path may cross tiles no NPC can patrol.
+// Navigation ignores collision, so a reported route can cross NPC-blocking tiles.
 bool Cmd_NavPath(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3374,7 +3231,6 @@ bool Cmd_NavPath(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// nav.reachable <tx> <ty> - flood-fill from a tile; print reachable count and bounds.
 bool Cmd_NavReachable(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.tilemap == nullptr)
@@ -3419,7 +3275,6 @@ bool Cmd_NavReachable(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// npc.path <idx> - print an NPC patrol route: closed/pingpong, waypoints, validity.
 bool Cmd_NpcPath(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr)
@@ -3438,8 +3293,8 @@ bool Cmd_NpcPath(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("npc.path: idx must be a non-negative integer");
         return false;
     }
-    const ecs::entity npcE = NpcAtIndex(*ctx.npcs, idx);
-    if (!npcE)
+    const entt::entity npcE = NpcAtIndex(*ctx.npcs, idx);
+    if (npcE == entt::null)
     {
         ctx.out.PrintError("npc.path: idx out of range");
         return false;
@@ -3471,8 +3326,6 @@ bool Cmd_NpcPath(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.goto <idx> - move the camera's top-left corner to an NPC's world position
-// (enters free mode; see CameraSnapTo).
 bool Cmd_NpcGoto(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.npcs == nullptr || ctx.camera == nullptr)
@@ -3491,8 +3344,8 @@ bool Cmd_NpcGoto(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("npc.goto: idx must be a non-negative integer");
         return false;
     }
-    const ecs::entity npcE = NpcAtIndex(*ctx.npcs, idx);
-    if (!npcE)
+    const entt::entity npcE = NpcAtIndex(*ctx.npcs, idx);
+    if (npcE == entt::null)
     {
         ctx.out.PrintError("npc.goto: idx out of range");
         return false;
@@ -3511,10 +3364,9 @@ bool Cmd_NpcGoto(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// npc.nearest - find NPC closest (tile Manhattan) to player; print id/name/tile/dist.
 bool Cmd_NpcNearest(std::span<const std::string_view> args, CommandContext& ctx)
 {
-    if (ctx.npcs == nullptr || (ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if (ctx.npcs == nullptr || (ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("npc.nearest: npc list or player unavailable");
         return false;
@@ -3524,25 +3376,23 @@ bool Cmd_NpcNearest(std::span<const std::string_view> args, CommandContext& ctx)
         ctx.out.PrintError("npc.nearest: usage 'npc.nearest'");
         return false;
     }
-    // Players use bottom-center anchoring (mirrors Tilemap::WorldToTileCoord).
-    // player.pos, state.dump and map.save report the standing row instead
-    // (TileMath::StandingTileRow), so mid-stride the two can differ by one row.
+    // Anchor-row and standing-row reports can differ by one tile mid-stride.
     glm::vec2 ppos = ctx.npcs->get<Transform>(ctx.playerEntity).position;
     int ptx = TileMath::TileIndex(ppos.x, static_cast<float>(CONSOLE_TILE_SIZE));
     int pty = TileMath::AnchorTileRow(ppos.y, static_cast<float>(CONSOLE_TILE_SIZE));
-    ecs::entity bestE{};
+    entt::entity bestE = entt::null;
     int bestDist = std::numeric_limits<int>::max();
-    ctx.npcs->each<const Patrol, const NpcTag>(
-        [&](ecs::entity e, const Patrol& patrol)
+    for (const entt::entity entity : EntityStore::Entities(*ctx.npcs))
+    {
+        const Patrol& patrol = ctx.npcs->get<Patrol>(entity);
+        const int distance = std::abs(patrol.tileX - ptx) + std::abs(patrol.tileY - pty);
+        if (distance < bestDist)
         {
-            int d = std::abs(patrol.tileX - ptx) + std::abs(patrol.tileY - pty);
-            if (d < bestDist)
-            {
-                bestDist = d;
-                bestE = e;
-            }
-        });
-    if (!bestE)
+            bestDist = distance;
+            bestE = entity;
+        }
+    }
+    if (bestE == entt::null)
     {
         ctx.out.Print("npc.nearest: no NPCs");
         return true;
@@ -3563,7 +3413,6 @@ bool Cmd_NpcNearest(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// quest.list - print active quests with descriptions plus completed_* flags as [DONE].
 bool Cmd_QuestList(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -3592,7 +3441,6 @@ bool Cmd_QuestList(std::span<const std::string_view> args, CommandContext& ctx)
     }
     for (const auto& [k, v] : ctx.gameState->GetAllFlags())
     {
-        // Completed quests are persisted as game-state flags named completed_<quest>.
         constexpr std::string_view kPrefix = "completed_";
         if (k.size() <= kPrefix.size() || k.compare(0, kPrefix.size(), kPrefix) != 0)
         {
@@ -3605,7 +3453,6 @@ bool Cmd_QuestList(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// quest.give <name> [description...] - accept a quest with optional joined description.
 bool Cmd_QuestGive(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -3639,7 +3486,6 @@ bool Cmd_QuestGive(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// quest.complete <name> - mark the named quest complete.
 bool Cmd_QuestComplete(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.gameState == nullptr)
@@ -3660,7 +3506,6 @@ bool Cmd_QuestComplete(std::span<const std::string_view> args, CommandContext& c
     return true;
 }
 
-// version - print engine version, Debug/Release build, build date/time, C++ standard.
 bool Cmd_Version(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (!args.empty())
@@ -3686,7 +3531,6 @@ bool Cmd_Version(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// renderer.info - print backend/API and GPU vendor/device/driver/maxTextureSize.
 bool Cmd_RendererInfo(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (ctx.renderer == nullptr)
@@ -3718,7 +3562,6 @@ bool Cmd_RendererInfo(std::span<const std::string_view> args, CommandContext& ct
     return true;
 }
 
-// mem.stats - print approximate tilemap/NPC/scrollback/ECS-registry/struct/light memory use.
 bool Cmd_MemStats(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (!args.empty())
@@ -3731,12 +3574,7 @@ bool Cmd_MemStats(std::span<const std::string_view> args, CommandContext& ctx)
     if (ctx.tilemap != nullptr)
     {
         const std::size_t cells = ctx.tilemap->MapCellCount();
-        // Rough approximation, not the real layout. It charges one int (tile id),
-        // one float (rotation), five bools and two more ints (structureId,
-        // animationMap) per cell per layer, for 21 bytes. TileLayer actually holds
-        // three ints, one float, four bools and two uint8 enums (stance,
-        // elevationRole), and the bools sit in a bit-packed std::vector<bool>, so
-        // this over-charges the flags and omits the enums entirely.
+        // Estimate only: counts unpacked flags and omits stance/elevation-role enum storage.
         const std::size_t perCellBytes =
             sizeof(int) + sizeof(float) + sizeof(bool) * 5 + sizeof(int) + sizeof(int);
         tilemapBytes = ctx.tilemap->GetLayerCount() * cells * perCellBytes;
@@ -3749,15 +3587,6 @@ bool Cmd_MemStats(std::span<const std::string_view> args, CommandContext& ctx)
                   ctx.npcs ? EntityStore::Count(*ctx.npcs) : static_cast<std::size_t>(0),
                   ctx.out.Lines().size());
     ctx.out.Print(line);
-    if (ctx.npcs != nullptr)
-    {
-        // Exact registry accounting from the ECS itself (entity table + every
-        // component pool + bookkeeping). Reports allocated pool capacity, not
-        // just the live-entity footprint.
-        std::snprintf(
-            line, sizeof(line), "  ecs registry=%zu bytes", ctx.npcs->footprint().total());
-        ctx.out.Print(line);
-    }
     if (ctx.tilemap != nullptr)
     {
         std::snprintf(line,
@@ -3770,34 +3599,6 @@ bool Cmd_MemStats(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// ecs.validate - on-demand ECS registry integrity check (table/pools/globals/links).
-bool Cmd_EcsValidate(std::span<const std::string_view> args, CommandContext& ctx)
-{
-    if (!args.empty())
-    {
-        ctx.out.PrintError("ecs.validate: usage 'ecs.validate'");
-        return false;
-    }
-    if (ctx.npcs == nullptr)
-    {
-        ctx.out.PrintError("ecs.validate: registry unavailable");
-        return false;
-    }
-    // On-demand integrity check (table + pools + globals + parent/child links).
-    // O(entities + pools), so it is a manual command, never run per frame.
-    const auto result = ctx.npcs->validate();
-    if (result)
-    {
-        ctx.out.Print("ecs.validate: OK (table + pools + globals + links consistent)");
-        return true;
-    }
-    char line[224];
-    std::snprintf(line, sizeof(line), "ecs.validate: FAULT - %s", result.error().note);
-    ctx.out.PrintError(line);
-    return false;
-}
-
-// config.dump - emit current time/weather/editor/postfx toggles as replayable console commands.
 bool Cmd_ConfigDump(std::span<const std::string_view> args, CommandContext& ctx)
 {
     if (!args.empty())
@@ -3858,12 +3659,11 @@ bool Cmd_ConfigDump(std::span<const std::string_view> args, CommandContext& ctx)
     return true;
 }
 
-// bookmark.set <name> - save the player's current tile under a bookmark name.
 bool Cmd_BookmarkSet(std::span<const std::string_view> args,
                      CommandContext& ctx,
                      std::unordered_map<std::string, glm::ivec2>& bookmarks)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("bookmark.set: player unavailable");
         return false;
@@ -3873,10 +3673,7 @@ bool Cmd_BookmarkSet(std::span<const std::string_view> args,
         ctx.out.PrintError("bookmark.set: usage 'bookmark.set <name>'");
         return false;
     }
-    // Players use bottom-center anchoring: `Transform::position.y` is the feet edge, so
-    // recover the tile by subtracting half a tile (mirrors Tilemap::WorldToTileCoord).
-    // player.pos, state.dump and map.save report the standing row instead
-    // (TileMath::StandingTileRow), so mid-stride the two can differ by one row.
+    // Anchor-row and standing-row reports can differ by one tile mid-stride.
     glm::vec2 pos = ctx.npcs->get<Transform>(ctx.playerEntity).position;
     glm::ivec2 tile{TileMath::TileIndex(pos.x, static_cast<float>(CONSOLE_TILE_SIZE)),
                     TileMath::AnchorTileRow(pos.y, static_cast<float>(CONSOLE_TILE_SIZE))};
@@ -3888,12 +3685,11 @@ bool Cmd_BookmarkSet(std::span<const std::string_view> args,
     return true;
 }
 
-// bookmark.tp <name> - teleport the player to a saved bookmark tile.
 bool Cmd_BookmarkTp(std::span<const std::string_view> args,
                     CommandContext& ctx,
                     std::unordered_map<std::string, glm::ivec2>& bookmarks)
 {
-    if ((ctx.npcs == nullptr || !ctx.npcs->alive(ctx.playerEntity)))
+    if ((ctx.npcs == nullptr || !ctx.npcs->valid(ctx.playerEntity)))
     {
         ctx.out.PrintError("bookmark.tp: player unavailable");
         return false;
@@ -3924,7 +3720,6 @@ bool Cmd_BookmarkTp(std::span<const std::string_view> args,
     return true;
 }
 
-// bookmark.list - list saved bookmarks (name and tile) sorted alphabetically.
 bool Cmd_BookmarkList(std::span<const std::string_view> args,
                       CommandContext& ctx,
                       const std::unordered_map<std::string, glm::ivec2>& bookmarks)
@@ -3967,21 +3762,21 @@ void Console::RegisterDefaultCommands()
     auto makeContext = [this]() -> CommandContext
     {
         return CommandContext{
-            /* out         */ m_Buffer,
-            /* playerEntity*/ m_Game.m_PlayerEntity,
-            /* gameState   */ &m_Game.m_GameState,
-            /* time        */ &m_Game.m_TimeManager,
-            /* tilemap     */ &m_Game.m_Tilemap,
-            /* npcs        */ &m_Game.m_World,
-            /* registry    */ &m_Registry,
-            /* editor      */ &m_Game.m_Editor,
-            /* camera      */ &m_Game.m_Camera,
-            /* renderer    */ m_Game.m_Renderer.get(),
-            /* game        */ &m_Game,
-            /* postFXEnabled */ &m_Game.m_PostFXEnabled,
-            /* dialogue    */ &m_Game.m_DialogueManager,
-            /* particles   */ &m_Game.m_Particles,
-            /* weatherDirector */ &m_Game.m_WeatherDirector,
+            m_Buffer,
+            m_Game.m_PlayerEntity,
+            &m_Game.m_GameState,
+            &m_Game.m_TimeManager,
+            &m_Game.m_Tilemap,
+            &m_Game.m_World,
+            &m_Registry,
+            &m_Game.m_Editor,
+            &m_Game.m_Camera,
+            m_Game.m_Renderer.get(),
+            &m_Game,
+            &m_Game.m_PostFXEnabled,
+            &m_Game.m_DialogueManager,
+            &m_Game.m_Particles,
+            &m_Game.m_WeatherDirector,
         };
     };
 
@@ -4507,7 +4302,6 @@ void Console::RegisterDefaultCommands()
         {},
         [](std::size_t argIndex) -> std::vector<std::string>
         {
-            // Schedule is the 7th positional arg (index 6) when present.
             if (argIndex != 6)
                 return {};
             std::vector<std::string> out;
@@ -4882,15 +4676,6 @@ void Console::RegisterDefaultCommands()
                         },
                         {"mem"});
 
-    m_Registry.Register("ecs.validate",
-                        "check ECS registry integrity (table/pools/globals/links)",
-                        [makeContext](auto args, Console&)
-                        {
-                            CommandContext ctx = makeContext();
-                            (void)Cmd_EcsValidate(args, ctx);
-                        },
-                        {});
-
     m_Registry.Register("config.dump",
                         "emit current toggles as a script-style command list",
                         [makeContext](auto args, Console&)
@@ -4927,14 +4712,8 @@ void Console::RegisterDefaultCommands()
                         },
                         {"bl"});
 
-    // Argument autocomplete for commands with a small, enumerable value set.
-    // Wired here (rather than inline on each Register) so the whole set is
-    // visible in one place. Numeric args (coords, indices, ranges) and
-    // open-ended args (map paths, brand-new flag/quest names) are intentionally
-    // omitted: a dropdown only helps when the choices are few and named.
-    //
-    // Known gaps, not design: `world3d` and `noclip` are on/off/toggle-shaped and
-    // `cam.preset` takes classic|ds|free, yet none of the three is wired up below.
+    // Completion lists cover named values; numeric and open-ended inputs have none.
+    // world3d, noclip and cam.preset also lack providers.
     const auto toggleCompletions = FixedArgValues({"on", "off", "toggle"});
 
     const auto characterCompletions = [](std::size_t argIndex) -> std::vector<std::string>
@@ -4968,9 +4747,7 @@ void Console::RegisterDefaultCommands()
         return {};
     };
 
-    // Dynamic: read live state when the dropdown asks. Capturing makeContext is
-    // safe - the provider is owned by m_Registry, which lives as long as this
-    // Console, and makeContext only holds `this`.
+    // makeContext captures this; the provider and context factory share the Console lifetime.
     const auto flagNameCompletions = [makeContext](std::size_t argIndex) -> std::vector<std::string>
     {
         if (argIndex != 0)
@@ -4994,7 +4771,7 @@ void Console::RegisterDefaultCommands()
     {
         if (argIndex != 0)
         {
-            return {};  // arg 0 is the type; args 1-2 are tile coords (numeric)
+            return {};
         }
         return m_Game.m_Assets.AvailableNpcTypes();
     };
