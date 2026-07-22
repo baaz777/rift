@@ -5,6 +5,7 @@
 #include "CharacterKinematics.hpp"
 #include "CollisionGeometry.hpp"
 #include "Elevation.hpp"
+#include "EntityStore.hpp"
 #include "Facing.hpp"
 #include "Identity.hpp"
 #include "NpcIdle.hpp"
@@ -22,14 +23,12 @@
 
 namespace
 {
-constexpr float WAYPOINT_REACH_THRESHOLD = 0.5f;  // Pixels to count as "reached".
-constexpr float MIN_MOVEMENT_DIST = 0.001f;       // Avoid divide-by-zero.
+constexpr float WAYPOINT_REACH_THRESHOLD = 0.5f;  // pixels to count as "reached".
+constexpr float MIN_MOVEMENT_DIST = 0.001f;
 
-// Used for random look-around direction picks.
 constexpr Direction ALL_DIRECTIONS[] = {
     Direction::LEFT, Direction::RIGHT, Direction::UP, Direction::DOWN};
 
-// Cycle through random facing directions during idle.
 void UpdateLookAround(NpcIdle& idle, Facing& facing, float dt, std::mt19937& rng)
 {
     idle.lookAroundTimer -= dt;
@@ -40,7 +39,6 @@ void UpdateLookAround(NpcIdle& idle, Facing& facing, float dt, std::mt19937& rng
     }
 }
 
-// Transition to standing-still idle state.
 void EnterStandingStill(NpcIdle& idle,
                         Facing& facing,
                         AnimationState& anim,
@@ -49,8 +47,7 @@ void EnterStandingStill(NpcIdle& idle,
                         std::mt19937& rng)
 {
     idle.standingStill = true;
-    // When not random (e.g. no patrol route found), timer stays at 0 so the NPC
-    // stays in standing-still/look-around mode indefinitely until a route exists.
+    // Zero duration holds indefinitely until a route rebuild succeeds.
     idle.randomStandStillTimer = isRandom ? duration : 0.0f;
     idle.lookAroundTimer = 2.0f;
     CharacterKinematics::ResetAnimation(anim);
@@ -58,8 +55,7 @@ void EnterStandingStill(NpcIdle& idle,
     facing.dir = ALL_DIRECTIONS[std::uniform_int_distribution<int>(0, 3)(rng)];
 }
 
-// Set facing direction from a tile movement delta (equal-magnitude diagonals
-// resolve to vertical; a zero delta leaves the current facing unchanged).
+// Diagonal ties face vertically; zero delta preserves facing.
 void UpdateDirectionFromMovement(Facing& facing, int dx, int dy)
 {
     if (dx != 0 || dy != 0)
@@ -103,7 +99,7 @@ void Update(Transform& xf,
     if (!tilemap)
         return;
 
-    // Smooth elevation transition (must run regardless of movement state)
+    // Smooth elevation even when patrol is stopped.
     CharacterKinematics::UpdateElevation(elev, dt);
 
     bool isCollidingWithPlayer = false;
@@ -130,7 +126,6 @@ void Update(Transform& xf,
     {
         CharacterKinematics::ResetAnimation(anim);
 
-        // Random pause: count down timer.
         if (idle.randomStandStillTimer > 0.0f)
         {
             idle.randomStandStillTimer -= dt;
@@ -141,14 +136,12 @@ void Update(Transform& xf,
             }
             else
             {
-                // Look around while paused.
                 UpdateLookAround(idle, facing, dt, rng);
                 return;
             }
         }
         else
         {
-            // No path available: look around indefinitely.
             UpdateLookAround(idle, facing, dt, rng);
             return;
         }
@@ -160,8 +153,7 @@ void Update(Transform& xf,
         return;
 
     patrol.tileX = TileMath::TileIndex(xf.position.x, static_cast<float>(tileWidth));
-    // Standing-tile row: feet nudged up so an NPC on a tile boundary registers as
-    // the tile above (see TileMath::StandingTileRow).
+    // Boundary feet belong to the tile above.
     patrol.tileY = TileMath::StandingTileRow(xf.position.y, static_cast<float>(tileHeight));
 
     if (idle.waitTimer > 0.0f)
@@ -194,10 +186,8 @@ void Update(Transform& xf,
     glm::vec2 toTarget = targetPos - xf.position;
     float dist = glm::length(toTarget);
 
-    // Check whether the NPC has reached the current waypoint.
     if (dist < WAYPOINT_REACH_THRESHOLD)
     {
-        // Verify the target tile is still walkable before snapping.
         int targetTileX = TileMath::TileIndex(targetPos.x, static_cast<float>(tileWidth));
         int targetTileY = TileMath::AnchorTileRow(targetPos.y, static_cast<float>(tileHeight));
         const SurfaceTransition transition =
@@ -206,7 +196,6 @@ void Update(Transform& xf,
                                       SurfaceSystem::CollisionBelongsTo(
                                           *tilemap, targetTileX, targetTileY, transition.support)))
         {
-            // Target blocked - stop and invalidate route to trigger re-initialization.
             EnterStandingStill(idle, facing, anim, false, 0.0f, rng);
             route = PatrolRoute();
             return;
@@ -215,10 +204,7 @@ void Update(Transform& xf,
         xf.position = targetPos;
         CharacterKinematics::CommitSupport(elev, transition.support);
 
-        // Initialize patrol route if needed. The 100 is PatrolRoute's maxRouteLength (and
-        // its own default): it caps the BFS collection, so an NPC standing in a large open
-        // navigation region ends up with a compact cluster of waypoints around its start
-        // rather than a route spanning the whole map.
+        // Cap route collection at 100 tiles to keep patrols local.
         if (!route.IsValid())
         {
             if (!route.Initialize(patrol.tileX, patrol.tileY, tilemap, 100))
@@ -230,30 +216,25 @@ void Update(Transform& xf,
             {
                 idle.standingStill = false;
                 idle.randomStandStillTimer = 0.0f;
-                // Wait 5-9.99 seconds before the next random-pause roll. The range
-                // prevents NPCs from all pausing in sync.
+                // Stagger pause checks by 5-9.99 seconds.
                 idle.randomStandStillCheckTimer =
                     5.0f + std::uniform_int_distribution<int>(0, 499)(rng) / 100.0f;
             }
         }
 
-        // 30% chance to pause at each waypoint when the cooldown expires. This
-        // breaks up the mechanical look of constant patrol walking.
+        // 30% pause chance per eligible waypoint.
         if (route.IsValid() && idle.randomStandStillCheckTimer <= 0.0f)
         {
             idle.randomStandStillCheckTimer =
                 5.0f + std::uniform_int_distribution<int>(0, 499)(rng) / 100.0f;
             if (std::uniform_int_distribution<int>(0, 99)(rng) < 30)
             {
-                // Pause for 2-4.99 seconds - long enough to look natural, short
-                // enough not to stall gameplay.
                 float duration = 2.0f + std::uniform_int_distribution<int>(0, 299)(rng) / 100.0f;
                 EnterStandingStill(idle, facing, anim, true, duration, rng);
                 return;
             }
         }
 
-        // Get next waypoint.
         int nextX, nextY;
         if (route.GetNextWaypoint(nextX, nextY))
         {
@@ -301,7 +282,7 @@ bool ReinitializePatrolRoute(
         return false;
 
     route.Reset();
-    // 100 = maxRouteLength, same cap as the in-Update rebuild above.
+
     bool success = route.Initialize(patrol.tileX, patrol.tileY, tilemap, 100);
 
     if (success)
@@ -321,57 +302,60 @@ bool ReinitializePatrolRoute(
     return success;
 }
 
-void UpdateAll(ecs::registry& world,
+void UpdateAll(entt::registry& world,
                const Tilemap& tilemap,
                CharacterCollisionBody playerBody,
                std::mt19937& rng,
                std::uint64_t frozenNpcId,
                float dt)
 {
-    world.each<Transform,
-               Elevation,
-               Facing,
-               AnimationState,
-               NpcIdle,
-               Patrol,
-               PatrolRoute,
-               Speed,
-               Identity,
-               NpcTag>(
-        [&](Transform& xf,
-            Elevation& elev,
-            Facing& facing,
-            AnimationState& anim,
-            NpcIdle& idle,
-            Patrol& patrol,
-            PatrolRoute& route,
-            Speed& speed,
-            Identity& id)
+    for (const entt::entity entity : EntityStore::Entities(world))
+    {
+        if (!world.all_of<Transform,
+                          Elevation,
+                          Facing,
+                          AnimationState,
+                          NpcIdle,
+                          Patrol,
+                          PatrolRoute,
+                          Speed>(entity))
         {
-            // Freeze the active dialogue speaker (0 = nobody frozen).
-            if (frozenNpcId != 0 && id.instanceId == frozenNpcId)
-            {
-                return;
-            }
-            Update(
-                xf, elev, facing, anim, idle, patrol, route, speed, dt, &tilemap, &playerBody, rng);
-        });
+            continue;
+        }
+
+        Identity& identity = world.get<Identity>(entity);
+        if (frozenNpcId != 0 && identity.instanceId == frozenNpcId)
+        {
+            continue;
+        }
+
+        Update(world.get<Transform>(entity),
+               world.get<Elevation>(entity),
+               world.get<Facing>(entity),
+               world.get<AnimationState>(entity),
+               world.get<NpcIdle>(entity),
+               world.get<Patrol>(entity),
+               world.get<PatrolRoute>(entity),
+               world.get<Speed>(entity),
+               dt,
+               &tilemap,
+               &playerBody,
+               rng);
+    }
 }
 
-void ApplyPlayerOverlapStop(ecs::registry& world, CharacterCollisionBody playerBody)
+void ApplyPlayerOverlapStop(entt::registry& world, CharacterCollisionBody playerBody)
 {
-    // Both use bottom-center anchored 16x16 hitboxes; an NPC is stopped while it
-    // overlaps the player (exact, no-epsilon) to prevent visual overlap.
-    world.each<Transform, Elevation, NpcIdle, NpcTag>(
-        [&](const Transform& xf, const Elevation& elevation, NpcIdle& idle)
+    world.view<Transform, Elevation, NpcIdle, NpcTag>().each(
+        [&](const Transform& transform, const Elevation& elevation, NpcIdle& idle)
         {
             idle.isStopped =
                 CharacterKinematics::GetSupport(elevation) == playerBody.support &&
                 CollisionGeometry::FeetBoxesOverlap(playerBody.feet,
-                                                    xf.position,
+                                                    transform.position,
                                                     CharacterConstants::HALF_HITBOX_WIDTH,
                                                     CharacterConstants::HITBOX_HEIGHT,
-                                                    /*eps=*/0.0f);
+                                                    0.0f);
         });
 }
 }  // namespace NpcAiSystem
