@@ -1,5 +1,3 @@
-// Tests for the move.* console commands. CommandContext is hand-built; no Game,
-// no GLFW, no renderer.
 #include <gtest/gtest.h>
 
 #include "../src/CameraController.hpp"
@@ -8,7 +6,7 @@
 #include "../src/EntityStore.hpp"
 #include "../src/Motor.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <span>
 #include <string>
@@ -57,8 +55,8 @@ bool BufferContains(const ConsoleBuffer& buf, std::string_view needle)
 
 TEST(MoveCommandTests, AccelSetsValue)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -71,8 +69,8 @@ TEST(MoveCommandTests, AccelSetsValue)
 
 TEST(MoveCommandTests, AccelRejectsNonPositive)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -84,8 +82,8 @@ TEST(MoveCommandTests, AccelRejectsNonPositive)
 
 TEST(MoveCommandTests, DecelSetsValue)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     ConsoleBuffer buf;
     CommandContext ctx{buf};
     ctx.npcs = &world;
@@ -110,8 +108,8 @@ TEST(MoveCommandTests, LookaheadSetsValue)
 
 TEST(MoveCommandTests, DumpReportsValues)
 {
-    ecs::registry world;
-    ecs::entity player = EntityStore::SpawnPlayer(world);
+    entt::registry world;
+    entt::entity player = EntityStore::SpawnPlayer(world);
     CameraController cam;
     world.get<Motor>(player).params.accel = 123.0f;
     ConsoleBuffer buf;
