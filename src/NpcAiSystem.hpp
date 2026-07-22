@@ -2,7 +2,7 @@
 
 #include "SupportSurface.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 #include <glm/glm.hpp>
 
 #include <cstdint>
@@ -19,30 +19,21 @@ class PatrolRoute;
 class Tilemap;
 
 /**
- * @brief Stateless NPC patrol/idle AI over component bundles.
- * @author Alex (https://github.com/lextpf)
+ * @brief NPC patrol and idle state transitions with an explicit RNG.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Entities
  *
- * Patrol stepping, route reinitialization, and the idle, look-around and facing helpers, all as
- * free functions. Each operates only on the component structs passed by reference, with no NPC
- * instance and no hidden state, so the same call works from an ECS each loop or from a unit test.
+ * PatrolRoute is a regenerable runtime cache; navigation edits rebuild it in place.
+ * Retain the Patrol cursor, not cached route references. Patrol tiles require navigation
+ * without collision; Pathfinding checks navigation alone.
  *
- * Randomness arrives as an explicit @c std::mt19937& parameter. Game owns the world's engine and
- * publishes it through @ref WorldServices::npcRng, and passing a seeded engine makes the idle
- * state machine deterministically testable.
+ * Stopped takes priority over waiting and standing states. Stalled looks around
+ * indefinitely until ReinitializePatrolRoute succeeds.
  *
- * @ref PatrolRoute is an ECS component, created with the NPC in EntityStore::SpawnNpc and
- * iterated by @ref UpdateAll, but it is a regenerable runtime cache rather than authored state.
- * Only the small @ref Patrol tile cursor persists. Editor navigation edits invalidate the route
- * and NavigationRecalc::RebuildPatrolRoutes regenerates it in place, so never hold a reference or
- * a copy of one across frames.
- *
- * @par Idle state machine
- * @ref Update is a chain of early returns over the @ref NpcIdle flags and timers. Each state
- * below names the field tuple that selects that branch:
- *
- * @htmlonly
- * <pre class="mermaid">
+ * Game owns the shared std::mt19937 published as WorldServices::npcRng. Callers can seed it for
+ * deterministic idle transitions. Each update works on the supplied components; the system keeps
+ * no hidden per-NPC state.
+ * ```mermaid
  * stateDiagram-v2
  *     state "Patrolling" as Pat
  *     state "Stopped (isStopped)" as Stop
@@ -59,52 +50,24 @@ class Tilemap;
  *     Pause --> Pat: timer reaches 0
  *     Pat --> Stall: waypoint blocked, or Initialize failed
  *     Stall --> Pat: ReinitializePatrolRoute succeeds
- * </pre>
- * @endhtmlonly
- *
- * Stalled is the only state with no exit inside @ref Update: it looks around forever until
- * NavigationRecalc::RebuildPatrolRoutes drives a successful @ref ReinitializePatrolRoute.
- * Stopped and Waiting are independent of the standing-still pair, and Stopped wins, because it
- * is tested first.
- *
- * @par Route validity is stricter than pathfinding
- * A route tile must be navigable and free of collision (PatrolRoute::IsValidTile), whereas
- * @ref Pathfinding checks navigation only. A tile carrying both flags is therefore
- * reachable by @c nav.path but unusable as a patrol waypoint, so a console-reported path
- * can describe a route no NPC will ever walk.
- *
- * @see PatrolRoute, Pathfinding, NavigationRecalc
+ * ```
  */
 namespace NpcAiSystem
 {
 /**
- * @brief Advance one frame of NPC patrol + idle AI: walk toward the current
- *        waypoint, advance the route, and run the random pause / look-around FSM.
+ * @fn void Update(Transform& xf, Elevation& elev, Facing& facing, AnimationState& anim, NpcIdle& \
+ *     idle, Patrol& patrol, PatrolRoute& route, const Speed& speed, float dt, const Tilemap* \
+ *     tilemap, const CharacterCollisionBody* playerBody, std::mt19937& rng)
+ * @brief Advance patrol and idle state; dt is in seconds and speed is in px/s.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * No-op when @p tilemap is null. Elevation is smoothed every frame regardless of
- * movement state; the NPC pauses briefly when its feet box overlaps the player.
+ * Null tilemap leaves state unchanged. Null playerBody skips overlap avoidance.
+ * Smooth elevation even while idle. Blocked waypoints and failed route rebuilds
+ * enter indefinite standstill; only a successful ReinitializePatrolRoute resumes patrol.
  *
- * @note Two failures park the NPC in an indefinite stand-still and look-around state with no
- * timer: a waypoint that has become blocked, and a route that will not rebuild. Nothing inside
- * this function leaves that state. Only a successful @ref ReinitializePatrolRoute clears it, which
- * the editor's navigation rebuild drives.
- *
- * @param xf             NPC transform; @c position (feet) is integrated toward the waypoint.
- * @param elev           Committed support plus its smoothed visual elevation.
- * @param facing         Facing direction; set from the movement delta or idle look-around.
- * @param anim           Walk-cycle animation state; advanced while moving, reset while idle.
- * @param idle           Idle state machine: standing-still, pause and look-around timers, and
- *                       the stop and wait flags.
- * @param patrol         Patrol tile state (current tile + target waypoint tile).
- * @param route          Regenerable patrol-route cache; supplies waypoints. Built on the
- *                       first waypoint arrival while invalid, and discarded (reset to an
- *                       invalid route) when the current target tile turns out blocked.
- * @param speed          Movement speed in px/s (@c speed.value).
- * @param dt             Frame time in seconds.
- * @param tilemap        World tilemap for tile size and walkability queries; null makes
- *                       this a no-op.
- * @param playerBody     Player feet/support for exact-support overlap avoidance, or null.
- * @param rng            Random engine driving the idle pause / look-around FSM.
+ * Walk toward the current waypoint, advance on arrival, and roll random pauses only at eligible
+ * waypoints. Temporary overlap with the player enters a timed wait. Random pause and stalled
+ * look-around behavior share NpcIdle timers but have different resume conditions.
  */
 void Update(Transform& xf,
             Elevation& elev,
@@ -120,42 +83,30 @@ void Update(Transform& xf,
             std::mt19937& rng);
 
 /**
- * @brief Rebuild the patrol route from the NPC's current tile; updates idle
- *        state to reflect success (resume patrol) or failure (stand + look around).
+ * @fn bool ReinitializePatrolRoute( NpcIdle& idle, Patrol& patrol, PatrolRoute& route, const \
+ *     Tilemap* tilemap, std::mt19937& rng)
+ * @brief Rebuild from the Patrol tile without correcting that cursor.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @param idle    Idle state; cleared to resume patrol on success, or set to
- *                stand-still + look-around on failure.
- * @param patrol  Patrol tile state; the route is initialized from @c patrol.tileX / @c tileY.
- *                Read-only here - the cursor is not corrected if it has drifted.
- * @param route   Route cache; reset and re-initialized in place. A failed rebuild leaves it
- *                reset, i.e. invalid.
- * @param tilemap World tilemap; a null tilemap returns false immediately, without touching
- *                @p idle or @p route.
- * @param rng     Seeds the post-success random-pause cooldown.
- * @return true if a new route was built (patrol resumes); false otherwise.
+ * Null tilemap returns false without changing idle or route. Otherwise reset the route;
+ * success resumes patrol and seeds the pause cooldown, while failure leaves standstill.
+ *
+ * Navigation edits call this through RebuildPatrolRoutes. Use the saved tile
+ * cursor as the start; rebuilding does not move the NPC or correct that cursor.
  */
 bool ReinitializePatrolRoute(
     NpcIdle& idle, Patrol& patrol, PatrolRoute& route, const Tilemap* tilemap, std::mt19937& rng);
 
 /**
- * @brief Drive support-aware @ref Update over every NPC entity.
+ * @fn void UpdateAll(entt::registry& world, const Tilemap& tilemap, CharacterCollisionBody \
+ *     playerBody, std::mt19937& rng, std::uint64_t frozenNpcId, float dt)
+ * @brief Visit complete NPC component sets in ascending Identity::instanceId order.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Iterates with @c each<> over Transform, Elevation, Facing, AnimationState, NpcIdle, Patrol,
- * PatrolRoute, Speed, Identity and NpcTag. The filter is exact and silent: an entity missing any
- * one of the ten never moves and nothing is logged, so a hand-assembled test NPC must carry the
- * full set. Each accepted movement commits its position and support surface together, matching how
- * player movement commits.
- *
- * @param world          ECS registry; the NPC component set is iterated in place.
- * @param tilemap        World tilemap, forwarded to each NPC's @ref Update; the support it
- *                       resolves is committed there, not here.
- * @param playerBody     Player feet/support, forwarded for per-NPC overlap avoidance.
- * @param rng            Shared random engine for every NPC's idle FSM.
- * @param frozenNpcId    @c Identity::instanceId to skip; 0 skips nobody. The active dialogue
- *                       speaker is the usual caller.
- * @param dt             Frame time in seconds.
+ * Stable ordering preserves shared RNG draws. Commit each accepted position and support
+ * together. frozenNpcId skips one speaker; 0 skips none. dt is in seconds.
  */
-void UpdateAll(ecs::registry& world,
+void UpdateAll(entt::registry& world,
                const Tilemap& tilemap,
                CharacterCollisionBody playerBody,
                std::mt19937& rng,
@@ -163,20 +114,12 @@ void UpdateAll(ecs::registry& world,
                float dt);
 
 /**
- * @brief Stop every NPC overlapping the player's feet box (sets @c NpcIdle.isStopped),
- *        preventing visual overlap.
+ * @fn void ApplyPlayerOverlapStop(entt::registry& world, CharacterCollisionBody playerBody)
+ * @brief Assign isStopped from exact feet overlap on matching support, after UpdateAll.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Runs after @ref UpdateAll so it sees final positions. The overlap test is exact, with no
- * epsilon, against bottom-center-anchored feet boxes. It counts only when the NPC's committed
- * support matches the player's, so an NPC on a bridge deck does not stop for a player below.
- *
- * @warning This assigns @c isStopped for every NPC on every frame rather than combining with it.
- * Any other hold on that flag, from the dialogue path or the console @c npc.freeze command, is
- * therefore overwritten on the next frame. The dialogue freeze survives only because
- * @ref UpdateAll skips the speaker by @c Identity::instanceId rather than by this flag.
- *
- * @param world      ECS registry; every NPC is tested and its @c NpcIdle.isStopped updated.
- * @param playerBody Player feet/support record to test NPCs against.
+ * Overwrite every NPC flag each frame, including console or dialogue holds.
+ * Dialogue freezing relies on UpdateAll skipping the speaker id.
  */
-void ApplyPlayerOverlapStop(ecs::registry& world, CharacterCollisionBody playerBody);
+void ApplyPlayerOverlapStop(entt::registry& world, CharacterCollisionBody playerBody);
 }  // namespace NpcAiSystem
