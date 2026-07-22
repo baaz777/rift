@@ -15,23 +15,17 @@
 #include "../src/Speed.hpp"
 #include "../src/Transform.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 #include <glm/glm.hpp>
 
 #include <cstdint>
 #include <vector>
 
-// EntityStore is the NPC lifecycle + query seam over the registry: spawn
-// (SpawnNpc -> entity from an NpcRecord blueprint), despawn (Remove / Clear),
-// count, the index/id lookups the console + editor need (Entities / FindById),
-// snapshot (for undo), and BuildNpcFeet. NPCs are granular components tagged
-// NpcTag. These tests run WITHOUT WorldServices published in globals: SpawnNpc
-// tolerates absent services (the sprite stays an invalid handle), so the data
-// paths still exercise without a renderer.
-
+// without WorldServices, SpawnNpc leaves invalid sprite handles but must still attach the data
+// components.
 TEST(EntityStore, SpawnCreatesEntities)
 {
-    ecs::registry world;
+    entt::registry world;
     EntityStore::SpawnNpc(world, NpcRecord{});
     EntityStore::SpawnNpc(world, NpcRecord{});
     EXPECT_EQ(EntityStore::Count(world), static_cast<std::size_t>(2));
@@ -39,36 +33,36 @@ TEST(EntityStore, SpawnCreatesEntities)
 
 TEST(EntityStore, SpawnAttachesFullComponentSet)
 {
-    // R4 guard: an NPC missing any component silently drops out of the system
-    // each<...> views. SpawnNpc must attach the complete tuple + NpcTag.
-    ecs::registry world;
-    const ecs::entity e = EntityStore::SpawnNpc(world, NpcRecord{});
-    ASSERT_TRUE(world.alive(e));
-    EXPECT_TRUE((world.has_all<Transform,
-                               Elevation,
-                               Facing,
-                               AnimationState,
-                               Speed,
-                               Identity,
-                               NpcSprite,
-                               Dialogue,
-                               NpcIdle,
-                               Patrol,
-                               PatrolRoute>(e)));
-    EXPECT_TRUE(world.has<NpcTag>(e));
+    // an NPC without one required component does not appear in the system view.
+    // SpawnNpc must attach the complete tuple and NpcTag.
+    entt::registry world;
+    const entt::entity e = EntityStore::SpawnNpc(world, NpcRecord{});
+    ASSERT_TRUE(world.valid(e));
+    EXPECT_TRUE((world.all_of<Transform,
+                              Elevation,
+                              Facing,
+                              AnimationState,
+                              Speed,
+                              Identity,
+                              NpcSprite,
+                              Dialogue,
+                              NpcIdle,
+                              Patrol,
+                              PatrolRoute>(e)));
+    EXPECT_TRUE(world.all_of<NpcTag>(e));
 }
 
 TEST(EntityStore, SpawnPositionsAtTileAndAssignsFreshIdentity)
 {
-    ecs::registry world;
+    entt::registry world;
     NpcRecord rec;
     rec.tileX = 3;
     rec.tileY = 4;
     rec.tileSize = 16;
-    const ecs::entity e = EntityStore::SpawnNpc(world, rec);
+    const entt::entity e = EntityStore::SpawnNpc(world, rec);
     EXPECT_EQ(world.get<Patrol>(e).tileX, 3);
     EXPECT_EQ(world.get<Patrol>(e).tileY, 4);
-    // Feet at bottom-center of the tile.
+
     EXPECT_FLOAT_EQ(world.get<Transform>(e).position.x, 3 * 16 + 8.0f);
     EXPECT_FLOAT_EQ(world.get<Transform>(e).position.y, 4 * 16 + 16.0f);
     EXPECT_NE(world.get<Identity>(e).instanceId, 0u);
@@ -76,72 +70,95 @@ TEST(EntityStore, SpawnPositionsAtTileAndAssignsFreshIdentity)
 
 TEST(EntityStore, SpawnPreservesNonzeroInstanceId)
 {
-    ecs::registry world;
+    entt::registry world;
     NpcRecord rec;
     rec.instanceId = 4242;  // undo/redo round-trips a nonzero id
-    const ecs::entity e = EntityStore::SpawnNpc(world, rec);
+    const entt::entity e = EntityStore::SpawnNpc(world, rec);
     EXPECT_EQ(world.get<Identity>(e).instanceId, static_cast<std::uint64_t>(4242));
 }
 
 TEST(EntityStore, RemoveDestroysOneKeepsOthers)
 {
-    ecs::registry world;
+    entt::registry world;
     EntityStore::SpawnNpc(world, NpcRecord{});
-    const ecs::entity mid = EntityStore::SpawnNpc(world, NpcRecord{});
-    const ecs::entity last = EntityStore::SpawnNpc(world, NpcRecord{});
+    const entt::entity mid = EntityStore::SpawnNpc(world, NpcRecord{});
+    const entt::entity last = EntityStore::SpawnNpc(world, NpcRecord{});
     const std::uint64_t keepId = world.get<Identity>(last).instanceId;
 
     EntityStore::Remove(world, mid);
 
     EXPECT_EQ(EntityStore::Count(world), static_cast<std::size_t>(2));
-    EXPECT_FALSE(world.alive(mid));
-    // The survivor kept its identity and is still resolvable through the seam.
-    EXPECT_TRUE(EntityStore::FindById(world, keepId));
+    EXPECT_FALSE(world.valid(mid));
+
+    EXPECT_NE(EntityStore::FindById(world, keepId), entt::null);
 }
 
 TEST(EntityStore, RemoveDeadEntityIsNoOp)
 {
-    ecs::registry world;
-    const ecs::entity e = EntityStore::SpawnNpc(world, NpcRecord{});
+    entt::registry world;
+    const entt::entity e = EntityStore::SpawnNpc(world, NpcRecord{});
     EntityStore::Remove(world, e);
     EntityStore::Remove(world, e);  // second remove must not crash
     EXPECT_EQ(EntityStore::Count(world), static_cast<std::size_t>(0));
 }
 
-TEST(EntityStore, ClearRemovesAll)
+TEST(EntityStore, ClearRemovesNpcsOnly)
 {
-    ecs::registry world;
+    entt::registry world;
+    const entt::entity player = EntityStore::SpawnPlayer(world);
+    const entt::entity unrelated = world.create();
     EntityStore::SpawnNpc(world, NpcRecord{});
     EntityStore::SpawnNpc(world, NpcRecord{});
+
     EntityStore::Clear(world);
+
     EXPECT_EQ(EntityStore::Count(world), static_cast<std::size_t>(0));
+    EXPECT_TRUE(world.valid(player));
+    EXPECT_TRUE(world.valid(unrelated));
 }
 
-TEST(EntityStore, EntitiesReturnsAllAlive)
+TEST(EntityStore, EntitiesSortByInstanceIdAndRestoreRespawnedRank)
 {
-    ecs::registry world;
-    EntityStore::SpawnNpc(world, NpcRecord{});
-    EntityStore::SpawnNpc(world, NpcRecord{});
-    const std::vector<ecs::entity> all = EntityStore::Entities(world);
-    ASSERT_EQ(all.size(), static_cast<std::size_t>(2));
-    EXPECT_TRUE(world.alive(all[0]));
-    EXPECT_TRUE(world.alive(all[1]));
+    entt::registry world;
+    NpcRecord highestRecord;
+    highestRecord.instanceId = 30;
+    NpcRecord middleRecord;
+    middleRecord.instanceId = 20;
+    NpcRecord lowestRecord;
+    lowestRecord.instanceId = 10;
+
+    const entt::entity highest = EntityStore::SpawnNpc(world, highestRecord);
+    const entt::entity middle = EntityStore::SpawnNpc(world, middleRecord);
+    const entt::entity lowest = EntityStore::SpawnNpc(world, lowestRecord);
+    const NpcRecord middleSnapshot = EntityStore::SnapshotNpc(world, middle);
+
+    EntityStore::Remove(world, middle);
+    const entt::entity respawned = EntityStore::SpawnNpc(world, middleSnapshot);
+
+    const std::vector<entt::entity> all = EntityStore::Entities(world);
+    ASSERT_EQ(all.size(), static_cast<std::size_t>(3));
+    EXPECT_EQ(all[0], lowest);
+    EXPECT_EQ(all[1], respawned);
+    EXPECT_EQ(all[2], highest);
+    EXPECT_TRUE(world.valid(lowest));
+    EXPECT_TRUE(world.valid(respawned));
+    EXPECT_TRUE(world.valid(highest));
 }
 
 TEST(EntityStore, FindByIdResolvesAndMisses)
 {
-    ecs::registry world;
-    const ecs::entity e = EntityStore::SpawnNpc(world, NpcRecord{});
+    entt::registry world;
+    const entt::entity e = EntityStore::SpawnNpc(world, NpcRecord{});
     const std::uint64_t id = world.get<Identity>(e).instanceId;
 
     EXPECT_EQ(EntityStore::FindById(world, id), e);
-    EXPECT_FALSE(EntityStore::FindById(world, id + 99999u));  // unknown id
-    EXPECT_FALSE(EntityStore::FindById(world, 0u));           // id 0 never resolves
+    EXPECT_EQ(EntityStore::FindById(world, id + 99999u), entt::null);  // unknown id
+    EXPECT_EQ(EntityStore::FindById(world, 0u), entt::null);           // id 0 never resolves
 }
 
 TEST(EntityStore, SnapshotRoundTripsAuthoredState)
 {
-    ecs::registry world;
+    entt::registry world;
     NpcRecord rec;
     rec.type = "guard";
     rec.name = "Bob";
@@ -149,7 +166,7 @@ TEST(EntityStore, SnapshotRoundTripsAuthoredState)
     rec.tileX = 5;
     rec.tileY = 6;
     rec.instanceId = 77;
-    const ecs::entity e = EntityStore::SpawnNpc(world, rec);
+    const entt::entity e = EntityStore::SpawnNpc(world, rec);
 
     const NpcRecord snap = EntityStore::SnapshotNpc(world, e);
     EXPECT_EQ(snap.type, "guard");
@@ -162,9 +179,9 @@ TEST(EntityStore, SnapshotRoundTripsAuthoredState)
 
 TEST(BuildNpcFeet, CollectsFeetPositions)
 {
-    ecs::registry world;
-    const ecs::entity a = EntityStore::SpawnNpc(world, NpcRecord{});
-    const ecs::entity b = EntityStore::SpawnNpc(world, NpcRecord{});
+    entt::registry world;
+    const entt::entity a = EntityStore::SpawnNpc(world, NpcRecord{});
+    const entt::entity b = EntityStore::SpawnNpc(world, NpcRecord{});
     world.get<Transform>(a).position = glm::vec2(10.0f, 20.0f);
     world.get<Transform>(b).position = glm::vec2(-5.0f, 7.5f);
 
@@ -172,8 +189,7 @@ TEST(BuildNpcFeet, CollectsFeetPositions)
     BuildNpcFeet(world, feet);
 
     ASSERT_EQ(feet.size(), static_cast<std::size_t>(2));
-    // Order is the registry's dense iteration order; assert both are present
-    // without depending on which comes first.
+    // registry iteration order is unspecified here; check membership only.
     bool has10 = false;
     bool hasNeg5 = false;
     for (const glm::vec2& f : feet)
@@ -193,7 +209,7 @@ TEST(BuildNpcFeet, CollectsFeetPositions)
 
 TEST(BuildNpcFeet, ClearsStaleOutputBeforeFilling)
 {
-    ecs::registry world;
+    entt::registry world;
     EntityStore::SpawnNpc(world, NpcRecord{});
 
     std::vector<glm::vec2> feet{glm::vec2(99.0f), glm::vec2(99.0f), glm::vec2(99.0f)};
@@ -204,9 +220,9 @@ TEST(BuildNpcFeet, ClearsStaleOutputBeforeFilling)
 
 TEST(BuildNpcCollisionBodies, IncludesCommittedSupportSurface)
 {
-    ecs::registry world;
-    const ecs::entity groundNpc = EntityStore::SpawnNpc(world, NpcRecord{});
-    const ecs::entity deckNpc = EntityStore::SpawnNpc(world, NpcRecord{});
+    entt::registry world;
+    const entt::entity groundNpc = EntityStore::SpawnNpc(world, NpcRecord{});
+    const entt::entity deckNpc = EntityStore::SpawnNpc(world, NpcRecord{});
     world.get<Transform>(groundNpc).position = glm::vec2(10.0f, 20.0f);
     world.get<Transform>(deckNpc).position = glm::vec2(30.0f, 40.0f);
     world.get<Elevation>(deckNpc).surface = SupportSurface::Elevation;
