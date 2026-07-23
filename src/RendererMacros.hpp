@@ -1,38 +1,16 @@
 #pragma once
 
 /**
- * @brief Declares all IRenderer override methods for a concrete renderer class.
- * @author Alex (https://github.com/lextpf)
+ * @brief Keeps shared backend override declarations identical.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * Expands to the IRenderer overrides both backends declare identically:
- * Init, Shutdown, BeginFrame, EndFrame, BeginScene, EndSceneApplyPostFX,
- * DrawSprite, DrawSpriteRegion, DrawSpriteAlpha, DrawSpriteAtlas,
- * DrawColoredRect, DrawQuad3D, SetViewProjection,
- * SetProjection, SetViewport, Clear, UploadTexture, DrawText, GetTextAscent,
- * GetTextWidth, and GetBackendInfo.
+ * Update this macro with irenderer when changing a shared signature.
+ * SetFontCandidates, RequiresYFlip, SetAmbientColor, and GetDrawCallCount remain
+ * backend declarations. OpenGL also overrides the optional large-text hooks.
  *
- * Note the expansion ends without a trailing semicolon, so every use site must
- * write one: `RIFT_DECLARE_COMMON_RENDERER_METHODS;`.
- *
- * @par Overrides that stay outside the macro
- * This is not the whole override set. Both backends declare `SetFontCandidates`,
- * `RequiresYFlip`, `SetAmbientColor` and `GetDrawCallCount` separately, because
- * each is defined inline or with backend-specific documentation; the optional
- * non-pure hooks `DrawTextLarge` and `GetTextWidthLarge` are overridden only by the
- * OpenGL backend. Changing any of those six signatures means editing four files:
- * `IRenderer.hpp`, `OpenGLRenderer.hpp`, `VulkanRenderer.hpp`, and this one only if
- * the method moves into the macro.
- *
- * @par Why this macro exists
- * For the methods it does cover, `OpenGLRenderer` and `VulkanRenderer` must declare
- * byte-identical signatures. Centralising those declarations here makes signature
- * drift impossible: change IRenderer, mirror it in this macro, and both backends
- * recompile against the same source. Do not bypass the macro for one-off overrides;
- * add the method here and to `IRenderer.hpp` together.
- *
- * @see IRenderer for documentation of each method.
- * @see OpenGLRenderer, VulkanRenderer for the backends that consume this macro.
+ * Append a semicolon at each use.
+ * @see irenderer
  */
 #define RIFT_DECLARE_COMMON_RENDERER_METHODS                                                 \
     [[nodiscard]] bool Init() override;                                                      \
@@ -81,7 +59,8 @@
                     renderModes::DepthMode depth,                                            \
                     bool flipY,                                                              \
                     bool tileFlipX,                                                          \
-                    bool tileFlipY) override;                                                \
+                    bool tileFlipY,                                                          \
+                    renderModes::LightMode light) override;                                  \
     void SetViewProjection(const glm::mat4& viewProjection) override;                        \
     void SetProjection(const glm::mat4& projection) override;                                \
     void SetViewport(int x, int y, int width, int height) override;                          \
