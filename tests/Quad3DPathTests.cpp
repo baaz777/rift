@@ -1,12 +1,5 @@
-// The golden test for the 3D world draw path. No GL/Vulkan context is created
-// here (see the rift_tests constraint in CMakeLists.txt).
-//
-// The overhaul's core safety claim is that the new pipeline is a strict superset
-// of the old one: under the Classic preset a tile submitted as a world-space quad
-// must rasterize to exactly the pixels the flat screen-space path drew it at.
-// This file proves that end to end - build the geometry the way Tilemap will,
-// project it the way the renderer will, and compare against the pre-overhaul
-// formula `(worldPos - cameraTopLeft) * screen / visibleWorld`.
+// under Classic, projected world quads must match the flat pixel formula:
+// (worldPos - cameraTopLeft) * screen / visibleWorld.
 #include "../src/Billboard.hpp"
 #include "../src/CameraRig.hpp"
 #include "../src/MathConstants.hpp"
@@ -36,7 +29,6 @@ cameraRig::RigParams ClassicParams()
     return params;
 }
 
-// What the flat pipeline would have produced for a world point.
 glm::vec2 LegacyScreenPos(const cameraRig::RigParams& params, glm::vec2 world, glm::vec2 screen)
 {
     const glm::vec2 topLeft = params.target - params.visibleWorldSize * 0.5f;
@@ -50,8 +42,6 @@ TEST(Quad3DPathTest, GroundTileLandsOnTheLegacyScreenRect)
     const glm::mat4 viewProj = cameraRig::BuildViewProjection(params);
     const glm::vec2 screen{1520.0f, 855.0f};
 
-    // A 16x16 tile near the middle of the view, addressed exactly as Tilemap
-    // addresses tiles: (tileX * tileWidth, tileY * tileHeight).
     const glm::vec2 tileTopLeft{1008.0f, 496.0f};
     const glm::vec2 tileSize{16.0f, 16.0f};
 
@@ -77,16 +67,13 @@ TEST(Quad3DPathTest, GroundTileLandsOnTheLegacyScreenRect)
 
 TEST(Quad3DPathTest, ClassicPresetKeepsTilesAxisAlignedAndUnscaled)
 {
-    // Under the flat pipeline a tile was always an upright screen rectangle of a
-    // fixed pixel size. The Classic preset must preserve that exactly - no
-    // keystoning, no size drift with position on screen.
+    // Classic keeps tiles axis-aligned and the same pixel size across the view.
     const cameraRig::RigParams params = ClassicParams();
     const glm::mat4 viewProj = cameraRig::BuildViewProjection(params);
     const glm::vec2 screen{1520.0f, 855.0f};
     const glm::vec2 tileSize{16.0f, 16.0f};
     const glm::vec2 scale = screen / params.visibleWorldSize;
 
-    // Sample tiles spread across the view, including the far corners.
     const glm::vec2 origins[] = {
         params.target - params.visibleWorldSize * 0.5f,
         params.target,
@@ -107,12 +94,10 @@ TEST(Quad3DPathTest, ClassicPresetKeepsTilesAxisAlignedAndUnscaled)
             pixels[i] = *p;
         }
 
-        // Top edge horizontal, left edge vertical: still an axis-aligned rect.
         EXPECT_NEAR(pixels[sceneMath::QUAD_TOP_LEFT].y, pixels[sceneMath::QUAD_TOP_RIGHT].y, kTol);
         EXPECT_NEAR(
             pixels[sceneMath::QUAD_TOP_LEFT].x, pixels[sceneMath::QUAD_BOTTOM_LEFT].x, kTol);
 
-        // And exactly one tile wide/tall in screen pixels, wherever it sits.
         EXPECT_NEAR(pixels[sceneMath::QUAD_TOP_RIGHT].x - pixels[sceneMath::QUAD_TOP_LEFT].x,
                     tileSize.x * scale.x,
                     kTol);
@@ -124,9 +109,7 @@ TEST(Quad3DPathTest, ClassicPresetKeepsTilesAxisAlignedAndUnscaled)
 
 TEST(Quad3DPathTest, PerspectivePresetActuallyConverges)
 {
-    // The counterpart to the test above: under the DS preset a tile further from
-    // the camera must project SMALLER. If this ever passes trivially, the
-    // projection has silently fallen back to orthographic.
+    // the DS preset uses perspective; distant tiles must project smaller.
     cameraRig::RigParams params = ClassicParams();
     cameraRig::ApplyPreset(params, cameraRig::Preset::DS);
 
@@ -145,7 +128,7 @@ TEST(Quad3DPathTest, PerspectivePresetActuallyConverges)
         return tr.x - tl.x;
     };
 
-    // Map-north (smaller world Y) is away from the camera at yaw 0.
+    // map-north (smaller world Y) is away from the camera at yaw 0.
     const float nearWidth = screenWidthOfTileAt(params.target + glm::vec2(0.0f, 40.0f));
     const float farWidth = screenWidthOfTileAt(params.target - glm::vec2(0.0f, 40.0f));
 
@@ -155,10 +138,7 @@ TEST(Quad3DPathTest, PerspectivePresetActuallyConverges)
 TEST(Quad3DPathTest, MockRecordsSubmissionsWithPassState)
 {
     MockRenderer renderer;
-    // Call through the interface, as engine code does: the trailing default
-    // arguments are declared on IRenderer, and RIFT_DECLARE_COMMON_RENDERER_METHODS
-    // deliberately does not repeat them on the overrides, so a call through the
-    // concrete type would have to spell out all ten.
+    // call through IRenderer because it declares the default arguments; overrides omit them.
     IRenderer& api = renderer;
     const Texture texture;
 
@@ -195,7 +175,6 @@ TEST(Quad3DPathTest, MockRecordsSubmissionsWithPassState)
     EXPECT_EQ(renderer.quads3D[1].depth, renderModes::DepthMode::TestOnly);
     EXPECT_EQ(renderer.quads3D[1].blend, renderModes::BlendMode::Additive);
 
-    // The ground quad is flat; the billboard stands up out of the plane.
     EXPECT_NEAR(renderer.quads3D[0].corners[sceneMath::QUAD_TOP_LEFT].y, 0.0f, kTol);
     EXPECT_GT(renderer.quads3D[1].corners[sceneMath::QUAD_TOP_LEFT].y, 0.0f);
 
@@ -210,4 +189,62 @@ TEST(Quad3DPathTest, RenderModeNamesRoundTrip)
     EXPECT_EQ(EnumTraits<renderModes::BlendMode>::FromString("Additive"),
               renderModes::BlendMode::Additive);
     EXPECT_FALSE(EnumTraits<renderModes::DepthMode>::FromString("Always").has_value());
+}
+
+TEST(Quad3DPathTest, LightModeDefaultsToAmbientAndReachesTheMock)
+{
+    // day/night ambient and self-lighting modes must survive interface dispatch.
+    MockRenderer renderer;
+    IRenderer& api = renderer;
+    const Texture texture;
+
+    glm::vec3 ground[sceneMath::QUAD_CORNER_COUNT];
+    sceneMath::MakeGroundQuad({0.0f, 0.0f}, {16.0f, 16.0f}, 0.0f, 0.0f, ground);
+
+    api.DrawQuad3D(texture,
+                   ground,
+                   {0.0f, 0.0f},
+                   {16.0f, 16.0f},
+                   glm::vec4(1.0f),
+                   renderModes::BlendMode::Alpha,
+                   renderModes::DepthMode::TestAndWrite);
+
+    api.DrawQuad3D(texture,
+                   ground,
+                   {0.0f, 0.0f},
+                   {16.0f, 16.0f},
+                   glm::vec4(1.0f),
+                   renderModes::BlendMode::Additive,
+                   renderModes::DepthMode::None,
+                   true,
+                   false,
+                   false,
+                   renderModes::LightMode::SelfLit);
+
+    ASSERT_EQ(renderer.quads3D.size(), 2u);
+    EXPECT_EQ(renderer.quads3D[0].light, renderModes::LightMode::Ambient);
+    EXPECT_EQ(renderer.quads3D[1].light, renderModes::LightMode::SelfLit);
+    EXPECT_TRUE(renderer.quads3D[0].flipY);
+
+    api.DrawQuad3D(texture,
+                   ground,
+                   {0.0f, 0.0f},
+                   {16.0f, 16.0f},
+                   glm::vec4(1.0f),
+                   renderModes::BlendMode::Alpha,
+                   renderModes::DepthMode::TestAndWrite,
+                   false);
+
+    ASSERT_EQ(renderer.quads3D.size(), 3u);
+    EXPECT_FALSE(renderer.quads3D[2].flipY);
+    EXPECT_EQ(renderer.quads3D[2].light, renderModes::LightMode::Ambient);
+}
+
+TEST(Quad3DPathTest, LightModeNamesRoundTrip)
+{
+    EXPECT_EQ(EnumTraits<renderModes::LightMode>::ToString(renderModes::LightMode::SelfLit),
+              "SelfLit");
+    EXPECT_EQ(EnumTraits<renderModes::LightMode>::FromString("Ambient"),
+              renderModes::LightMode::Ambient);
+    EXPECT_FALSE(EnumTraits<renderModes::LightMode>::FromString("Emissive").has_value());
 }
