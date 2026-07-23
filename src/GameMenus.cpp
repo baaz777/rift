@@ -16,6 +16,7 @@
 #include "NpcRender.hpp"
 #include "NpcSprite.hpp"
 #include "NpcTag.hpp"
+#include "ParticleCards.hpp"
 #include "ParticleSystem.hpp"
 #include "PlayerModes.hpp"
 #include "PlayerRender.hpp"
@@ -25,6 +26,7 @@
 #include "Transform.hpp"
 #include "Version.hpp"
 #include "ViewScaling.hpp"
+#include "WorldLightPools.hpp"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -45,8 +47,7 @@ namespace
 {
 constexpr const char* LOG_SUBSYSTEM = "Game";
 
-// Atlas region keys for the player's three sprite sheets (walk, run,
-// bicycle). Distinct from any NPC type string so collisions are impossible.
+// reserved player atlas keys must not collide with NPC type names.
 constexpr const char* kPlayerWalkAtlasKey = "__player_walk__";
 constexpr const char* kPlayerRunAtlasKey = "__player_run__";
 constexpr const char* kPlayerBicycleAtlasKey = "__player_bicycle__";
@@ -59,6 +60,8 @@ constexpr const char* kSkyGlowAtlasKey = "__sky_glow__";
 constexpr const char* kSkyLightPoolAtlasKey = "__sky_light_pool__";
 constexpr const char* kSkyAuroraCurtainAtlasKey = "__sky_aurora_curtain__";
 constexpr const char* kSkyAuroraSmallAtlasKey = "__sky_aurora_small__";
+constexpr const char* kSkyAuroraBeamAtlasKey = "__sky_aurora_beam__";
+constexpr const char* kSkySolidAtlasKey = "__sky_solid__";
 
 constexpr glm::vec3 TITLE_TEXT_COLOR{1.0f, 1.0f, 1.0f};
 constexpr glm::vec3 TITLE_DIM_COLOR{0.55f, 0.55f, 0.62f};
@@ -69,19 +72,13 @@ constexpr glm::vec4 PAUSE_DIM_COLOR{0.0f, 0.0f, 0.0f, 0.55f};
 constexpr glm::vec4 MODAL_BACKDROP_COLOR{0.0f, 0.0f, 0.0f, 0.65f};
 constexpr glm::vec4 MODAL_BOX_COLOR{0.10f, 0.11f, 0.16f, 0.95f};
 
-// Title logo uses the renderer's *headline* atlas (~96 px native in OpenGL;
-// falls back to a scaled body atlas in Vulkan). Scale 1.0 keeps it crisp
-// instead of blurring like an upscaled body-atlas glyph.
+// The headline atlas has a 96 px logical size in OpenGL; scale 1 keeps the title at that size.
 constexpr float TITLE_LOGO_SCALE = 1.0f;
-// Outline scaled to match the menu items' outline-to-glyph ratio. Outline
-// offset = 2 * scale * outlineSize px; on a 96-px headline glyph that's
-// ~12.5% of glyph height.
+// outline offset = 2 * scale * outlineSize pixels.
 constexpr float TITLE_LOGO_OUTLINE = 6.0f;
 constexpr float MENU_ITEM_SCALE = 1.4f;
 constexpr float MENU_LINE_HEIGHT = 48.0f;
-// Design resolution the menu's pixel/scale constants were authored against (the
-// default window size). uiScale = 1.0 here, so the menu is unchanged at the
-// default size and scales proportionally as the window grows/shrinks.
+// reference screen width for proportional menu scaling.
 constexpr float MENU_REFERENCE_WIDTH = 1520.0f;
 constexpr float MENU_REFERENCE_HEIGHT = 800.0f;
 constexpr const char* FOOTER_WATERMARK_TEXT = "@lextpf";
@@ -91,27 +88,17 @@ constexpr float FOOTER_BASELINE_OFFSET = 28.0f;
 constexpr float PAUSE_HEADER_SCALE = 1.8f;
 constexpr float MODAL_TEXT_SCALE = 1.0f;
 
-// Body-atlas (24px native) menu/button outline. ~21% outline-to-glyph ratio
-// (heavier than the title's 12.5%) so strokes read against the busy backdrop.
-// Selection only changes color, never outline weight.
+// Keep outline weight fixed across menu selection so highlighting does not move glyph edges.
 constexpr float MENU_ITEM_OUTLINE = 2.5f;
 
-// Title world: a small grass-only tilemap with firefly particles, frozen at
-// night. Tweak these to change the title-screen aesthetic.
 constexpr int TITLE_WORLD_MAP_WIDTH = 32;
 constexpr int TITLE_WORLD_MAP_HEIGHT = 24;
-constexpr float TITLE_WORLD_TIME_OF_DAY = 23.0f;  // 23:00 = deep night.
-// Painted across layer 0. The base overworld tileset's first non-empty entry
-// is grass; change this if your tileset orders things differently.
+constexpr float TITLE_WORLD_TIME_OF_DAY = 23.0f;
+// tileset entry 1 must contain grass for the title world.
 constexpr int TITLE_WORLD_GRASS_TILE_ID = 1;
-// Per-zone particle cap on the title screen. Bumped above the gameplay
-// default (50, set in Game::Initialize) because the title world has one
-// whole-map zone per type, so a denser pool reads as populated backdrop.
-// Lifted further (was 160) so Snow / Fog / CherryBlossom - whose long
-// lifetimes saturate the cap quickly - actually look populated instead
-// of "barely there".
+// whole-map title zones need a higher cap to sustain long-lived particles.
 constexpr size_t TITLE_PARTICLES_PER_ZONE = 240;
-// Restored when LoadGameWorld runs so the title bump doesn't leak in.
+// Restore this cap after leaving the title world.
 constexpr size_t GAMEPLAY_PARTICLES_PER_ZONE = 50;
 
 enum TitleItem : int
@@ -142,14 +129,12 @@ constexpr const char* PAUSE_LABELS[PAUSE_ITEM_COUNT] = {
     "Quit to Title",
 };
 
-// Ortho projection mapping (0,0)=top-left to (screenW, screenH)=bottom-right.
 glm::mat4 MakeUIProjection(int screenWidth, int screenHeight)
 {
     return glm::ortho(
         0.0f, static_cast<float>(screenWidth), static_cast<float>(screenHeight), 0.0f, -1.0f, 1.0f);
 }
 
-// Pick the text color for a menu item given its state.
 glm::vec3 MenuItemColor(bool selected, bool enabled)
 {
     if (!enabled)
@@ -159,17 +144,14 @@ glm::vec3 MenuItemColor(bool selected, bool enabled)
     return selected ? TITLE_HIGHLIGHT_COLOR : TITLE_DIM_COLOR;
 }
 
-// Hit-testing matches the renderer layout exactly. IRenderer::DrawText takes
-// y as the glyph baseline despite the "top-left" wording in the header.
+// hit tests use DrawText Y as the glyph baseline.
 
-// Item index under the cursor for the title menu, or -1.
 int TitleMenuHitTest(
     IRenderer& renderer, int screenWidth, int screenHeight, double mouseX, double mouseY)
 {
     const float screenW = static_cast<float>(screenWidth);
     const float screenH = static_cast<float>(screenHeight);
-    // Mirror RenderTitleContent term-for-term: same uiScale, same un-scaled
-    // anchor, same per-item centering and line spacing.
+    // Keep layout math synchronized with RenderTitleContent.
     const float uiScale = viewScaling::MenuUiScale(
         screenWidth, screenHeight, MENU_REFERENCE_WIDTH, MENU_REFERENCE_HEIGHT);
     const float menuTopY = std::floor(screenH * 0.50f);
@@ -179,8 +161,7 @@ int TitleMenuHitTest(
 
     for (int i = 0; i < TITLE_ITEM_COUNT; ++i)
     {
-        // Use unselected width: "> " vs "  " prefix shift is small relative to
-        // HIT_PAD_X, so the hit box stays comfortable across items.
+        // Use unselected width; horizontal padding absorbs the selection-prefix change.
         const std::string display = std::string("  ") + TITLE_LABELS[i];
         const float w = renderer.GetTextWidth(display, MENU_ITEM_SCALE * uiScale);
         const float x = std::floor((screenW - w) * 0.5f);
@@ -195,14 +176,12 @@ int TitleMenuHitTest(
     return -1;
 }
 
-// Item index under the cursor for the pause menu, or -1.
 int PauseMenuHitTest(
     IRenderer& renderer, int screenWidth, int screenHeight, double mouseX, double mouseY)
 {
     const float screenW = static_cast<float>(screenWidth);
     const float screenH = static_cast<float>(screenHeight);
-    // Mirror RenderPauseOverlay term-for-term: same uiScale, same un-scaled
-    // anchor, same per-item centering and line spacing.
+    // Keep layout math synchronized with RenderPauseOverlay.
     const float uiScale = viewScaling::MenuUiScale(
         screenWidth, screenHeight, MENU_REFERENCE_WIDTH, MENU_REFERENCE_HEIGHT);
     const float menuTopY = std::floor(screenH * 0.52f);
@@ -226,7 +205,7 @@ int PauseMenuHitTest(
     return -1;
 }
 
-// Confirm-overwrite modal hit test. 0 = Cancel, 1 = New Game, -1 = neither.
+// 0 = Cancel, 1 = New Game, -1 = neither.
 int ConfirmPromptHitTest(
     IRenderer& renderer, int screenWidth, int screenHeight, double mouseX, double mouseY)
 {
@@ -280,9 +259,7 @@ void Game::LoadGameWorld(bool loadSave)
     int loadedCharacterType = -1;
     bool mapLoaded = false;
 
-    // The configured map is both the persisted save and the authored starting
-    // world. New Game resets transient systems below, but should still begin on
-    // that authored landscape instead of replacing it with generated terrain.
+    // New Game retains the authored map and resets only transient systems.
     if (loadSave || CheckSaveExists())
     {
         mapLoaded = m_Tilemap.LoadMapFromJSON(
@@ -299,13 +276,13 @@ void Game::LoadGameWorld(bool loadSave)
         m_Tilemap.SetTilemapSize(m_DefaultMapWidth, m_DefaultMapHeight);
     }
 
-    // Vulkan re-uploads the tileset after a map change; OpenGL uploads lazily on first use.
+    // Vulkan needs an explicit tileset upload; OpenGL uploads lazily.
     if (m_RendererAPI == RendererAPI::Vulkan && m_Renderer)
     {
         m_Renderer->UploadTexture(m_Tilemap.GetTilesetTexture());
     }
 
-    // Pick player character: saved value, then first manifest entry, then hard default.
+    // prefer saved character, then manifest order, then the default.
     CharacterType initialCharacter =
         (loadedCharacterType >= 0 &&
          loadedCharacterType < static_cast<int>(EnumTraits<CharacterType>::Count))
@@ -326,10 +303,8 @@ void Game::LoadGameWorld(bool loadSave)
     int playerTileY = (loadedPlayerTileY >= 0) ? loadedPlayerTileY : 5;
     PlayerSystem::SetTilePosition(m_World, m_PlayerEntity, playerTileX, playerTileY);
 
-    // Pack every loaded NPC and player sprite sheet into the tile atlas so
-    // the Y-sorted pass batches into one or two draws instead of one draw
-    // per texture switch. Bindings are reset on each load so a save load or
-    // character switch re-binds with the freshly-packed offsets.
+    // repack and rebind characters after every world load; loaded sheets may differ from the
+    // Previous world.
     PackCharactersIntoAtlas();
 
     float camWorldWidth = static_cast<float>(m_TilesVisibleWidth * m_Tilemap.GetTileWidth());
@@ -339,42 +314,31 @@ void Game::LoadGameWorld(bool loadSave)
         glm::vec2(playerPos.x, playerPos.y - CharacterConstants::HITBOX_HEIGHT);
     m_Camera.Initialize(playerVisualCenter, camWorldWidth, camWorldHeight);
 
-    // Particle zones are tied to the live tilemap; refresh after a (re)load.
     m_Particles.SetZones(m_Tilemap.GetParticleZones());
     m_Particles.SetTilemap(&m_Tilemap);
 
-    // Restore the gameplay cap (title screen bumps it for a denser backdrop).
+    // Restore the gameplay cap after the title world's denser emitter budget.
     m_Particles.SetMaxParticlesPerZone(GAMEPLAY_PARTICLES_PER_ZONE);
 }
 
 void Game::PackCharactersIntoAtlas()
 {
-    // Build the list of sheet entries to pack. PackAdditionalSheets flips
-    // every source on copy so the atlas sub-region preserves each source's
-    // m_ImageData layout - that means standalone-equivalent UV math works
-    // for both stbi-flipped (LoadFromFile) and image-space (LoadFromData)
-    // sources without any per-source distinction here.
+    // atlas copies preserve each source image row convention for standalone-equivalent uvs.
     std::vector<Tilemap::AtlasPackEntry> sheets;
     sheets.reserve(EntityStore::Count(m_World) + 3 + 8);
 
-    // De-duplicate NPC types - multiple NPCs of the same type share one
-    // sheet, so only one atlas region per type is needed. First-seen wins.
+    // The first NPC in instance-id order owns each deduplicated atlas entry.
     std::unordered_set<std::string> seenTypes;
-    m_World.each<const Dialogue, const NpcSprite, const NpcTag>(
-        [&](const Dialogue& dial, const NpcSprite& sprite)
+    for (const entt::entity entity : EntityStore::Entities(m_World))
+    {
+        const Dialogue& dialogue = m_World.get<Dialogue>(entity);
+        const NpcSprite& sprite = m_World.get<NpcSprite>(entity);
+        if (!dialogue.type.empty() && seenTypes.insert(dialogue.type).second)
         {
-            const std::string& type = dial.type;
-            if (type.empty())
-            {
-                return;
-            }
-            if (seenTypes.insert(type).second)
-            {
-                sheets.push_back({type, &m_TextureStore.Get(sprite.sheet)});
-            }
-        });
+            sheets.push_back({dialogue.type, &m_TextureStore.Get(sprite.sheet)});
+        }
+    }
 
-    // Player sheets (walk / run / bicycle) under fixed keys.
     const PlayerSprite& playerSprite = m_World.get<PlayerSprite>(m_PlayerEntity);
     sheets.push_back({kPlayerWalkAtlasKey, &PlayerSystem::GetSpriteSheet(m_World, playerSprite)});
     sheets.push_back(
@@ -382,7 +346,6 @@ void Game::PackCharactersIntoAtlas()
     sheets.push_back(
         {kPlayerBicycleAtlasKey, &PlayerSystem::GetBicycleSpriteSheet(m_World, playerSprite)});
 
-    // Sky textures (procedurally generated + AuroraSmall from file).
     sheets.push_back({kSkyRayAtlasKey, &m_SkyRenderer.GetRayTexture()});
     sheets.push_back({kSkyStarAtlasKey, &m_SkyRenderer.GetStarTexture()});
     sheets.push_back({kSkyStarGlowAtlasKey, &m_SkyRenderer.GetStarGlowTexture()});
@@ -391,14 +354,17 @@ void Game::PackCharactersIntoAtlas()
     sheets.push_back({kSkyLightPoolAtlasKey, &m_SkyRenderer.GetLightPoolTexture()});
     sheets.push_back({kSkyAuroraCurtainAtlasKey, &m_SkyRenderer.GetAuroraCurtainTexture()});
     sheets.push_back({kSkyAuroraSmallAtlasKey, &m_SkyRenderer.GetAuroraSmallTexture()});
+    // 3D sky quads share the atlas to remain in one batch.
+    sheets.push_back({kSkyAuroraBeamAtlasKey, &m_SkyRenderer.GetAuroraBeamTexture()});
+    sheets.push_back({kSkySolidAtlasKey, &m_SkyRenderer.GetSolidTexture()});
 
     if (!m_Tilemap.PackAdditionalSheets(sheets))
     {
         Logger::Error(
             LOG_SUBSYSTEM,
             "PackCharactersIntoAtlas: atlas pack failed; characters keep per-sheet textures");
-        // Make sure no stale bindings linger.
-        m_World.each<NpcSprite, NpcTag>(
+        // Clear old atlas bindings before assigning new regions.
+        m_World.view<NpcSprite, NpcTag>().each(
             [](NpcSprite& sprite)
             {
                 sprite.atlas = nullptr;
@@ -406,24 +372,15 @@ void Game::PackCharactersIntoAtlas()
             });
         PlayerSystem::SetAtlasBinding(
             m_World, m_PlayerEntity, nullptr, glm::vec2(0.0f), glm::vec2(0.0f), glm::vec2(0.0f));
-        m_SkyRenderer.SetAtlasBinding(nullptr,
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f),
-                                      glm::vec2(0.0f));
+        m_SkyRenderer.SetAtlasBinding(nullptr, SkyAtlasOffsets{});
         return;
     }
 
-    // Bind each character to the atlas region keyed by its sheet identifier.
     const Texture* atlasTex = &m_Tilemap.GetTilesetTexture();
-    m_World.each<Dialogue, NpcSprite, NpcTag>(
-        [&](const Dialogue& dial, NpcSprite& sprite)
+    m_World.view<Dialogue, NpcSprite, NpcTag>().each(
+        [&](const Dialogue& dialogue, NpcSprite& sprite)
         {
-            auto offset = m_Tilemap.GetCharacterAtlasOffset(dial.type);
+            const auto offset = m_Tilemap.GetCharacterAtlasOffset(dialogue.type);
             sprite.atlas = atlasTex;
             sprite.atlasOffset = offset.value_or(glm::vec2(0.0f));
         });
@@ -438,15 +395,18 @@ void Game::PackCharactersIntoAtlas()
 
     auto skyOff = [this](const char* key)
     { return m_Tilemap.GetCharacterAtlasOffset(key).value_or(glm::vec2(0.0f)); };
-    m_SkyRenderer.SetAtlasBinding(atlasTex,
-                                  skyOff(kSkyRayAtlasKey),
-                                  skyOff(kSkyStarAtlasKey),
-                                  skyOff(kSkyStarGlowAtlasKey),
-                                  skyOff(kSkyShootingStarAtlasKey),
-                                  skyOff(kSkyGlowAtlasKey),
-                                  skyOff(kSkyLightPoolAtlasKey),
-                                  skyOff(kSkyAuroraCurtainAtlasKey),
-                                  skyOff(kSkyAuroraSmallAtlasKey));
+    SkyAtlasOffsets skyOffsets;
+    skyOffsets[skyDraw::Sprite::Ray] = skyOff(kSkyRayAtlasKey);
+    skyOffsets[skyDraw::Sprite::Star] = skyOff(kSkyStarAtlasKey);
+    skyOffsets[skyDraw::Sprite::StarGlow] = skyOff(kSkyStarGlowAtlasKey);
+    skyOffsets[skyDraw::Sprite::ShootingStar] = skyOff(kSkyShootingStarAtlasKey);
+    skyOffsets[skyDraw::Sprite::Glow] = skyOff(kSkyGlowAtlasKey);
+    skyOffsets[skyDraw::Sprite::LightPool] = skyOff(kSkyLightPoolAtlasKey);
+    skyOffsets[skyDraw::Sprite::AuroraCurtain] = skyOff(kSkyAuroraCurtainAtlasKey);
+    skyOffsets[skyDraw::Sprite::AuroraSmall] = skyOff(kSkyAuroraSmallAtlasKey);
+    skyOffsets[skyDraw::Sprite::AuroraBeam] = skyOff(kSkyAuroraBeamAtlasKey);
+    skyOffsets[skyDraw::Sprite::Solid] = skyOff(kSkySolidAtlasKey);
+    m_SkyRenderer.SetAtlasBinding(atlasTex, skyOffsets);
 }
 
 void Game::PaintTitleWorld(int tilesWide, int tilesTall)
@@ -454,19 +414,17 @@ void Game::PaintTitleWorld(int tilesWide, int tilesTall)
     tilesWide = std::max(1, tilesWide);
     tilesTall = std::max(1, tilesTall);
 
-    m_Tilemap.SetTilemapSize(tilesWide, tilesTall, /*generateMap=*/false);
+    m_Tilemap.SetTilemapSize(tilesWide, tilesTall, false);
 
-    // Paint layer 0 (Ground) with grass across the whole (possibly grown) map.
     for (int y = 0; y < tilesTall; ++y)
     {
         for (int x = 0; x < tilesWide; ++x)
         {
-            m_Tilemap.SetLayerTile(x, y, /*layer=*/0, TITLE_WORLD_GRASS_TILE_ID);
+            m_Tilemap.SetLayerTile(x, y, 0, TITLE_WORLD_GRASS_TILE_ID);
         }
     }
 
-    // One whole-map zone per atmospheric particle type, sized to the map so
-    // particles fill the viewport. (Lantern excluded - needs a lit zone.)
+    // One full-map zone per atmospheric type; Lantern requires a lit zone.
     if (auto* zones = m_Tilemap.GetParticleZonesMutable())
     {
         zones->clear();
@@ -498,13 +456,12 @@ void Game::PaintTitleWorld(int tilesWide, int tilesTall)
         }
     }
 
-    // Vulkan needs the tileset re-uploaded after a tilemap recreate.
     if (m_RendererAPI == RendererAPI::Vulkan && m_Renderer)
     {
         m_Renderer->UploadTexture(m_Tilemap.GetTilesetTexture());
     }
 
-    // ParticleSystem holds the zones vector by reference; refresh after rebuild.
+    // Refresh the borrowed zone list after tilemap rebuild.
     m_Particles.SetZones(m_Tilemap.GetParticleZones());
     m_Particles.SetTilemap(&m_Tilemap);
 }
@@ -517,7 +474,7 @@ void Game::RefreshTitleWorldForViewport(bool forceRepaint)
                                                                        m_Tilemap.GetTileWidth(),
                                                                        m_Tilemap.GetTileHeight(),
                                                                        m_Camera.GetState().zoom,
-                                                                       /*marginTiles=*/2,
+                                                                       2,
                                                                        TITLE_WORLD_MAP_WIDTH,
                                                                        TITLE_WORLD_MAP_HEIGHT);
 
@@ -527,7 +484,7 @@ void Game::RefreshTitleWorldForViewport(bool forceRepaint)
         PaintTitleWorld(titleTiles.x, titleTiles.y);
     }
 
-    // Center the camera on the (possibly resized) map using the accurate extent.
+    // Use the actual visible extent to center the resized title world.
     const glm::vec2 mapCenterPx(
         static_cast<float>(m_Tilemap.GetMapWidth() * m_Tilemap.GetTileWidth()) * 0.5f,
         static_cast<float>(m_Tilemap.GetMapHeight() * m_Tilemap.GetTileHeight()) * 0.5f);
@@ -537,11 +494,7 @@ void Game::RefreshTitleWorldForViewport(bool forceRepaint)
 
 void Game::LoadTitleScreenWorld()
 {
-    // Title is purely cosmetic - no save, NPCs, player, or editor. Strip
-    // session state to a clean slate before painting the grass.
-    // Re-arm the title-ambient latch: a fresh title session starts with
-    // the scripted ambient zones + initial weather, until the user opens
-    // the console (which strips them for the rest of the session).
+    // Reset the title ambience latch for this menu session.
     m_TitleAmbientCleared = false;
     EntityStore::Clear(m_World);
     m_Editor.SetActive(false);
@@ -554,39 +507,28 @@ void Game::LoadTitleScreenWorld()
     m_DialogueUi.boxFadeTimer = 0.0f;
     m_DialogueUi.snap.active = false;
 
-    // Size the title world to the current viewport, paint grass, build zones,
-    // and center the camera. Re-runnable on resize via the same helper.
-    RefreshTitleWorldForViewport(/*forceRepaint=*/true);
+    RefreshTitleWorldForViewport(true);
 
-    // Park player at (0,0) to keep its tile coords valid - it isn't rendered
-    // in Title (Y-sort skips it).
+    // Keep the player entity at a valid tile for shared frame code; the title renderer skips it.
     PlayerSystem::SetTilePosition(m_World, m_PlayerEntity, 0, 0);
 
-    // Freeze time at night. TimeManager.Update is gated in Title mode so
-    // this value holds until Continue / New Game.
+    // Title mode skips TimeManager::Update, so this authored nighttime hour remains fixed.
     m_TimeManager.Initialize();
     m_WeatherDirector.Reset(m_TimeManager);
-    m_WeatherDirector.SetEnabled(false);  // title weather is scripted, not directed
+    m_WeatherDirector.SetEnabled(false);
     m_TimeManager.SetTime(TITLE_WORLD_TIME_OF_DAY);
-    // Aurora enables aurora curtains + floating wisps (SkyRenderer reads
-    // weather each frame). Cherry blossoms still drift via the title zone.
+
+    // Aurora supplies sky curtains and wisps while zone emitters supply the other title particles.
     m_TimeManager.SetWeather(WeatherState::Aurora);
 
-    // Bump per-zone cap for a denser backdrop (one zone per type, whole-map).
-    // Reset to gameplay value when a real game world loads.
+    // whole-map title zones use a higher cap; LoadGameWorld restores the gameplay value.
     m_Particles.SetMaxParticlesPerZone(TITLE_PARTICLES_PER_ZONE);
 
-    // Pre-warm the particle pool so the menu doesn't open empty. Stepping a
-    // few seconds reaches steady state for fast types (rain, sparkles) and a
-    // near-cap count for slow ones (firefly, fog). Time-of-day and night
-    // factor must be set first - some zone spawn rules read them (e.g.
-    // lantern day-skip).
+    // Set time and night factor before prewarming; zone spawn rules read them.
     m_Particles.SetTimeOfDay(m_TimeManager.GetTimeOfDay());
     m_Particles.SetNightFactor(m_TimeManager.GetStarVisibility());
     m_Particles.Clear();
-    // The prewarm below runs before the first Game::Update push - clear any
-    // gameplay leftovers (transition streams, gusted wind) so the title
-    // backdrop simulates with the same calm defaults as a fresh boot.
+    // Clear gameplay transitions and wind before prewarming title particles.
     m_Particles.SetWeatherTransition(nullptr, nullptr, 0.0f);
     m_Particles.SetWind(m_WeatherDirector.GetWindDirection(), m_WeatherDirector.GetWindStrength());
     const glm::vec2 prewarmCam = m_Camera.GetState().position;
@@ -602,13 +544,13 @@ void Game::LoadTitleScreenWorld()
 
 void Game::ResetWorldToDefaults()
 {
-    LoadGameWorld(/*loadSave=*/false);
+    LoadGameWorld(false);
     m_TimeManager.Initialize();
     m_WeatherDirector.Reset(m_TimeManager);
     m_WeatherDirector.SetEnabled(true);
     m_GameState.Clear();
 
-    // Close leftover dialogue/snap state so the next gameplay frame starts clean.
+    // Clear conversation state before the new world can update its NPCs.
     m_DialogueManager.EndDialogue();
     m_DialogueUi.inDialogue = false;
     m_DialogueUi.text.clear();
@@ -625,19 +567,16 @@ void Game::RebuildTitleMenu()
 
     m_TitleMenu.enabled.assign(TITLE_ITEM_COUNT, true);
     m_TitleMenu.enabled[TITLE_CONTINUE] = hasSave;
-    m_TitleMenu.enabled[TITLE_SETTINGS] = false;  // MVP stub.
+    m_TitleMenu.enabled[TITLE_SETTINGS] = false;
 
-    // Default-highlight Continue when a save exists (likely intent); otherwise
-    // first enabled item (New Game).
+    // prefer Continue when a save exists; otherwise select the first enabled item.
     m_TitleMenu.selected =
         hasSave ? static_cast<int>(TITLE_CONTINUE) : MenuLogic::FirstEnabledIndex(m_TitleMenu);
 
     m_ConfirmOverwriteShown = false;
     m_ConfirmPrompt.selected = MenuLogic::ConfirmChoice::Cancel;
 
-    // Sentinel skips move-detection on the first title frame so a stale
-    // cursor doesn't yank selection. Also suppresses any in-flight click so
-    // entering with the mouse held doesn't fire a phantom confirm.
+    // ignore stale hover and held clicks on the first menu frame.
     m_MenuLastMouseX = -1.0;
     m_MenuLastMouseY = -1.0;
     m_MenuMouseLeftPrev = true;
@@ -645,14 +584,12 @@ void Game::RebuildTitleMenu()
 
 void Game::ProcessTitleInput()
 {
-    // Lazy first-time init, which avoids reaching into Initialize.
-    // Cheap to repeat (size never grows).
     if (m_TitleMenu.enabled.size() != static_cast<size_t>(TITLE_ITEM_COUNT))
     {
         RebuildTitleMenu();
     }
 
-    // Drive every KeyToggle to advance edge state and avoid carry-over.
+    // poll every toggle so edge state cannot carry across modes.
     bool up = m_KeyMenuUp.JustPressed(m_Window);
     bool down = m_KeyMenuDown.JustPressed(m_Window);
     bool left = m_KeyMenuLeft.JustPressed(m_Window);
@@ -660,10 +597,7 @@ void Game::ProcessTitleInput()
     bool confirm = m_KeyMenuConfirm.JustPressed(m_Window);
     bool esc = m_KeyEscape.JustPressed(m_Window);
 
-    // Mouse: hover updates selection only when the cursor actually moved (so
-    // a parked cursor doesn't override keyboard nav); left-click edge confirms.
-    // The negative sentinel on m_MenuLastMouseX skips move-detection on the
-    // first menu frame so a stale cursor doesn't yank the default selection.
+    // Only mouse motion changes hover selection; stationary hover must not override keyboard input.
     double mouseX = 0.0;
     double mouseY = 0.0;
     glfwGetCursorPos(m_Window, &mouseX, &mouseY);
@@ -676,7 +610,6 @@ void Game::ProcessTitleInput()
     const bool mouseClicked = mouseDown && !m_MenuMouseLeftPrev;
     m_MenuMouseLeftPrev = mouseDown;
 
-    // Confirm-overwrite modal owns input while shown.
     if (m_ConfirmOverwriteShown)
     {
         const int modalHit =
@@ -723,8 +656,7 @@ void Game::ProcessTitleInput()
         return;
     }
 
-    // Mouse hover/click goes first so the cursor can override the keyboard
-    // selection on the same frame and the confirm path sees the click.
+    // Apply hover before confirmation so clicks act on the hovered item.
     const int titleHit =
         TitleMenuHitTest(*m_Renderer, m_ScreenWidth, m_ScreenHeight, mouseX, mouseY);
     if (titleHit >= 0 && m_TitleMenu.enabled[titleHit])
@@ -750,7 +682,6 @@ void Game::ProcessTitleInput()
     }
     if (esc)
     {
-        // No-op on title - user must explicitly select Quit.
     }
     if (!confirm)
     {
@@ -778,21 +709,19 @@ void Game::ProcessTitleInput()
         {
             if (!CheckSaveExists())
             {
-                break;  // shouldn't be reachable (item is disabled)
+                break;
             }
             Logger::Info(LOG_SUBSYSTEM, "Continue: reloading save from disk");
-            // Reset time so Continue doesn't inherit the title's 23:00 night
-            // setting (LoadGameWorld doesn't touch TimeManager).
+            // continue must not inherit the title hour.
             m_TimeManager.Initialize();
             m_WeatherDirector.Reset(m_TimeManager);
             m_WeatherDirector.SetEnabled(true);
-            LoadGameWorld(/*loadSave=*/true);
+            LoadGameWorld(true);
             m_GameMode = GameMode::Playing;
             break;
         }
         case TITLE_SETTINGS:
         {
-            // Stub (disabled; NavigateDown skips it).
             break;
         }
         case TITLE_QUIT:
@@ -819,7 +748,6 @@ void Game::ProcessPauseInput()
     bool confirm = m_KeyMenuConfirm.JustPressed(m_Window);
     bool esc = m_KeyEscape.JustPressed(m_Window);
 
-    // Mouse hover/click - same pattern as title menu (see ProcessTitleInput).
     double mouseX = 0.0;
     double mouseY = 0.0;
     glfwGetCursorPos(m_Window, &mouseX, &mouseY);
@@ -877,8 +805,8 @@ void Game::ProcessPauseInput()
         case PAUSE_QUIT_TO_TITLE:
         {
             Logger::Info(LOG_SUBSYSTEM, "Quit to Title (no save)");
-            // Restore the cosmetic title world so the menu sits over the grass +
-            // ambient-particle backdrop again instead of the abandoned session.
+
+            // Replace the abandoned session with the cosmetic world before showing the title menu.
             LoadTitleScreenWorld();
             m_GameMode = GameMode::Title;
             RebuildTitleMenu();
@@ -889,39 +817,54 @@ void Game::ProcessPauseInput()
     }
 }
 
-// Bridge the flat camera to the orbit rig. `camera.position` is the viewport's
-// top-left corner, so the equivalent orbit focus is that corner plus half the
-// visible extent - i.e. the point the 2D view was already centered on. Switching
-// paths therefore does not move the view.
 cameraRig::RigParams Game::BuildCameraRig() const
 {
     const glm::vec2 world = VisibleWorldSize();
     const float zoom = std::max(m_Camera.GetState().zoom, 0.001f);
     const glm::vec2 visible = world / zoom;
 
+    // match flat pixel snapping only for Classic; rotated world axes are not screen-pixel steps.
+    glm::vec2 corner = m_Camera.GetState().position;
+    if (m_RendererAPI == RendererAPI::OpenGL && m_CameraPreset == cameraRig::Preset::Classic)
+    {
+        const float pixelStepX = visible.x / static_cast<float>(m_ScreenWidth);
+        const float pixelStepY = visible.y / static_cast<float>(m_ScreenHeight);
+        auto snapToPixel = [](float value, float step)
+        { return (step > 0.0f) ? std::round(value / step) * step : value; };
+        corner.x = snapToPixel(corner.x, pixelStepX);
+        corner.y = snapToPixel(corner.y, pixelStepY);
+    }
+
     cameraRig::RigParams rig;
     rig.visibleWorldSize = visible;
-    rig.target = m_Camera.GetState().position + visible * 0.5f;
+    rig.target = corner + visible * 0.5f;
     rig.yawRadians = m_CameraYaw;
     rig.pitchRadians = m_CameraPitch;
 
-    // Depth range must span the map, not just the viewport, or tall billboards
-    // near the edges would clip.
+    // span the map depth so tall edge billboards do not clip.
     const float mapW = static_cast<float>(m_Tilemap.GetMapWidth() * m_Tilemap.GetTileWidth());
     const float mapH = static_cast<float>(m_Tilemap.GetMapHeight() * m_Tilemap.GetTileHeight());
     rig.sceneRadius = std::max(256.0f, std::sqrt(mapW * mapW + mapH * mapH));
 
-    // The preset sets projection kind and, for Classic/DS, the angles; Free
-    // keeps whatever the live yaw/pitch already are.
+    // Classic and DS prescribe angles; Free retains the live orbit angles.
     cameraRig::ApplyPreset(rig, m_CameraPreset);
     return rig;
 }
 
-// Self-contained gameplay frame through the world-space 3D path, structured like
-// RenderTitleFrame. Deliberately minimal for now: tiles and characters only.
-// Particles, sky parallax, world lights and editor overlays still belong to the
-// flat pipeline and are ported in a later phase - so this is a look preview, not
-// yet a replacement.
+// Resolve support height here; the shared light builder has no tilemap.
+void Game::RenderWorldLights3D(const particleCards::Frame& frame)
+{
+    worldLights::Build(m_Tilemap.GetLights(),
+                       m_TimeManager.GetTimeOfDay(),
+                       m_TimeManager.GetStarVisibility(),
+                       m_LightPoolScratch);
+    for (skyDraw::LightPool& pool : m_LightPoolScratch)
+    {
+        pool.surfaceHeight = m_Tilemap.SurfaceHeightAtWorldPos(pool.centreWorld);
+    }
+    m_SkyRenderer.SubmitLightPools3D(*m_Renderer, m_LightPoolScratch, frame);
+}
+
 void Game::RenderFrame3D()
 {
     m_Renderer->BeginFrame();
@@ -936,25 +879,29 @@ void Game::RenderFrame3D()
     const cameraRig::RigParams rig = BuildCameraRig();
     m_Renderer->SetViewProjection(cameraRig::BuildViewProjection(rig));
 
+    m_Renderer->SetViewSize(rig.visibleWorldSize);
+
     DrawTracer::Mark("section: World3D", m_Renderer->GetDrawCallCount());
     m_Tilemap.RenderWorld3D(*m_Renderer, rig);
 
-    // Characters follow the camera's yaw completely so they are never seen
-    // edge-on; tile scenery deliberately under-follows (see billboard::Role).
+    // characters follow full camera yaw to avoid edge-on sprites.
     const billboard::Orientation actorOrientation = billboard::Orient(
         rig.yawRadians, rig.pitchRadians, billboard::DefaultDamping(billboard::Role::Character));
     DrawTracer::Mark("section: NPCs3D", m_Renderer->GetDrawCallCount());
-    // NpcTag is filter-only in this ECS - tags select the archetype but are not
-    // passed to the callback.
-    m_World.each<Transform, Elevation, Facing, AnimationState, NpcSprite, NpcTag>(
-        [&](Transform& xf, Elevation& elev, Facing& facing, AnimationState& anim, NpcSprite& sprite)
-        {
-            NpcRender::Draw3D(
-                m_World, *m_Renderer, actorOrientation, xf, elev, facing, anim, sprite);
-        });
+    for (const entt::entity entity : EntityStore::Entities(m_World))
+    {
+        NpcRender::Draw3D(m_World,
+                          *m_Renderer,
+                          actorOrientation,
+                          m_World.get<Transform>(entity),
+                          m_World.get<Elevation>(entity),
+                          m_World.get<Facing>(entity),
+                          m_World.get<AnimationState>(entity),
+                          m_World.get<NpcSprite>(entity));
+    }
 
     DrawTracer::Mark("section: Player3D", m_Renderer->GetDrawCallCount());
-    if (m_World.alive(m_PlayerEntity))
+    if (m_World.valid(m_PlayerEntity))
     {
         PlayerRender::Draw3D(m_World,
                              *m_Renderer,
@@ -966,6 +913,18 @@ void Game::RenderFrame3D()
                              m_World.get<PlayerModes>(m_PlayerEntity),
                              m_World.get<PlayerSprite>(m_PlayerEntity));
     }
+
+    DrawTracer::Mark("section: Particles3D", m_Renderer->GetDrawCallCount());
+    m_Particles.Render3D(*m_Renderer, rig);
+
+    // reuse the camera frame for both light pools and sky; pools draw first as in the flat path.
+    const particleCards::Frame skyFrame = particleCards::MakeFrame(rig);
+    DrawTracer::Mark("section: WorldLights3D", m_Renderer->GetDrawCallCount());
+    RenderWorldLights3D(skyFrame);
+
+    // Use the unzoomed sky extent to match flat rendering.
+    DrawTracer::Mark("section: Sky3D", m_Renderer->GetDrawCallCount());
+    m_SkyRenderer.Render3D(*m_Renderer, m_TimeManager, skyFrame, VisibleWorldSize());
 
     PostFXParams postFX;
     postFX.timeOfDay = m_TimeManager.GetTimeOfDay();
@@ -982,17 +941,15 @@ void Game::RenderFrame3D()
     DrawTracer::Mark("section: PostFX", m_Renderer->GetDrawCallCount());
     m_Renderer->EndSceneApplyPostFX(postFX);
 
-    // Screen-space UI after PostFX, on the untouched 2D path.
+    // Reset ambient after postfx; an earlier change can flush pending 3D geometry with white light.
     DrawTracer::Mark("section: UI overlays", m_Renderer->GetDrawCallCount());
+    m_Renderer->SetAmbientColor(glm::vec3(1.0f));
     m_Renderer->SetProjection(MakeUIProjection(m_ScreenWidth, m_ScreenHeight));
     m_Console.Render(*m_Renderer, m_ScreenWidth, m_ScreenHeight);
 
     m_Renderer->EndFrame();
 
-    // Present. Easy to miss: the flat path swaps at the end of Game::Render, so
-    // a path that returns early from Render must swap for itself - exactly as
-    // RenderTitleFrame does. Without this the frame renders and composites
-    // correctly and is then never shown.
+    // This complete frame path must swap OpenGL buffers itself.
     if (m_RendererAPI == RendererAPI::OpenGL)
     {
         glfwSwapBuffers(m_Window);
@@ -1013,13 +970,11 @@ void Game::RenderTitleFrame()
 
     DrawTracer::Mark("== title frame ==", m_Renderer->GetDrawCallCount());
 
-    // Clear to the title world's sky color (deep blue at night).
     glm::vec3 skyColor = m_TimeManager.GetSkyColor();
     m_Renderer->Clear(skyColor.r, skyColor.g, skyColor.b, 1.0f);
     m_Renderer->SetAmbientColor(m_TimeManager.GetAmbientColor());
 
-    // Title world has no entities, so the Y-sort assembly is skipped here.
-    // Foreground layers still render in case future tweaks add upper-layer overlays.
+    // The title has no rendered actors, so it can omit gameplay Y-sort assembly.
     const float worldWidth = static_cast<float>(m_ScreenWidth) / static_cast<float>(PIXEL_SCALE);
     const float worldHeight = static_cast<float>(m_ScreenHeight) / static_cast<float>(PIXEL_SCALE);
     const float zoomedWidth = worldWidth / m_Camera.GetState().zoom;
@@ -1035,12 +990,10 @@ void Game::RenderTitleFrame()
     DrawTracer::Mark("section: ForegroundLayers", m_Renderer->GetDrawCallCount());
     m_Tilemap.RenderForegroundLayers(*m_Renderer, renderCam, renderSize, renderCam, renderSize);
 
-    // Ambient particles (fireflies, etc.) drawn on top of the world.
     DrawTracer::Mark("section: Particles", m_Renderer->GetDrawCallCount());
-    m_Particles.Render(*m_Renderer, renderCam, /*noProjection=*/false, /*additive=*/false);
+    m_Particles.Render(*m_Renderer, renderCam, false, false);
 
-    // Sky overlay (stars, moon, dawn glow). World projection with parallax
-    // driven by the menu's renderCam, matching the gameplay path.
+    // Use renderCam for sky parallax so sky and cosmetic map respond to the same menu camera.
     DrawTracer::Mark("section: Sky", m_Renderer->GetDrawCallCount());
     m_SkyRenderer.Render(*m_Renderer,
                          m_TimeManager,
@@ -1048,8 +1001,6 @@ void Game::RenderTitleFrame()
                          static_cast<int>(worldWidth),
                          static_cast<int>(worldHeight));
 
-    // Composite through PostFX. Modest bloom so fireflies glow without
-    // blowing the screen out.
     PostFXParams postFX;
     postFX.timeOfDay = m_TimeManager.GetTimeOfDay();
     postFX.nightFactor = m_TimeManager.GetStarVisibility();
@@ -1068,29 +1019,25 @@ void Game::RenderTitleFrame()
         postFX.grainIntensity = 0.0f;
         postFX.bloomIntensity = 0.0f;
         postFX.saturation = 1.0f;
-        // gradingParams default-constructs to identity. postFXEnabled=false
-        // is the real off-switch; these zeroes are a defensive fallback in
-        // case the uniform fails to bind.
+        // identity values back up postFXEnabled if its uniform is absent.
     }
     DrawTracer::Mark("section: PostFX", m_Renderer->GetDrawCallCount());
     m_Renderer->EndSceneApplyPostFX(postFX);
 
     DrawTracer::Mark("section: UI overlays", m_Renderer->GetDrawCallCount());
 
-    // UI overlays draw straight to swapchain after PostFX.
     RenderTitleContent();
     if (m_ConfirmOverwriteShown)
     {
         RenderConfirmOverwritePrompt();
     }
 
-    // Perf overlay (toggled via the debug.info console command): FPS + right-column
-    // renderer/res/zoom. Player position and quests are intentionally omitted on title.
+    // Title diagnostics show performance and renderer state; player and quest fields do not apply.
     if (m_Editor.IsShowDebugInfo())
     {
         constexpr float kMargin = 12.0f;
         constexpr float kLineHeight = 28.0f;
-        constexpr float kHudAlpha = 0.6f;  // Slightly transparent overlay (matches gameplay HUD).
+        constexpr float kHudAlpha = 0.6f;
         const glm::vec3 kFpsColor(1.0f, 1.0f, 0.0f);
         const glm::vec3 kRightColor(1.0f, 0.3f, 0.3f);
 
@@ -1102,13 +1049,11 @@ void Game::RenderTitleFrame()
                                             1.0f);
         m_Renderer->SetProjection(uiProjection);
 
-        // Left column: FPS only (matches gameplay overlay format).
         char fpsText[32];
         std::snprintf(
             fpsText, sizeof(fpsText), "FPS: %d", static_cast<int>(m_Fps.currentFps + 0.5f));
         m_Renderer->DrawText(fpsText, glm::vec2(kMargin, 32.0f), 1.0f, kFpsColor, 2.0f, kHudAlpha);
 
-        // Right column: renderer, resolution, frame time, zoom, draws.
         const char* rendererName = (m_RendererAPI == RendererAPI::OpenGL) ? "OpenGL" : "Vulkan";
         float rightMargin = static_cast<float>(m_ScreenWidth) - kMargin;
 
@@ -1186,7 +1131,6 @@ void Game::RenderTitleContent()
     const float uiScale = viewScaling::MenuUiScale(
         m_ScreenWidth, m_ScreenHeight, MENU_REFERENCE_WIDTH, MENU_REFERENCE_HEIGHT);
 
-    // "RIFT" logo (headline atlas), scaled and anchored proportionally.
     const std::string logoText = "RIFT";
     const float logoWidth = m_Renderer->GetTextWidthLarge(logoText, TITLE_LOGO_SCALE * uiScale);
     const float logoX = std::floor((screenW - logoWidth) * 0.5f);
@@ -1219,15 +1163,12 @@ void Game::RenderTitleContent()
                              1.0f);
     }
 
-    // Footer labels - the same pair the in-game HUD shows.
     RenderVersionFooter();
 }
 
 void Game::RenderVersionFooter()
 {
-    // Self-contained so both the title screen and the in-game HUD can call it:
-    // suspend perspective and draw in a screen-space UI projection. Callers that
-    // resume world-space drawing afterward restore their own projection.
+    // Leave UI projection active; callers restore it before drawing world geometry.
     m_Renderer->SetProjection(MakeUIProjection(m_ScreenWidth, m_ScreenHeight));
 
     const float screenW = static_cast<float>(m_ScreenWidth);
@@ -1263,7 +1204,6 @@ void Game::RenderConfirmOverwritePrompt()
     const float screenW = static_cast<float>(m_ScreenWidth);
     const float screenH = static_cast<float>(m_ScreenHeight);
 
-    // Semi-opaque backdrop over the title.
     m_Renderer->DrawColoredRect(
         glm::vec2(0.0f, 0.0f), glm::vec2(screenW, screenH), MODAL_BACKDROP_COLOR);
 
@@ -1292,7 +1232,6 @@ void Game::RenderConfirmOverwritePrompt()
                          1.0f,
                          1.0f);
 
-    // Cancel | New Game buttons, side by side.
     const std::string cancelLabel = "Cancel";
     const std::string confirmLabel = "New Game";
     const bool confirmSelected = (m_ConfirmPrompt.selected == MenuLogic::ConfirmChoice::Confirm);
@@ -1339,7 +1278,6 @@ void Game::RenderPauseOverlay()
     const float uiScale = viewScaling::MenuUiScale(
         m_ScreenWidth, m_ScreenHeight, MENU_REFERENCE_WIDTH, MENU_REFERENCE_HEIGHT);
 
-    // Dim the frozen world.
     m_Renderer->DrawColoredRect(
         glm::vec2(0.0f, 0.0f), glm::vec2(screenW, screenH), PAUSE_DIM_COLOR);
 
@@ -1369,7 +1307,7 @@ void Game::RenderPauseOverlay()
         m_Renderer->DrawText(display,
                              glm::vec2(x, y),
                              MENU_ITEM_SCALE * uiScale,
-                             MenuItemColor(selected, /*enabled=*/true),
+                             MenuItemColor(selected, true),
                              MENU_ITEM_OUTLINE,
                              1.0f);
     }
