@@ -4,7 +4,7 @@
 
 #include "CharacterType.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <glm/glm.hpp>
 
@@ -17,166 +17,145 @@ class Tilemap;
 struct PlayerSprite;
 
 /**
- * @brief Free-function player appearance / mode / per-frame logic over components.
- * @author Alex (https://github.com/lextpf)
+ * @brief Player appearance, movement, and animation operations over registry components.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Entities
  *
- * The player counterpart to NpcAiSystem and NpcRender: character switching, appearance copying,
- * sprite and atlas binding, and the per-frame update, all as free functions over the player
- * entity's components.
- *
- * Services come from @c world.globals().find&lt;WorldServices&gt;(). Either the TextureStore or the
- * AssetRegistry may be absent, as in a bare test world with no renderer wired up, so every use is
- * null-checked and the sheet accessors fall back to a shared empty texture.
- *
- * The per-frame movement step and Stop live in @ref PlayerMovementSystem. This header covers the
- * appearance, mode and animation glue around them.
- *
- * @see WorldServices, PlayerMovementSystem, TextureStore
+ * services come from world.ctx().find<WorldServices>(). entity components are updated in place;
+ * stateless PlayerMovementSystem handles movement and stopping. Missing services are tolerated,
+ * but callers must supply a valid player with the required components.
  */
 namespace PlayerSystem
 {
 /**
- * @brief Switch the player to a character variant: load its walk/run/bicycle sheets
- * via the TextureStore + AssetRegistry from globals, set Appearance, and re-sample
- * the dialogue accent.
+ * @fn bool PlayerSystem::SwitchCharacter(entt::registry& world, entt::entity player, \
+ *     CharacterType type)
+ * @brief Load walk and run sheets; bicycle is optional.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @param world  ECS registry; the player's PlayerSprite + Appearance are updated in place.
- * @param player Player entity to restyle.
- * @param type   Character variant to load (resolved to asset paths via the AssetRegistry).
- * @return true if the walk + run sheets loaded (bicycle is optional); false on any
- *         failure, leaving the current appearance untouched.
+ * On failure return false and preserve the appearance.
+ *
+ * Resolve paths through AssetRegistry and load through TextureStore. success updates PlayerSprite
+ * and Appearance and resamples the dialogue accent. If the optional bicycle sheet cannot load,
+ * retain the previous bicycle sheet. Failed switches can still populate the texture cache.
  */
-bool SwitchCharacter(ecs::registry& world, ecs::entity player, CharacterType type);
+bool SwitchCharacter(entt::registry& world, entt::entity player, CharacterType type);
 
 /**
- * @brief Copy an NPC look onto the player (walking sheet only); sets the disguise
- * flag and re-samples the accent.
- *
- * @param world      ECS registry; the player's PlayerSprite + Appearance are updated.
- * @param player     Player entity to disguise.
- * @param spritePath Path to the NPC's walking sheet to copy.
- * @return true if the sheet loaded; false otherwise (appearance left unchanged).
+ * @fn bool PlayerSystem::CopyAppearanceFrom(entt::registry& world, entt::entity player, const \
+ *     std::string& spritePath)
+ * @brief Copy an NPC walking sheet, set disguise and resample accent; failure preserves the
+ * appearance.
+ * @author Alex (<https://github.com/lextpf>)
  */
-bool CopyAppearanceFrom(ecs::registry& world, ecs::entity player, const std::string& spritePath);
+bool CopyAppearanceFrom(entt::registry& world, entt::entity player, const std::string& spritePath);
 
 /**
- * @brief Reload the original character sheets, clearing the disguise flag on success.
- *
- * @param world  ECS registry; delegates to @ref SwitchCharacter with the stored type.
- * @param player Player entity to restore. No-op when not currently disguised.
+ * @fn void PlayerSystem::RestoreOriginalAppearance(entt::registry& world, entt::entity player)
+ * @brief Reload original sheets and clear disguise on success; do nothing when not disguised.
+ * @author Alex (<https://github.com/lextpf>)
  */
-void RestoreOriginalAppearance(ecs::registry& world, ecs::entity player);
+void RestoreOriginalAppearance(entt::registry& world, entt::entity player);
 
 /**
- * @brief Re-upload the player's three sheets to @p renderer (e.g. after a character
- * switch or a renderer/backend swap).
- *
- * @param world    ECS registry holding the player's PlayerSprite handles.
- * @param player   Player entity whose sheets are uploaded.
- * @param renderer Target renderer; receives the walk/run/bicycle textures. No-op when
- *                 no TextureStore is bound in globals.
+ * @fn void PlayerSystem::UploadTextures(const entt::registry& world, entt::entity player, \
+ *     IRenderer& renderer)
+ * @brief Upload walk, run and bicycle sheets after an appearance change or renderer switch; missing
+ * TextureStore makes this a no-op.
+ * @author Alex (<https://github.com/lextpf>)
  */
-void UploadTextures(const ecs::registry& world, ecs::entity player, IRenderer& renderer);
+void UploadTextures(const entt::registry& world, entt::entity player, IRenderer& renderer);
 
 /**
- * @brief Bind the player's three sheets to atlas regions; a null @p atlasTex reverts
- * to the per-player sheets. Offsets are pixel-space within the atlas.
+ * @fn void PlayerSystem::SetAtlasBinding(entt::registry& world, entt::entity player, const \
+ *     Texture* atlasTex, glm::vec2 walkOffset, glm::vec2 runOffset, glm::vec2 bicycleOffset)
+ * @brief Borrow atlasTex; null restores individual sheets.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @param world         ECS registry; updates the player's PlayerSprite atlas fields.
- * @param player        Player entity to bind.
- * @param atlasTex      Shared atlas texture, or nullptr to revert to per-player sheets.
- * @param walkOffset    Walk sheet's pixel offset within the atlas.
- * @param runOffset     Run sheet's pixel offset within the atlas.
- * @param bicycleOffset Bicycle sheet's pixel offset within the atlas.
+ * Offsets are in atlas pixels.
+ *
  */
-void SetAtlasBinding(ecs::registry& world,
-                     ecs::entity player,
+void SetAtlasBinding(entt::registry& world,
+                     entt::entity player,
                      const Texture* atlasTex,
                      glm::vec2 walkOffset,
                      glm::vec2 runOffset,
                      glm::vec2 bicycleOffset);
 
 /**
- * @brief Resolve the player's walking sheet through the TextureStore in globals (a
- * shared empty texture if none is bound). Used by atlas packing and the render path.
- *
- * @param world  ECS registry supplying the TextureStore via globals.
- * @param sprite Player sprite component holding the sheet handles.
- * @return The walking sheet texture, or a shared empty texture when no store is bound.
+ * @fn const Texture& PlayerSystem::GetSpriteSheet(const entt::registry& world, const \
+ *     PlayerSprite& sprite)
+ * @brief Borrow the walking sheet, or a shared empty texture if no TextureStore is published.
+ * @author Alex (<https://github.com/lextpf>)
  */
-const Texture& GetSpriteSheet(const ecs::registry& world, const PlayerSprite& sprite);
-
-/// @brief As @ref GetSpriteSheet, for the running sheet (@c sprite.run).
-const Texture& GetRunningSpriteSheet(const ecs::registry& world, const PlayerSprite& sprite);
-
-/// @brief As @ref GetSpriteSheet, for the bicycle sheet (@c sprite.bicycle).
-const Texture& GetBicycleSpriteSheet(const ecs::registry& world, const PlayerSprite& sprite);
+const Texture& GetSpriteSheet(const entt::registry& world, const PlayerSprite& sprite);
 
 /**
- * @brief Per-frame player animation + elevation advance: velocity-driven walk
- * cadence + smooth elevation.
- *
- * @param world     ECS registry holding the player's animation + elevation components.
- * @param player    Player entity to advance.
- * @param deltaTime Frame time in seconds.
+ * @fn const Texture& PlayerSystem::GetRunningSpriteSheet(const entt::registry& world, const \
+ *     PlayerSprite& sprite)
+ * @brief Borrow the running sheet, or a shared empty texture without TextureStore.
+ * @author Alex (<https://github.com/lextpf>)
  */
-void Update(ecs::registry& world, ecs::entity player, float deltaTime);
+const Texture& GetRunningSpriteSheet(const entt::registry& world, const PlayerSprite& sprite);
 
 /**
- * @brief Full per-frame movement step: wraps @ref PlayerMovementSystem::Step over
- * the player's components; collision runs through the stateless
- * @ref CollisionSystem free functions.
- *
- * @param world        ECS registry; the player's movement components are stepped in place.
- * @param player       Player entity to move.
- * @param direction    Desired move direction (normalized input).
- * @param deltaTime    Frame time in seconds.
- * @param tilemap      World tilemap for collision/walkability, or null to skip world blocking.
- *                     A null tilemap also means no support is committed, so the caller must
- *                     derive the plane afterwards (CharacterKinematics::DerivePlane) - Game
- *                     does exactly that on the no-clip path.
- * @param npcBodies NPC feet/support records for overlap blocking, or null when absent.
+ * @fn const Texture& PlayerSystem::GetBicycleSpriteSheet(const entt::registry& world, const \
+ *     PlayerSprite& sprite)
+ * @brief Borrow the bicycle sheet, or a shared empty texture without TextureStore.
+ * @author Alex (<https://github.com/lextpf>)
  */
-void Move(ecs::registry& world,
-          ecs::entity player,
+const Texture& GetBicycleSpriteSheet(const entt::registry& world, const PlayerSprite& sprite);
+
+/**
+ * @fn void PlayerSystem::Update(entt::registry& world, entt::entity player, float deltaTime)
+ * @brief Advance velocity-driven walk cadence and smooth visual elevation; deltaTime is in seconds.
+ * @author Alex (<https://github.com/lextpf>)
+ *
+ * position changes belong to Move. Animation follows actual motor speed during the glide after
+ * input ends.
+ */
+void Update(entt::registry& world, entt::entity player, float deltaTime);
+
+/**
+ * @fn void PlayerSystem::Move(entt::registry& world, entt::entity player, glm::vec2 direction, \
+ *     float deltaTime, const Tilemap* tilemap, const std::vector<CharacterCollisionBody>* \
+ *     npcBodies)
+ * @brief Apply normalized direction for deltaTime seconds.
+ * @author Alex (<https://github.com/lextpf>)
+ *
+ * Null tilemap skips world blocking and support commit; derive the plane afterwards
+ * with CharacterKinematics::DerivePlane. Null npcBodies skips NPC blocking.
+ */
+void Move(entt::registry& world,
+          entt::entity player,
           glm::vec2 direction,
           float deltaTime,
           const Tilemap* tilemap,
           const std::vector<CharacterCollisionBody>* npcBodies);
 
 /**
- * @brief Stop movement and reset to idle.
- *
- * @param world  ECS registry holding the player's movement + animation components.
- * @param player Player entity to halt.
+ * @fn void PlayerSystem::Stop(entt::registry& world, entt::entity player)
+ * @brief Reset movement to idle, including the motor stop target.
+ * @author Alex (<https://github.com/lextpf>)
  */
-void Stop(ecs::registry& world, ecs::entity player);
+void Stop(entt::registry& world, entt::entity player);
 
 /**
- * @brief Snap the player feet to the bottom-center of a tile and reset the motor.
+ * @fn void PlayerSystem::SetTilePosition(entt::registry& world, entt::entity player, int tileX, \
+ *     int tileY)
+ * @brief Snap feet to tile bottom-center and reset the motor; this path assumes 16 px tiles.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * The motor reset is required rather than cosmetic. Without it, a grid stop-target latched at the
- * previous position drags the player back toward a grid line near where they were.
- *
- * @warning Tile size is hardcoded to 16px here. Everywhere else it comes from the project
- * manifest via Tilemap (@c tileWidth / @c tileHeight), so a project authored with a
- * different tile size will mis-snap through this path.
- *
- * @param world  Player-owning ECS registry.
- * @param player Player entity to reposition.
- * @param tileX  Destination tile column.
- * @param tileY  Destination tile row.
+ * resetting the motor clears the old grid stop target so it cannot pull the player back after
+ * teleporting. projects with another tile size must avoid this snapping path.
  */
-void SetTilePosition(ecs::registry& world, ecs::entity player, int tileX, int tileY);
+void SetTilePosition(entt::registry& world, entt::entity player, int tileX, int tileY);
 
 /**
- * @brief Set the player feet to an exact world position and reset the motor (no tile
- * snapping; used by dialogue alignment).
- *
- * @param world  Player-owning ECS registry.
- * @param player Player entity to reposition.
- * @param pos    Exact feet position (world space).
+ * @fn void PlayerSystem::SetPositionRaw(entt::registry& world, entt::entity player, glm::vec2 \
+ *     pos)
+ * @brief Set feet in world pixels without snapping and reset the motor stop target.
+ * @author Alex (<https://github.com/lextpf>)
  */
-void SetPositionRaw(ecs::registry& world, ecs::entity player, glm::vec2 pos);
+void SetPositionRaw(entt::registry& world, entt::entity player, glm::vec2 pos);
 }  // namespace PlayerSystem
