@@ -21,7 +21,6 @@
 #include "NpcAiSystem.hpp"
 #include "NpcIdle.hpp"
 #include "NpcRender.hpp"
-#include "NpcTag.hpp"
 #include "OpenGLRenderer.hpp"
 #include "Patrol.hpp"
 #include "PatrolRoute.hpp"
@@ -35,6 +34,7 @@
 #include "Speed.hpp"
 #include "Transform.hpp"
 #include "Version.hpp"
+#include "WorldLightPools.hpp"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -63,8 +63,8 @@ constexpr const char* LOG_SUBSYSTEM = "Game";
 constexpr float HORIZON_SCALE_BASE = 0.6f;
 constexpr float HORIZON_SCALE_TILT_RANGE = 0.15f;
 constexpr float DEBUG_TEXT_MARGIN = 12.0f;
-constexpr float DEBUG_HUD_ALPHA = 0.6f;      // Debug/FPS HUD text opacity (slightly transparent).
-constexpr float DEBUG_HUD_ALPHA_DIM = 0.5f;  // Dimmer secondary HUD lines (quest descriptions).
+constexpr float DEBUG_HUD_ALPHA = 0.6f;
+constexpr float DEBUG_HUD_ALPHA_DIM = 0.5f;
 constexpr float SEAM_FIX_OVERLAP = 0.1f;
 
 std::string ToLowerCopy(std::string value)
@@ -114,21 +114,12 @@ Game::~Game()
 
 bool Game::Initialize()
 {
-    // Route ECS contract violations (stale handle, duplicate add, iteration
-    // lock) into the Rift log instead of the library default (stderr + abort),
-    // so a breach lands in rift.txt with context. Capture-free lambda decays to
-    // the required function pointer. Installed only here (the game), never in
-    // test setup, since the handler slot is process-global.
-    ecs::set_violation_handler([](const char* message) { Logger::Error("ECS", message); });
+    // Publish borrowed services for the registry lifetime.
+    m_World.ctx().insert_or_assign(
+        WorldServices{&m_TextureStore, &m_DialogueStore, &m_Assets, &m_NpcRng, &m_GameState});
 
-    // Publish the shared services into the ECS world's globals() singleton so the
-    // systems (and spawn) reach them through the world rather than via per-entity
-    // back-pointers. The services outlive the registry (Game owns both).
-    m_World.globals().obtain<WorldServices>() =
-        WorldServices{&m_TextureStore, &m_DialogueStore, &m_Assets, &m_NpcRng, &m_GameState};
-
-    // Mint the player entity (PlayerTag + the player components). Sprite sheets are
-    // bound later by PlayerSystem::SwitchCharacter, which reads the services above.
+    // create the player before loading a world; bind its sprite sheets after publishing the
+    // services.
     m_PlayerEntity = EntityStore::SpawnPlayer(m_World);
 
     Logger::Info(LOG_SUBSYSTEM, "Initialize() step 1: Initializing GLFW...");
@@ -202,7 +193,6 @@ bool Game::Initialize()
     glfwSetFramebufferSizeCallback(m_Window, FramebufferSizeCallback);
     glfwSetWindowRefreshCallback(m_Window, WindowRefreshCallback);
 
-    // Set true to sleep 2s after each draw call (visual debugging).
     SetDebugDrawSleep(m_Window, false);
 
     Logger::Info(LOG_SUBSYSTEM, "Initialize() step 7: Creating Renderer...");
@@ -237,7 +227,7 @@ bool Game::Initialize()
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glfwSwapInterval(0);  // 0 = no VSync.
+        glfwSwapInterval(0);
     }
 
     if (m_RendererAPI == RendererAPI::OpenGL)
@@ -265,7 +255,7 @@ bool Game::Initialize()
     }
     Logger::Info(LOG_SUBSYSTEM, "Renderer->Init() completed successfully");
 
-    // Some drivers/middleware reset swap interval during init; re-apply no-vsync.
+    // drivers may reset swap interval during initialization.
     if (m_RendererAPI == RendererAPI::OpenGL)
     {
         glfwSwapInterval(0);
@@ -300,13 +290,10 @@ bool Game::Initialize()
     }
     m_Editor.Initialize(npcSpritePaths);
 
-    // Cache manifest fields so LoadGameWorld() can re-run (Continue / New Game)
-    // without re-reading the file.
+    // cache manifest values for subsequent world loads.
     m_DefaultMapWidth = manifest.defaultMapWidth;
     m_DefaultMapHeight = manifest.defaultMapHeight;
 
-    // Register player sprites (static, one-time) and cache the character list
-    // so LoadGameWorld can pick a default.
     m_ConfiguredCharacters.clear();
     for (const auto& [characterName, character] : manifest.playerCharacters)
     {
@@ -327,9 +314,7 @@ bool Game::Initialize()
 
     m_LastFrameTime = static_cast<float>(glfwGetTime());
 
-    // Bring particles online (textures + tile size set here);
-    // zones are set later in LoadTitleScreenWorld. Sprite paths resolve
-    // through the manifest's "particles" links (asset names are GUIDs).
+    // Load particle sprites now; the title or gameplay world binds its zone list later.
     m_Particles.LoadTextures(m_TextureStore, manifest);
     m_Particles.SetTileSize(m_Tilemap.GetTileWidth(), m_Tilemap.GetTileHeight());
     m_Particles.SetMaxParticlesPerZone(50);
@@ -343,8 +328,7 @@ bool Game::Initialize()
 
     m_DialogueManager.Initialize(&m_GameState);
 
-    // Title screen first; the save file is untouched until "Continue"/"New Game".
-    // Called last so world setup overrides any earlier defaults (time, particles, camera).
+    // Load the title last so its world settings override subsystem defaults.
     LoadTitleScreenWorld();
 
     float camWorldWidth = static_cast<float>(m_TilesVisibleWidth * m_Tilemap.GetTileWidth());
@@ -374,9 +358,7 @@ bool Game::Initialize()
 void Game::Run()
 {
 #ifdef _WIN32
-    // RAII guard: raises Windows timer resolution from ~15.6ms to 1ms so that
-    // sleep_for() in the FPS limiter sleeps accurately. Automatically restored
-    // when Run() exits (normal return or exception).
+    // Request 1 ms sleep resolution for the FPS limiter; restore it when Run exits.
     struct TimerPeriodGuard
     {
         TimerPeriodGuard() { timeBeginPeriod(1); }
@@ -390,18 +372,14 @@ void Game::Run()
     {
         while (!glfwWindowShouldClose(m_Window))
         {
-            // Sample frame start before polling so the FPS limiter's deadline
-            // covers event processing. Otherwise poll cost lands outside the
-            // deadline and jitters FPS with input-event volume.
+            // include event polling in the frame deadline.
             double frameStartTime = glfwGetTime();
             float deltaTime = static_cast<float>(frameStartTime) - m_LastFrameTime;
             m_LastFrameTime = static_cast<float>(frameStartTime);
 
-            // Poll before ProcessInput so input sees this frame's key/mouse state
-            // (GLFW only updates cached state during poll).
+            // GLFW updates cached input only while polling.
             glfwPollEvents();
 
-            // Clamp dt to survive debugger pauses and window-drag stalls.
             static constexpr float MAX_DELTA_TIME = 0.1f;
             deltaTime = std::min(deltaTime, MAX_DELTA_TIME);
 
@@ -414,7 +392,7 @@ void Game::Run()
             catch (const std::exception& e)
             {
                 Logger::ErrorF(LOG_SUBSYSTEM, "Exception in game loop: {}", e.what());
-                break;  // Exit loop on error
+                break;
             }
             catch (...)
             {
@@ -422,8 +400,8 @@ void Game::Run()
                 break;
             }
 
-            // FPS limiter: sleep most of the remaining time, then spin-yield
-            // for accuracy. Disabled when targetFps is 0.
+            // sleep for most of the interval, then yield near the deadline to reduce limiter
+            // jitter.
             if (m_Fps.targetFps > 0.0f)
             {
                 double targetFrameTime = 1.0 / static_cast<double>(m_Fps.targetFps);
@@ -437,10 +415,8 @@ void Game::Run()
                         std::chrono::duration<double>(remaining));
                     const auto frameDeadline = clock::now() + sleepDuration;
 
-                    // Even with TimerPeriodGuard raising resolution to 1ms, sleep_for
-                    // can still overshoot by about a tick, so keep spinThreshold above
-                    // that granularity; high-FPS targets (e.g. 500fps = 2ms budget) then
-                    // never call sleep_for.
+                    // Leave 2 ms for spin-yield so sleep overshoot does not miss short frame
+                    // deadlines.
                     constexpr auto spinThreshold = std::chrono::milliseconds(2);
                     while (true)
                     {
@@ -474,8 +450,7 @@ void Game::Run()
 
 void Game::Update(float deltaTime)
 {
-    // SnapWindowToTileBoundaries() can synchronously fire WindowRefreshCallback,
-    // which would re-enter Render() mid-Update. The guard makes Render() bail.
+    // synchronous resize callbacks must not render partially updated state.
     struct UpdateGuard
     {
         bool& flag;
@@ -487,12 +462,7 @@ void Game::Update(float deltaTime)
         ~UpdateGuard() { flag = false; }
     } updateGuard(m_IsUpdating);
 
-    // One-shot: first console open during a title session permanently
-    // strips the title's ambient zones and the initial weather so the rest
-    // of the session shows only what the user sets via the console. Cleared
-    // state persists after the console closes (still in Title); only
-    // LoadTitleScreenWorld resets the latch. In-game is unaffected because
-    // LoadGameWorld replaced the zone list with the gameplay map's zones.
+    // Clear title ambience once per title session when the console opens.
     if (m_GameMode == GameMode::Title && m_Console.IsOpen() && !m_TitleAmbientCleared)
     {
         m_TitleAmbientCleared = true;
@@ -503,15 +473,13 @@ void Game::Update(float deltaTime)
             zones->clear();
         }
         m_TimeManager.SetWeather(WeatherState::Clear);
-        // Clear already has no weather particles. Keep full intensity so the
-        // first weather command entered against this clean title canvas is
-        // actually visible.
+        // retain full intensity so subsequent weather commands are visible.
         m_TimeManager.SetWeatherIntensity(1.0f);
     }
 
     m_Fps.frameCount++;
     m_Fps.updateTimer += deltaTime;
-    if (m_Fps.updateTimer >= 1.0f)  // Refresh FPS display once per second.
+    if (m_Fps.updateTimer >= 1.0f)
     {
         m_Fps.currentFps = m_Fps.frameCount / m_Fps.updateTimer;
         m_Fps.currentDrawCalls =
@@ -521,22 +489,15 @@ void Game::Update(float deltaTime)
         m_Fps.drawCallAccumulator = 0;
     }
 
-    // Output stats to console every second [deprecated]
     m_Fps.consoleTimer += deltaTime;
     if (m_Fps.consoleTimer >= 1.0f)
     {
         const char* renderer = (m_RendererAPI == RendererAPI::OpenGL) ? "OpenGL" : "Vulkan";
         float frameTimeMs = (m_Fps.currentFps > 0) ? (1000.0f / m_Fps.currentFps) : 0.0f;
-        /*std::cout << "[" << renderer << "] "
-                  << static_cast<int>(m_Fps.currentFps) << " FPS | "
-                  << std::fixed << std::setprecision(4) << frameTimeMs << "ms | "
-                  << m_ScreenWidth << "x" << m_ScreenHeight << " | "
-                  << std::setprecision(2) << m_Camera.GetState().zoom << "x zoom"
-                  << std::endl;*/
+
         m_Fps.consoleTimer = 0.0f;
     }
 
-    // Deferred window snap after resize settles.
     if (m_PendingWindowSnap)
     {
         m_ResizeSnapTimer -= deltaTime;
@@ -546,9 +507,7 @@ void Game::Update(float deltaTime)
         }
     }
 
-    // Pause freezes everything. Title freezes time/player/NPCs but lets
-    // cosmetic systems (sky, particles, animated tiles) keep running so
-    // fireflies still drift behind the menu.
+    // Paused freezes simulation; Title runs only cosmetic updates.
     if (m_GameMode == GameMode::Paused)
     {
         return;
@@ -558,39 +517,28 @@ void Game::Update(float deltaTime)
     if (isPlaying)
     {
         PlayerSystem::Update(m_World, m_PlayerEntity, deltaTime);
-        m_TimeManager.Update(deltaTime);  // Frozen in Title so night setting holds.
+        m_TimeManager.Update(deltaTime);
         m_WeatherDirector.Update(deltaTime, m_TimeManager);
     }
     else
     {
-        // Keep the authored title hour fixed while allowing manual overlays
-        // selected from the console to fade in and out.
+        // Keep the title hour fixed while manual weather overlays fade.
         m_TimeManager.UpdateWeatherEffects(deltaTime);
     }
     m_SkyRenderer.Update(deltaTime, m_TimeManager);
 
-    // Accurate pixel-based extent (matches the render projection) so weather +
-    // ambient particles cover the true viewport, not a truncated tile count.
+    // pixel extents match the render projection; truncated tile counts under-cover the view.
     const glm::vec2 particleCullCam = m_Camera.GetState().position;
     const glm::vec2 viewSize = VisibleWorldSizeZoomed();
     m_Particles.SetNightFactor(m_TimeManager.GetStarVisibility());
-    // Splash/impact fade keys on actual scene darkness, not weather star
-    // visibility (precipitation forces the latter to 0, so a night storm would
-    // otherwise read as daytime and the impacts stay bright).
+    // precipitation suppresses weather star visibility; include natural darkness for splash fading.
     m_Particles.SetSceneNightFactor(
         std::max(m_TimeManager.GetNaturalStarVisibility(), m_TimeManager.GetStarVisibility()));
     m_Particles.SetTimeOfDay(m_TimeManager.GetTimeOfDay());
-    // Bottom-center of the player sprite; used by PollenStorm / FallingLeaves
-    // for hitbox-anchored avoidance.
+
+    // Use the feet anchor for weather repulsion so it follows the collision body.
     m_Particles.SetPlayerPosition(m_World.get<Transform>(m_PlayerEntity).position);
-    // Push active weather so the particle system can drive global weather
-    // spawning (rain/snow/ash/etc.) across the viewport. The effective def is
-    // the director's blended definition mid-transition, the table def otherwise
-    // (stable storage either way - see TimeManager::GetEffectiveWeatherDefinition).
-    // Wind + spawn streams come from the director's choreography; the
-    // effective def keeps feeding the live-read channels (fog alpha). In
-    // Title the director never updates, so wind stays at the calm default
-    // and the streams stay idle - the backdrop is unchanged.
+    // endpoint definitions drive spawn streams; the blended definition supplies live-read effects.
     m_Particles.SetWind(m_WeatherDirector.GetWindDirection(), m_WeatherDirector.GetWindStrength());
     const WeatherDirector::SpawnStreams streams = m_WeatherDirector.GetSpawnStreams();
     m_Particles.SetWeatherTransition(streams.outgoing, streams.incoming, streams.weight);
@@ -602,17 +550,15 @@ void Game::Update(float deltaTime)
         overlayBlend);
     m_Particles.Update(deltaTime, particleCullCam, viewSize);
 
-    // Post-FX time accumulator (grain noise, subtle time-based motion).
-    // Wrap to keep float precision over long sessions.
+    // Wrap postfx time to limit float precision loss.
     m_PostFXTime += deltaTime;
-    if (m_PostFXTime > 86400.0f)  // 24h wrap
+    if (m_PostFXTime > 86400.0f)
     {
         m_PostFXTime -= 86400.0f;
     }
 
     m_Tilemap.UpdateAnimations(deltaTime);
 
-    // Title: nothing else to update - no player, NPCs, or dialogue.
     if (!isPlaying)
     {
         return;
@@ -628,11 +574,11 @@ void Game::Update(float deltaTime)
         }
         else
         {
-            const ecs::entity npcE = FindNPCById(m_DialogueUi.npcId);
+            const entt::entity npcE = FindNPCById(m_DialogueUi.npcId);
             m_DialogueUi.snap.timer += deltaTime;
             float duration = std::max(0.05f, m_DialogueUi.snap.duration);
             float t = std::clamp(m_DialogueUi.snap.timer / duration, 0.0f, 1.0f);
-            float smoothT = t * t * (3.0f - 2.0f * t);  // Smoothstep easing
+            float smoothT = t * t * (3.0f - 2.0f * t);
 
             glm::vec2 blendedPlayer =
                 m_DialogueUi.snap.playerStart +
@@ -667,11 +613,11 @@ void Game::Update(float deltaTime)
                                         m_DialogueUi.snap.npcTileX,
                                         m_DialogueUi.snap.npcTileY,
                                         16,
-                                        /*preserveRoute=*/true);
+                                        true);
 
                 PlayerSystem::Stop(m_World, m_PlayerEntity);
-                // Dialogue alignment bypasses normal movement probes, so commit
-                // any connected support transition for both participants here.
+                // Dialogue snapping bypasses movement probes; commit both participants support
+                // here.
                 CharacterKinematics::DerivePlane(m_World.get<Elevation>(m_PlayerEntity),
                                                  m_DialogueUi.snap.playerStart,
                                                  m_World.get<Transform>(m_PlayerEntity).position,
@@ -715,17 +661,13 @@ void Game::Update(float deltaTime)
             m_DialogueUi.charReveal += 35.0f * deltaTime;
     }
 
-    // If the dialogue speaker was removed (editor/console/nav) its id no longer
-    // resolves; drop the stale reference so nothing keeps it pinned. The old
-    // index-based identity could silently retarget to a different NPC here.
+    // Release a dialogue speaker whose stable id no longer resolves.
     if (m_DialogueUi.npcId != 0 && !HasDialogueNPC())
     {
         m_DialogueUi.npcId = 0;
     }
 
-    // Update every NPC's patrol/idle AI + logical plane; freeze the active dialogue
-    // speaker (id 0 = nobody). The per-NPC orchestration lives in NpcAiSystem::UpdateAll,
-    // symmetric with the player's PlayerSystem::Move/Update path.
+    // freeze the active speaker during both snap and dialogue; id 0 leaves every NPC eligible.
     const bool inAnyDialogue =
         m_DialogueUi.inDialogue || m_DialogueManager.IsActive() || m_DialogueUi.snap.active;
     const std::uint64_t frozenNpcId = inAnyDialogue ? m_DialogueUi.npcId : 0;
@@ -750,8 +692,7 @@ void Game::Update(float deltaTime)
     bool arrowLeft = glfwGetKey(m_Window, GLFW_KEY_LEFT) == GLFW_PRESS;
     bool arrowRight = glfwGetKey(m_Window, GLFW_KEY_RIGHT) == GLFW_PRESS;
 
-    // Tile picker and dialogue both repurpose arrow keys; console uses them for
-    // text editing. In all three cases, don't also pan the camera.
+    // do not pan the camera while UI owns the arrow keys.
     if (m_Editor.IsActive() && m_Editor.IsShowTilePicker())
     {
         arrowUp = arrowDown = arrowLeft = arrowRight = false;
@@ -770,16 +711,13 @@ void Game::Update(float deltaTime)
                         glfwGetKey(m_Window, GLFW_KEY_S) == GLFW_PRESS ||
                         glfwGetKey(m_Window, GLFW_KEY_D) == GLFW_PRESS);
 
-    // When the console is open, WASD belongs to text input. This signal is the
-    // camera's smooth-vs-grid follow toggle and would jitter the view as the
-    // user types. (Player movement WASD is gated earlier in ProcessInput.)
+    // typing WASD must not change camera follow state.
     if (m_Console.IsOpen())
     {
         wasdPressed = false;
     }
 
-    // Follow actual player position while moving (smooth), tile center when idle
-    // (settles on the grid).
+    // follow feet while moving and the tile center while idle.
     glm::vec2 playerCamPos = m_World.get<Transform>(m_PlayerEntity).position;
     glm::vec2 playerVisualCenter =
         glm::vec2(playerCamPos.x, playerCamPos.y - CharacterConstants::HITBOX_HEIGHT);
@@ -815,7 +753,7 @@ void Game::Update(float deltaTime)
     camParams.tileHeight = m_Tilemap.GetTileHeight();
     m_Camera.Update(camParams);
 
-    // Stop NPCs overlapping the player (visual de-overlap), after all positions settle.
+    // assign overlap stops after player and NPC positions settle for this frame.
     NpcAiSystem::ApplyPlayerOverlapStop(
         m_World,
         CharacterCollisionBody{
@@ -824,8 +762,7 @@ void Game::Update(float deltaTime)
 
 void Game::Render()
 {
-    // Reentrancy guard: WindowRefreshCallback can re-enter during resize, and
-    // SnapWindowToTileBoundaries() from Update() can fire it synchronously.
+    // resize callbacks can render synchronously during Update; do not re-enter either frame stage.
     if (m_IsRendering || m_IsUpdating)
     {
         return;
@@ -841,25 +778,18 @@ void Game::Render()
         ~RenderGuard() { flag = false; }
     } renderGuard(m_IsRendering);
 
-    // Title has its own self-contained render path (world tiles, particles, sky,
-    // PostFX) and returns before the gameplay Y-sort/entity assembly below.
     if (m_GameMode == GameMode::Title)
     {
         RenderTitleFrame();
         return;
     }
 
-    // The world-space 3D path is likewise self-contained and returns early, so
-    // the flat pipeline below is untouched while both exist.
     if (m_World3DEnabled)
     {
         RenderFrame3D();
         return;
     }
 
-    // Render order: see docs/RENDERING.md.
-
-    // Visual-debug pause after each draw call.
     if (IsDebugDrawSleepEnabled())
     {
         ResetDebugDrawCallIndex();
@@ -868,10 +798,7 @@ void Game::Render()
 
     m_Renderer->BeginFrame();
 
-    // World+sky+lights render to an offscreen scene FBO so the post-FX chain
-    // can apply bloom/grading/vignette/grain. UI (editor, dialogue, debug)
-    // draws directly to the swapchain after EndSceneApplyPostFX, keeping text
-    // sharp and ungrained.
+    // render the world into the scene target; UI follows the composite so its text remains sharp.
     m_Renderer->BeginScene();
 
     DrawTracer::Mark("== gameplay frame ==", m_Renderer->GetDrawCallCount());
@@ -879,23 +806,21 @@ void Game::Render()
     glm::vec3 skyColor = m_TimeManager.GetSkyColor();
     m_Renderer->Clear(skyColor.r, skyColor.g, skyColor.b, 1.0f);
 
-    // World size from actual screen pixels (not truncated tile count) so the
-    // viewport matches the true visible area.
+    // derive view dimensions from actual pixels; tile counts truncate partial tiles during
+    // resizing.
     const glm::vec2 world = VisibleWorldSize();
     float worldWidth = world.x;
     float worldHeight = world.y;
 
     m_Renderer->SetAmbientColor(m_TimeManager.GetAmbientColor());
 
-    // Apply camera zoom (>1 = smaller world view, <1 = larger).
     float zoomedWidth = worldWidth / m_Camera.GetState().zoom;
     float zoomedHeight = worldHeight / m_Camera.GetState().zoom;
     m_Renderer->SetViewSize({zoomedWidth, zoomedHeight});
     glm::mat4 projection = CameraController::GetOrthoProjection(zoomedWidth, zoomedHeight);
     m_Renderer->SetProjection(projection);
 
-    // Snap render camera to pixel grid to avoid per-frame jitter seams (OpenGL only).
-    // Cull tests use the unsnapped camera so visibility is stable across sub-pixel moves.
+    // Snap OpenGL rendering to pixels; retain the unsnapped camera for stable culling.
     const glm::vec2 originalCamera = m_Camera.GetState().position;
     glm::vec2 renderCam = originalCamera;
     glm::vec2 renderSize(zoomedWidth, zoomedHeight);
@@ -911,25 +836,18 @@ void Game::Render()
         renderCam.y = snapToPixel(originalCamera.y, pixelStepY);
     }
 
-    // Render uses snapped camera (restored at end of function).
     m_Camera.GetState().position = renderCam;
 
-    // Background layers (Y-sorted and no-projection tiles are skipped here).
     DrawTracer::Mark("section: BackgroundLayers", m_Renderer->GetDrawCallCount());
     m_Tilemap.RenderBackgroundLayers(*m_Renderer, renderCam, renderSize, cullCam, cullSize);
 
-    // Suspend perspective for character rendering.
-
-    // No-projection background tiles (buildings/entities that stay upright).
     DrawTracer::Mark("section: BackgroundLayersNoProjection", m_Renderer->GetDrawCallCount());
     m_Tilemap.RenderBackgroundLayersNoProjection(
         *m_Renderer, renderCam, renderSize, cullCam, cullSize);
 
     const auto& depthSortedTiles = m_Tilemap.GetVisibleDepthSortedTiles(cullCam, cullSize);
 
-    // Build one authored baseline list, then add local support constraints only
-    // between an actor and the elevation footprint containing its feet. Each
-    // character remains atomic, so no tile can slice through its sprite.
+    // Keep characters atomic and apply support constraints only inside their elevation footprint.
     m_RenderList.clear();
     size_t estimatedSize = depthSortedTiles.size() + EntityStore::Count(m_World) + 1;
     if (m_RenderList.capacity() < estimatedSize)
@@ -937,7 +855,6 @@ void Game::Render()
         m_RenderList.reserve(estimatedSize);
     }
 
-    // Depth-sorted tiles (base key = bottom edge, plus support height).
     int tileW = m_Tilemap.GetTileWidth();
     int tileH = m_Tilemap.GetTileHeight();
     for (const auto& tile : depthSortedTiles)
@@ -954,25 +871,23 @@ void Game::Render()
         m_RenderList.push_back(item);
     }
 
-    // NPCs are atomic queue items anchored at their feet. Their two sprite
-    // submissions remain consecutive inside the draw thunk.
-    m_World.each<const Transform, const Elevation, const NpcTag>(
-        [&](ecs::entity e, const Transform& xf, const Elevation& elevation)
-        {
-            glm::vec2 npcPos = xf.position;
+    // Keep each NPC atomic in the queue so no tile can sort between its two sprite halves.
+    for (const entt::entity entity : EntityStore::Entities(m_World))
+    {
+        const Transform& transform = m_World.get<Transform>(entity);
+        const Elevation& elevation = m_World.get<Elevation>(entity);
+        const glm::vec2 npcPos = transform.position;
 
-            AddNpcDrawable(m_RenderList,
-                           m_World,
-                           e,
-                           npcPos,
-                           elevation.surface,
-                           static_cast<float>(elevation.plane),
-                           m_Tilemap.GetElevationRegionIdAtWorldPos(npcPos.x, npcPos.y),
-                           TIE_NPC);
-        });
+        AddNpcDrawable(m_RenderList,
+                       m_World,
+                       entity,
+                       npcPos,
+                       elevation.surface,
+                       static_cast<float>(elevation.plane),
+                       m_Tilemap.GetElevationRegionIdAtWorldPos(npcPos.x, npcPos.y),
+                       TIE_NPC);
+    }
 
-    // Player. The complete sprite sorts at its feet anchor. The Title test below is
-    // dead: Render() early-returns into RenderTitleFrame() before reaching this point.
     if (!m_Editor.IsActive() && m_GameMode != GameMode::Title)
     {
         glm::vec2 playerPos = m_World.get<Transform>(m_PlayerEntity).position;
@@ -987,8 +902,8 @@ void Game::Render()
                           TIE_PLAYER);
     }
 
-    // Preserve layer/Y-sort authoring everywhere, then enforce underpass/deck
-    // relations only for actors inside the corresponding elevation component.
+    // Preserve authored layer/Y order, then apply support relations only inside the relevant
+    // elevation component.
     SortDrawables(m_RenderList);
 
     {
@@ -1015,52 +930,36 @@ void Game::Render()
         }
     }
 
-    // No-projection foreground tiles.
     DrawTracer::Mark("section: ForegroundLayersNoProjection", m_Renderer->GetDrawCallCount());
     m_Tilemap.RenderForegroundLayersNoProjection(
         *m_Renderer, renderCam, renderSize, cullCam, cullSize);
 
-    // No-projection particles (particle system handles suspend internally).
     DrawTracer::Mark("section: Particles(noProjection)", m_Renderer->GetDrawCallCount());
     m_Particles.Render(*m_Renderer, m_Camera.GetState().position, true, false);
 
-    // Resume perspective for the regular foreground (may still be suspended from
-    // the Y-sorted loop if no no-projection structures were processed).
-
-    // Foreground layers (Y-sorted and no-projection tiles are skipped here).
     DrawTracer::Mark("section: ForegroundLayers", m_Renderer->GetDrawCallCount());
     m_Tilemap.RenderForegroundLayers(*m_Renderer, renderCam, renderSize, cullCam, cullSize);
 
     DrawTracer::Mark("section: Particles(world)", m_Renderer->GetDrawCallCount());
     m_Particles.Render(*m_Renderer, m_Camera.GetState().position, false, false);
 
-    // World-anchored light pools (lamps, lit windows). Drawn under the world
-    // projection with perspective ON so they warp with the world plane. Only
-    // contribute once the scene is dim enough (ramps with night factor).
+    // share light gating and alpha with the 3D path; placement remains path-specific.
     DrawTracer::Mark("section: WorldLights", m_Renderer->GetDrawCallCount());
-    const float nightFactor = m_TimeManager.GetStarVisibility();
-    if (nightFactor > 0.01f && !m_Tilemap.GetLights().empty())
+    worldLights::Build(m_Tilemap.GetLights(),
+                       m_TimeManager.GetTimeOfDay(),
+                       m_TimeManager.GetStarVisibility(),
+                       m_LightPoolScratch);
+    for (const skyDraw::LightPool& pool : m_LightPoolScratch)
     {
-        const float hour = m_TimeManager.GetTimeOfDay();
-        for (const auto& light : m_Tilemap.GetLights())
-        {
-            float intensity = ComputeLightIntensity(light.schedule, hour) * nightFactor;
-            if (intensity < 0.01f)
-                continue;
-            glm::vec2 screenPos = light.position - renderCam;
-            float diameter = light.radius * 2.0f;
-            m_SkyRenderer.DrawLightPool(*m_Renderer,
-                                        screenPos - glm::vec2(light.radius),
-                                        glm::vec2(diameter),
-                                        0.0f,
-                                        glm::vec4(light.color, intensity * 0.6f),
-                                        true);  // additive
-        }
+        m_SkyRenderer.DrawLightPool(*m_Renderer,
+                                    pool.centreWorld - renderCam - glm::vec2(pool.radius),
+                                    glm::vec2(pool.radius * 2.0f),
+                                    0.0f,
+                                    pool.color,
+                                    true);
     }
 
-    // Sky pass under the world projection (no projection swap). Sky elements
-    // compute their own parallax against `cameraPos` so they drift slowly with
-    // the player. Perspective is suspended so the sky doesn't 3D-distort.
+    // sky elements subtract cameraPos themselves and use the existing world projection.
     DrawTracer::Mark("section: Sky", m_Renderer->GetDrawCallCount());
     m_SkyRenderer.Render(*m_Renderer,
                          m_TimeManager,
@@ -1068,9 +967,6 @@ void Game::Render()
                          static_cast<int>(worldWidth),
                          static_cast<int>(worldHeight));
 
-    // Composite the offscreen scene through the post-FX chain (bloom + grading
-    // + vignette + grain) into the swapchain. Subsequent UI draws (editor,
-    // dialogue, debug HUD) go directly to the swapchain and are not post-processed.
     {
         PostFXParams postFX;
         postFX.timeOfDay = m_TimeManager.GetTimeOfDay();
@@ -1090,9 +986,7 @@ void Game::Render()
             postFX.grainIntensity = 0.0f;
             postFX.bloomIntensity = 0.0f;
             postFX.saturation = 1.0f;
-            // gradingParams default-constructs to identity (lift=0, gamma=1, gain=1).
-            // postFXEnabled=false is the real off-switch; these zeroes are a
-            // defensive fallback in case the uniform fails to bind.
+            // identity values back up the postFXEnabled gate if its uniform is absent.
         }
 
         DrawTracer::Mark("section: PostFX", m_Renderer->GetDrawCallCount());
@@ -1104,14 +998,12 @@ void Game::Render()
     if (m_Editor.IsActive() || m_Editor.IsDebugMode())
     {
         m_Editor.Render(MakeEditorContext());
-        // Tile picker changes projection; restore the world projection.
+
         m_Renderer->SetProjection(projection);
     }
 
-    // UI ambient is white (not affected by day/night).
     m_Renderer->SetAmbientColor(glm::vec3(1.0f));
 
-    // Fallback head text for NPCs without dialogue trees.
     if (m_DialogueUi.inDialogue)
     {
         RenderNPCHeadText();
@@ -1122,7 +1014,6 @@ void Game::Render()
         RenderDialogueTreeBox();
     }
 
-    // Debug HUD in top-left corner (toggled via the debug.info console command).
     if (m_Editor.IsShowDebugInfo())
     {
         glm::mat4 uiProjection = glm::ortho(0.0f,
@@ -1133,7 +1024,6 @@ void Game::Render()
                                             1.0f);
         m_Renderer->SetProjection(uiProjection);
 
-        // FPS as integer; use the perf command for the precise float.
         char fpsText[32];
         snprintf(fpsText, sizeof(fpsText), "FPS: %d", static_cast<int>(m_Fps.currentFps + 0.5f));
 
@@ -1181,17 +1071,16 @@ void Game::Render()
                              2.0f,
                              DEBUG_HUD_ALPHA);
 
-        // Active quests with descriptions.
         auto activeQuests = m_GameState.GetActiveQuests();
         if (!activeQuests.empty())
         {
-            currentLine += 0.5f;  // Spacing before the quests section.
+            currentLine += 0.5f;
             glm::vec3 questGold(1.0f, 0.85f, 0.2f);
             glm::vec3 descColor(0.9f, 0.75f, 0.5f);
 
             for (const auto& quest : activeQuests)
             {
-                // "wolf_quest" -> "Wolf Quest".
+                // "wolf_quest" -> "wolf quest".
                 std::string displayName = quest;
                 for (size_t i = 0; i < displayName.size(); ++i)
                 {
@@ -1228,7 +1117,6 @@ void Game::Render()
                 std::string description = m_GameState.GetQuestDescription(quest);
                 if (!description.empty())
                 {
-                    // Truncate after 20 chars, but extend to a word boundary first.
                     if (description.size() > 20)
                     {
                         size_t cutPos = 20;
@@ -1246,7 +1134,6 @@ void Game::Render()
             }
         }
 
-        // Right side: renderer, resolution, frame time, zoom, draw calls.
         const char* rendererName = (m_RendererAPI == RendererAPI::OpenGL) ? "OpenGL" : "Vulkan";
         float rightMargin = static_cast<float>(m_ScreenWidth) - DEBUG_TEXT_MARGIN;
 
@@ -1291,7 +1178,6 @@ void Game::Render()
                              2.0f,
                              DEBUG_HUD_ALPHA);
 
-        // Averaged over last second.
         char drawCallText[32];
         snprintf(drawCallText, sizeof(drawCallText), "Draws: %d", m_Fps.currentDrawCalls);
         textWidth = m_Renderer->GetTextWidth(drawCallText, 1.0f);
@@ -1302,29 +1188,24 @@ void Game::Render()
                              2.0f,
                              DEBUG_HUD_ALPHA);
 
-        // Restore world projection in case EndFrame flushes batches.
+        // EndFrame can flush pending world batches.
         m_Renderer->SetProjection(projection);
     }
 
-    // Watermark and build-version footer, mirroring the title screen. Shown
-    // during normal gameplay; suppressed in the editor (its dense UI owns the
-    // screen edges) and outside Playing (Title draws its own footer; the pause
-    // menu omits it). RenderVersionFooter switches to a UI projection, so
-    // restore the world projection afterward for EndFrame's batch flush.
+    // Restore world projection after the screen-space footer.
     if (m_GameMode == GameMode::Playing && !m_Editor.IsActive())
     {
         RenderVersionFooter();
         m_Renderer->SetProjection(projection);
     }
 
-    // No-projection anchors only outside the editor - the editor draws its own
-    // structure visuals and adding markers on top just clutters the edit view.
+    // Editor overlays already show structure anchors.
     if (m_Editor.IsShowNoProjectionAnchors() && !m_Editor.IsActive())
     {
         m_Editor.RenderNoProjectionAnchors(MakeEditorContext());
     }
 
-    // Pause overlay above gameplay UI but below the console (keep REPL accessible).
+    // pause UI stays below the console.
     if (m_GameMode == GameMode::Paused)
     {
         RenderPauseOverlay();
@@ -1339,12 +1220,12 @@ void Game::Render()
         }
     }
 
-    // Console renders last so it sits on top of every layer.
+    // Console must remain above every layer.
     m_Console.Render(*m_Renderer, m_ScreenWidth, m_ScreenHeight);
 
     m_Renderer->EndFrame();
 
-    // Restore the unsnapped camera for game-state updates.
+    // Restore the unsnapped camera for simulation.
     m_Camera.GetState().position = originalCamera;
 
     m_Fps.drawCallAccumulator += m_Renderer->GetDrawCallCount();
@@ -1357,14 +1238,12 @@ void Game::Render()
         }
         glfwSwapBuffers(m_Window);
     }
-    // Vulkan presents in EndFrame(). m_IsRendering reset by RenderGuard.
 }
 
 void Game::Shutdown()
 {
-    // Windows timer period (timeBeginPeriod/timeEndPeriod) is owned by
-    // TimerPeriodGuard in Run(), not here.
-
+    // Run owns the Windows timer-period guard; shutdown here only releases renderer and window
+    // resources.
     if (m_Renderer)
     {
         m_Renderer->Shutdown();
@@ -1386,10 +1265,8 @@ void Game::Shutdown()
 
 bool Game::SwitchRenderer(RendererAPI api)
 {
-    // Hot-swap OpenGL <-> Vulkan at runtime. The GLFW window must be recreated
-    // because OpenGL needs GLFW_OPENGL_CORE_PROFILE and Vulkan needs GLFW_NO_API.
-    // All GPU resources (textures, shaders) must be re-uploaded after the switch.
-
+    // The APIs require incompatible GLFW hints, so switching also replaces the window and its GPU
+    // Context.
     if (api == m_RendererAPI)
     {
         Logger::InfoF(
@@ -1418,7 +1295,6 @@ bool Game::SwitchRenderer(RendererAPI api)
         m_Renderer.reset();
     }
 
-    // Preserve window position across the swap.
     int windowX = 0, windowY = 0;
     glfwGetWindowPos(m_Window, &windowX, &windowY);
 
@@ -1428,9 +1304,7 @@ bool Game::SwitchRenderer(RendererAPI api)
         m_Window = nullptr;
     }
 
-    // Create window + renderer + (OpenGL: GLAD) for `targetAPI`. Returns true on
-    // success; every failure path tears down its own partial state (m_Window and
-    // m_Renderer left null), so the rollback caller just retries.
+    // Each failed attempt clears its partial window and renderer so rollback can retry.
     auto setupRendererForAPI = [&](RendererAPI targetAPI) -> bool
     {
         m_RendererAPI = targetAPI;
@@ -1495,7 +1369,7 @@ bool Game::SwitchRenderer(RendererAPI api)
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glfwSwapInterval(0);  // Uncapped FPS; may tear.
+            glfwSwapInterval(0);
         }
 
         if (!m_Renderer->Init())
@@ -1508,7 +1382,7 @@ bool Game::SwitchRenderer(RendererAPI api)
             return false;
         }
 
-        // Re-apply no-vsync (Init can reset it).
+        // renderer initialization can reset swap interval.
         if (m_RendererAPI == RendererAPI::OpenGL)
         {
             glfwSwapInterval(0);
@@ -1522,17 +1396,12 @@ bool Game::SwitchRenderer(RendererAPI api)
         glm::mat4 projection = CameraController::GetOrthoProjection(worldWidth, worldHeight);
         m_Renderer->SetProjection(projection);
 
-        // Re-upload textures to the new renderer. The tileset is a Tilemap
-        // texture; every other texture (player + NPC sprite sheets, plus the
-        // particle + sky procedural textures) now lives in m_TextureStore and
-        // re-uploads in a single pass.
+        // The tilemap owns its tileset separately; all other registered textures re-upload through
+        // TextureStore.
         m_Renderer->UploadTexture(m_Tilemap.GetTilesetTexture());
         m_TextureStore.UploadAll(*m_Renderer);
 
-        // Re-pack characters into the atlas. PackCharactersIntoAtlas rebuilds and
-        // re-uploads the atlas from each sheet's retained CPU pixels (not the GL
-        // resources uploaded above), overwriting the tileset upload. Run it after
-        // the standalone uploads so they remain the fallback if packing fails.
+        // Pack after standalone uploads so sheets remain usable if atlas packing fails.
         PackCharactersIntoAtlas();
 
         return true;
@@ -1543,8 +1412,7 @@ bool Game::SwitchRenderer(RendererAPI api)
         Logger::InfoF(LOG_SUBSYSTEM,
                       "Renderer switch complete! Now using {}",
                       m_RendererAPI == RendererAPI::OpenGL ? "OpenGL" : "Vulkan");
-        // Swap cost (texture re-upload, window recreate) is ~100-500ms.
-        // Re-stamp so the first post-swap frame doesn't see that gap as dt.
+        // exclude renderer switch time from the next simulation delta.
         m_LastFrameTime = static_cast<float>(glfwGetTime());
         return true;
     }
@@ -1562,7 +1430,6 @@ bool Game::SwitchRenderer(RendererAPI api)
         return false;
     }
 
-    // Both renderers failed - fatal, shut down before the next frame.
     Logger::Fatal(LOG_SUBSYSTEM, "Rollback also failed, shutting down");
     Shutdown();
     return false;
@@ -1570,10 +1437,7 @@ bool Game::SwitchRenderer(RendererAPI api)
 
 void Game::OnFramebufferResized(int width, int height)
 {
-    // Updates dimensions immediately but defers window snapping to avoid
-    // fighting with an active resize drag. 150ms after the last resize event,
-    // SnapWindowToTileBoundaries() aligns to tile boundaries for pixel-perfect
-    // rendering.
+    // Apply dimensions immediately; defer snapping until 150 ms after the last resize event.
 
     if (!m_Window || width <= 0 || height <= 0)
         return;
@@ -1581,7 +1445,6 @@ void Game::OnFramebufferResized(int width, int height)
     m_ScreenWidth = width;
     m_ScreenHeight = height;
 
-    // Each tile occupies TILE_PIXEL_SIZE * PIXEL_SCALE screen pixels (16*5 = 80).
     const int tileScreenSize = TILE_PIXEL_SIZE * PIXEL_SCALE;
 
     m_TilesVisibleWidth = std::max(1, m_ScreenWidth / tileScreenSize);
@@ -1597,27 +1460,21 @@ void Game::OnFramebufferResized(int width, int height)
         glViewport(0, 0, m_ScreenWidth, m_ScreenHeight);
     }
 
-    // Title mode camera follows the window: re-anchor onto the map center so
-    // the backdrop stays centered behind the menu on resize. Gameplay uses
-    // follow-the-player and doesn't need a resize hook.
+    // recenter and grow the cosmetic title world on viewport changes.
     if (m_GameMode == GameMode::Title && m_Tilemap.GetMapWidth() > 0 &&
         m_Tilemap.GetMapHeight() > 0)
     {
-        // Grow the title world (and its particle zones) so grass keeps covering
-        // the window, then re-center. Repaints only when the required map size
-        // (in tiles) changes.
-        RefreshTitleWorldForViewport(/*forceRepaint=*/false);
+        // grow the cosmetic map and emitter bounds with the viewport; unchanged tile dimensions
+        // Skip repainting.
+        RefreshTitleWorldForViewport(false);
     }
 
-    // Schedule a snap once the resize settles.
     m_ResizeSnapTimer = 0.15f;
     m_PendingWindowSnap = true;
 }
 
 void Game::SnapWindowToTileBoundaries()
 {
-    // Round window to an exact multiple of tile size for pixel-perfect tile
-    // rendering. Minimum is 5x4 tiles (400x320 at 5x scale).
     if (!m_Window)
         return;
 
@@ -1653,8 +1510,7 @@ void Game::FramebufferSizeCallback(GLFWwindow* window, int width, int height)
 
 void Game::WindowRefreshCallback(GLFWwindow* window)
 {
-    // Fired by the OS during resize-drag repaints. Re-render so the user sees
-    // game content instead of white fill.
+    // Redraw during OS resize requests to avoid a blank client area.
     Game* game = static_cast<Game*>(glfwGetWindowUserPointer(window));
     if (game)
     {
