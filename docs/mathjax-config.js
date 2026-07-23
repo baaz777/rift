@@ -1,13 +1,12 @@
-// MathJax configuration for Doxygen documentation
 window.MathJax =
 {
   tex:
   {
-    // Enable $...$ for inline math (in addition to \(...\))
+
     inlineMath: [['$', '$'], ['\\(', '\\)']],
     displayMath: [['$$', '$$'], ['\\[', '\\]']],
-    processEscapes: true,      // Allow \$ to produce literal $
-    processEnvironments: true  // Process \begin{...}...\end{...}
+    processEscapes: true,      // allow an escaped dollar sign as literal text.
+    processEnvironments: true  // accept LaTeX environments inside math.
   },
   options:
   {
