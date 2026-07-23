@@ -1,22 +1,5 @@
-// Regression guard for multi-tile upright structures in the 3D world path.
-// No GL/Vulkan context is created here (see the rift_tests constraint in
-// CMakeLists.txt) - MockRenderer records the submitted quads instead.
-//
-// Multi-tile artwork broke apart in two separate ways, one per axis, and both
-// are pinned here.
-//
-// VERTICALLY, a building is authored as a run of tiles that paint one above the
-// other in the flat top-down view and read as one tall image. The first 3D
-// implementation stood each tile on its own grid row, putting the run at
-// different DEPTHS instead of stacking it, and lifted along world vertical
-// rather than along the billboard's leaning up axis - so the wall both marched
-// away from the camera and split open at every seam.
-//
-// HORIZONTALLY, each upright quad turns toward the camera about its OWN centre,
-// so neighbours standing side by side pivot about different axes and their
-// shared edge separates as (1 - cos yaw). A two-tile log visibly broke in half
-// as soon as the camera moved. Both axes are fixed by giving the whole run a
-// single shared pivot and placing each tile as a slice along the shared axes.
+// Structure tiles share a pivot and leaning axes. vertical slices must meet
+// along the up axis; horizontal slices must retain their shared edges during camera rotation.
 #include "../src/CameraRig.hpp"
 #include "../src/MathConstants.hpp"
 #include "../src/SceneMath.hpp"
@@ -37,9 +20,6 @@ constexpr float Degrees(float d)
     return d * rift::PiF / 180.0f;
 }
 
-// Layer indices are 0-based for the Set/GetLayer* API. Layer 0 is a background
-// layer, so its tiles are flat unless their stance stands them up - which is
-// exactly what we want to exercise: the stance, not the layer.
 constexpr size_t kLayer = 0;
 
 Tilemap MakeMap(int w = 40, int h = 40)
@@ -49,8 +29,7 @@ Tilemap MakeMap(int w = 40, int h = 40)
     return tm;
 }
 
-// A camera looking at the given world point, angled enough that a mistake in the
-// lift axis separates the quads visibly rather than hiding at pitch 90.
+// use an oblique camera so an incorrect lift axis visibly separates the quads.
 cameraRig::RigParams MakeRig(glm::vec2 target)
 {
     cameraRig::RigParams rig;
@@ -61,18 +40,15 @@ cameraRig::RigParams MakeRig(glm::vec2 target)
     return rig;
 }
 
-// Paint a horizontal run of Structure tiles - a log, a wall, a fence rail: the
-// shape that splits apart when each tile pivots about itself.
 void PaintUprightRow(Tilemap& tm, int leftX, int y, int columnCount)
 {
     for (int i = 0; i < columnCount; ++i)
     {
-        tm.SetLayerTile(leftX + i, y, kLayer, /*tileID=*/1);
+        tm.SetLayerTile(leftX + i, y, kLayer, 1);
         tm.SetLayerStance(leftX + i, y, kLayer, TileStance::Structure);
     }
 }
 
-// Quads sorted west-to-east along the run's own right axis.
 std::vector<MockRenderer::Quad3D> SortedByRunOrder(std::vector<MockRenderer::Quad3D> quads)
 {
     std::sort(quads.begin(),
@@ -85,31 +61,26 @@ std::vector<MockRenderer::Quad3D> SortedByRunOrder(std::vector<MockRenderer::Qua
     return quads;
 }
 
-// Paint a vertical run of Structure tiles, bottom row last.
 void PaintUprightColumn(Tilemap& tm, int x, int topRow, int rowCount)
 {
     for (int i = 0; i < rowCount; ++i)
     {
         const int y = topRow + i;
-        tm.SetLayerTile(x, y, kLayer, /*tileID=*/1);
+        tm.SetLayerTile(x, y, kLayer, 1);
         tm.SetLayerStance(x, y, kLayer, TileStance::Structure);
     }
 }
 
-// Paint a vertical run of one stance - a fence running north-south. Upright like
-// the above, but NOT a stacking structure: separate props on their own rows.
 void PaintStanceColumn(Tilemap& tm, int x, int topRow, int rowCount, TileStance stance)
 {
     for (int i = 0; i < rowCount; ++i)
     {
         const int y = topRow + i;
-        tm.SetLayerTile(x, y, kLayer, /*tileID=*/1);
+        tm.SetLayerTile(x, y, kLayer, 1);
         tm.SetLayerStance(x, y, kLayer, stance);
     }
 }
 
-// Quads recorded for one map column, ordered bottom-of-screen first is not
-// guaranteed, so sort by height instead.
 std::vector<MockRenderer::Quad3D> SortedByHeight(std::vector<MockRenderer::Quad3D> quads)
 {
     std::sort(quads.begin(),
@@ -122,8 +93,19 @@ std::vector<MockRenderer::Quad3D> SortedByHeight(std::vector<MockRenderer::Quad3
     return quads;
 }
 
-// Quads sorted north-to-south along scene Z, for a run that advances down a
-// single map column (increasing row) rather than along a row.
+// leave structureId at -1 to exercise automatic grouping.
+void PaintStructureBlock(Tilemap& tm, int leftX, int topRow, int columnCount, int rowCount)
+{
+    for (int dy = 0; dy < rowCount; ++dy)
+    {
+        for (int dx = 0; dx < columnCount; ++dx)
+        {
+            tm.SetLayerTile(leftX + dx, topRow + dy, kLayer, 1);
+            tm.SetLayerStance(leftX + dx, topRow + dy, kLayer, TileStance::Structure);
+        }
+    }
+}
+
 std::vector<MockRenderer::Quad3D> SortedByDepth(std::vector<MockRenderer::Quad3D> quads)
 {
     std::sort(quads.begin(),
@@ -140,8 +122,8 @@ std::vector<MockRenderer::Quad3D> SortedByDepth(std::vector<MockRenderer::Quad3D
 TEST(World3DStackingTest, UprightRunStacksIntoOneWall)
 {
     Tilemap tm = MakeMap();
-    // A 3-tall structure at column 20, occupying rows 10, 11, 12.
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/3);
+
+    PaintUprightColumn(tm, 20, 10, 3);
 
     MockRenderer renderer;
     const cameraRig::RigParams rig = MakeRig({20 * kTileSize + kTileSize * 0.5f, 12 * kTileSize});
@@ -150,22 +132,17 @@ TEST(World3DStackingTest, UprightRunStacksIntoOneWall)
     ASSERT_EQ(renderer.quads3D.size(), 3u);
     const auto quads = SortedByHeight(renderer.quads3D);
 
-    // The run must form ONE continuous wall three tiles long. Measuring the
-    // total extent from the base quad's foot to the top quad's head is what
-    // distinguishes a wall from the original bug's column-marching-north: a
-    // per-row anchored run spans three rows of DEPTH, so its end-to-end length
-    // is larger than 3 tiles and does not lie along the billboard up axis.
+    // measure along the shared up axis: a three-tile wall must span exactly three
+    // tiles, rather than advancing across three ground rows.
     const glm::vec3 foot = quads.front().corners[sceneMath::QUAD_BOTTOM_LEFT];
     const glm::vec3 head = quads.back().corners[sceneMath::QUAD_TOP_LEFT];
     EXPECT_NEAR(glm::distance(foot, head), 3.0f * kTileSize, kTol);
 
-    // ...and that extent runs along the quads' own up axis, not off at an angle.
     const glm::vec3 alongWall = glm::normalize(head - foot);
     const glm::vec3 quadUp = glm::normalize(quads.front().corners[sceneMath::QUAD_TOP_LEFT] -
                                             quads.front().corners[sceneMath::QUAD_BOTTOM_LEFT]);
     EXPECT_NEAR(glm::dot(alongWall, quadUp), 1.0f, kTol);
 
-    // Every tile of the run shares the same column.
     for (size_t i = 1; i < quads.size(); ++i)
     {
         EXPECT_NEAR(quads[i].corners[sceneMath::QUAD_BOTTOM_LEFT].x, foot.x, kTol)
@@ -175,11 +152,9 @@ TEST(World3DStackingTest, UprightRunStacksIntoOneWall)
 
 TEST(World3DStackingTest, AdjacentTilesInARunShareAnEdgeExactly)
 {
-    // The seam test: quad i's TOP edge must be quad i+1's BOTTOM edge. This is
-    // what fails if the lift runs along world vertical instead of the leaning
-    // billboard up axis - the wall splits open at every tile boundary.
+    // each tile's top edge must meet the next tile's bottom edge along the leaning up axis.
     Tilemap tm = MakeMap();
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/4);
+    PaintUprightColumn(tm, 20, 10, 4);
 
     MockRenderer renderer;
     tm.RenderWorld3D(renderer, MakeRig({20 * kTileSize + kTileSize * 0.5f, 12 * kTileSize}));
@@ -203,29 +178,24 @@ TEST(World3DStackingTest, AdjacentTilesInARunShareAnEdgeExactly)
 
 TEST(World3DStackingTest, RunIsOrderedBottomRowLowest)
 {
-    // The southern-most map row is the base and must end up lowest in the scene;
-    // getting this backwards would render the building upside down.
+    // the southernmost map row forms the base so the artwork stays upright.
     Tilemap tm = MakeMap();
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/3);
+    PaintUprightColumn(tm, 20, 10, 3);
 
     MockRenderer renderer;
     tm.RenderWorld3D(renderer, MakeRig({20 * kTileSize + kTileSize * 0.5f, 12 * kTileSize}));
     ASSERT_EQ(renderer.quads3D.size(), 3u);
 
-    // Submission order follows the row scan (north to south), so the FIRST quad
-    // is the top of the building and must be the highest.
+    // the north-to-south scan submits the top tile first.
     const float firstHeight = renderer.quads3D.front().corners[sceneMath::QUAD_BOTTOM_LEFT].y;
     const float lastHeight = renderer.quads3D.back().corners[sceneMath::QUAD_BOTTOM_LEFT].y;
     EXPECT_GT(firstHeight, lastHeight);
 
-    // The base tile stands on the ground plane.
     EXPECT_NEAR(lastHeight, 0.0f, kTol);
 }
 
 TEST(World3DStackingTest, LoneUprightTileStandsOnItsOwnCell)
 {
-    // A fence post or single bush is a run of length 1 and must be unaffected by
-    // the base-row search.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetLayerStance(20, 12, kLayer, TileStance::Structure);
@@ -236,24 +206,21 @@ TEST(World3DStackingTest, LoneUprightTileStandsOnItsOwnCell)
     ASSERT_EQ(renderer.quads3D.size(), 1u);
     const glm::vec3 foot = renderer.quads3D[0].corners[sceneMath::QUAD_BOTTOM_LEFT];
     EXPECT_NEAR(foot.y, 0.0f, kTol);
-    // Stands on its own row's south edge.
+
     EXPECT_NEAR(foot.z, static_cast<float>((12 + 1) * kTileSize), kTol);
 }
 
 TEST(World3DStackingTest, SeparateRunsDoNotMerge)
 {
-    // Two structures with a gap between them keep independent bases; if the
-    // downward scan ran through empty tiles they would fuse into one tall wall.
     Tilemap tm = MakeMap();
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/8, /*rowCount=*/2);   // rows 8-9
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/12, /*rowCount=*/2);  // rows 12-13
+    PaintUprightColumn(tm, 20, 8, 2);   // rows 8-9
+    PaintUprightColumn(tm, 20, 12, 2);  // rows 12-13
 
     MockRenderer renderer;
     tm.RenderWorld3D(renderer, MakeRig({20 * kTileSize + kTileSize * 0.5f, 11 * kTileSize}));
 
     ASSERT_EQ(renderer.quads3D.size(), 4u);
 
-    // Exactly two quads sit on the ground - one base per run.
     int onGround = 0;
     for (const auto& quad : renderer.quads3D)
     {
@@ -267,13 +234,10 @@ TEST(World3DStackingTest, SeparateRunsDoNotMerge)
 
 TEST(World3DStackingTest, SideBySideTilesShareAnEdgeWhenTheCameraIsYawed)
 {
-    // The reported bug: a 2-tile-wide log on the ground splits in half as soon
-    // as the camera turns. Each upright quad pivots toward the camera about its
-    // OWN centre, so neighbours rotate about different axes and their shared
-    // edge separates - the gap opening as (1 - cos yaw). Only a shared pivot
-    // keeps them welded.
+    // independent pivots separate adjacent edges by (1 - cos yaw); a shared pivot keeps them
+    // joined.
     Tilemap tm = MakeMap();
-    PaintUprightRow(tm, /*leftX=*/20, /*y=*/12, /*columnCount=*/2);
+    PaintUprightRow(tm, 20, 12, 2);
 
     cameraRig::RigParams rig = MakeRig({21 * kTileSize, 12 * kTileSize});
     rig.yawRadians = Degrees(40.0f);  // the angle that used to break it
@@ -284,7 +248,6 @@ TEST(World3DStackingTest, SideBySideTilesShareAnEdgeWhenTheCameraIsYawed)
     ASSERT_EQ(renderer.quads3D.size(), 2u);
     const auto quads = SortedByRunOrder(renderer.quads3D);
 
-    // West tile's east edge is exactly the east tile's west edge, top and bottom.
     EXPECT_NEAR(glm::distance(quads[0].corners[sceneMath::QUAD_TOP_RIGHT],
                               quads[1].corners[sceneMath::QUAD_TOP_LEFT]),
                 0.0f,
@@ -297,10 +260,8 @@ TEST(World3DStackingTest, SideBySideTilesShareAnEdgeWhenTheCameraIsYawed)
 
 TEST(World3DStackingTest, WideRunStaysWeldedAtEveryYaw)
 {
-    // Sweep a full turn: a run must never open a seam at any angle, not just the
-    // one that happened to be tested.
     Tilemap tm = MakeMap();
-    PaintUprightRow(tm, /*leftX=*/20, /*y=*/12, /*columnCount=*/4);
+    PaintUprightRow(tm, 20, 12, 4);
 
     for (int deg = -180; deg < 180; deg += 15)
     {
@@ -325,10 +286,8 @@ TEST(World3DStackingTest, WideRunStaysWeldedAtEveryYaw)
 
 TEST(World3DStackingTest, WideRunKeepsItsTotalWidth)
 {
-    // Welding the seams must not do it by overlapping the slices: the run's
-    // end-to-end width is still exactly four tiles.
     Tilemap tm = MakeMap();
-    PaintUprightRow(tm, /*leftX=*/20, /*y=*/12, /*columnCount=*/4);
+    PaintUprightRow(tm, 20, 12, 4);
 
     cameraRig::RigParams rig = MakeRig({22 * kTileSize, 12 * kTileSize});
     rig.yawRadians = Degrees(55.0f);
@@ -346,8 +305,6 @@ TEST(World3DStackingTest, WideRunKeepsItsTotalWidth)
 
 TEST(World3DStackingTest, LoneUprightTileIsUnaffectedByTheRunPivot)
 {
-    // A single tile is a run of one, so it must still stand on its own centre
-    // rather than being displaced by the run-centre arithmetic.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetLayerStance(20, 12, kLayer, TileStance::Structure);
@@ -359,7 +316,6 @@ TEST(World3DStackingTest, LoneUprightTileIsUnaffectedByTheRunPivot)
     tm.RenderWorld3D(renderer, rig);
     ASSERT_EQ(renderer.quads3D.size(), 1u);
 
-    // Bottom edge midpoint is the tile's own foot, at any yaw.
     const glm::vec3 mid = (renderer.quads3D[0].corners[sceneMath::QUAD_BOTTOM_LEFT] +
                            renderer.quads3D[0].corners[sceneMath::QUAD_BOTTOM_RIGHT]) *
                           0.5f;
@@ -369,15 +325,9 @@ TEST(World3DStackingTest, LoneUprightTileIsUnaffectedByTheRunPivot)
 
 TEST(World3DStackingTest, WideStructureStaysAnchoredAsTheCameraOrbits)
 {
-    // The reported bug: buildings and bridge borders drifted off their world
-    // positions while orbiting, swinging as they tried to face the camera. A
-    // rotating rigid body sweeps everything that is offset from its pivot, so a
-    // structure with real width cannot billboard - it must stay grid-locked.
-    //
-    // The assertion is total invariance: a wide structure's geometry may not
-    // depend on the camera's yaw AT ALL.
+    // wide structures keep fixed yaw so their footprint cannot move during an orbit.
     Tilemap tm = MakeMap();
-    PaintUprightRow(tm, /*leftX=*/20, /*y=*/12, /*columnCount=*/4);
+    PaintUprightRow(tm, 20, 12, 4);
 
     cameraRig::RigParams reference = MakeRig({22 * kTileSize, 12 * kTileSize});
     reference.yawRadians = 0.0f;
@@ -410,10 +360,6 @@ TEST(World3DStackingTest, WideStructureStaysAnchoredAsTheCameraOrbits)
 
 TEST(World3DStackingTest, LoneTileStillTurnsTowardTheCameraButHoldsItsAnchor)
 {
-    // The counterpart: one-tile artwork - lanterns, stones, tree trunks - is
-    // effectively a pole, so it SHOULD keep turning to face the camera. It spins
-    // about itself, so its footprint never moves. If this test ever passes by
-    // the geometry being frozen, the pivot behaviour has been lost entirely.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetLayerStance(20, 12, kLayer, TileStance::Structure);
@@ -435,12 +381,10 @@ TEST(World3DStackingTest, LoneTileStillTurnsTowardTheCameraButHoldsItsAnchor)
     ASSERT_EQ(straight.size(), 1u);
     ASSERT_EQ(turned.size(), 1u);
 
-    // It DID turn - the corners are not the same.
     EXPECT_GT(glm::distance(turned[0].corners[sceneMath::QUAD_BOTTOM_LEFT],
                             straight[0].corners[sceneMath::QUAD_BOTTOM_LEFT]),
               0.1f);
 
-    // ...but the anchor it spins about did not move.
     for (const auto& quads : {straight, turned})
     {
         const glm::vec3 mid = (quads[0].corners[sceneMath::QUAD_BOTTOM_LEFT] +
@@ -453,11 +397,9 @@ TEST(World3DStackingTest, LoneTileStillTurnsTowardTheCameraButHoldsItsAnchor)
 
 TEST(World3DStackingTest, TallSingleColumnStillCountsAsAPole)
 {
-    // Width is what decides, not tile count: a 1-wide, 3-tall tower is still a
-    // pole and may pivot. Keyed off the run's COLUMN span, so height must not
-    // accidentally lock it to the grid.
+    // column span determines fixed yaw; a one-column, three-row tower may still turn.
     Tilemap tm = MakeMap();
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/3);
+    PaintUprightColumn(tm, 20, 10, 3);
 
     const cameraRig::RigParams straight =
         MakeRig({20 * kTileSize + kTileSize * 0.5f, 12 * kTileSize});
@@ -478,11 +420,8 @@ TEST(World3DStackingTest, TallSingleColumnStillCountsAsAPole)
 
 TEST(World3DStackingTest, WideStructureBaseSitsOnItsAuthoredFootprint)
 {
-    // Not just invariant - invariant at the RIGHT place. Each tile's foot must
-    // land on its own authored column, so the structure covers exactly the tiles
-    // it was painted on.
     Tilemap tm = MakeMap();
-    PaintUprightRow(tm, /*leftX=*/20, /*y=*/12, /*columnCount=*/3);
+    PaintUprightRow(tm, 20, 12, 3);
 
     cameraRig::RigParams rig = MakeRig({21 * kTileSize, 12 * kTileSize});
     rig.yawRadians = Degrees(50.0f);
@@ -506,16 +445,8 @@ TEST(World3DStackingTest, WideStructureBaseSitsOnItsAuthoredFootprint)
 
 TEST(World3DStackingTest, GroundDrawsWithoutDepthSoCoplanarTilesCannotFight)
 {
-    // Every layer of ground art sits at height 0, so stacked tiles are exactly
-    // coplanar. That was survivable while tiles were axis-aligned - identical
-    // geometry gives bit-identical depth and GL_LEQUAL picks the later draw,
-    // which IS the layer order. Rotation broke it: a rotated quad overhangs its
-    // cell, and those overlaps are coplanar surfaces with different geometry,
-    // so their depths differ by float noise and the winner shimmers as the
-    // camera moves.
-    //
-    // Ground therefore submits with depth disabled outright. Nothing can be
-    // behind a flat floor viewed from above, so it never needed depth at all.
+    // coplanar rotated ground quads can disagree in depth by float noise. disable
+    // depth for ground and preserve layer order to prevent flicker.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetLayerRotation(20, 12, kLayer, 37.0f);
@@ -529,8 +460,7 @@ TEST(World3DStackingTest, GroundDrawsWithoutDepthSoCoplanarTilesCannotFight)
 
 TEST(World3DStackingTest, UprightArtworkStillUsesDepth)
 {
-    // The counterpart: upright artwork and actors DO need depth against each
-    // other, so only the flat floor opts out.
+    // upright artwork still needs depth against actors and other upright quads.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetLayerStance(20, 12, kLayer, TileStance::Structure);
@@ -544,19 +474,14 @@ TEST(World3DStackingTest, UprightArtworkStillUsesDepth)
 
 TEST(World3DStackingTest, AllGroundIsSubmittedBeforeAnyUprightArtwork)
 {
-    // Ground has no depth, so its only ordering is submission order - it must
-    // therefore all land before the upright pass, or a wall would be painted
-    // over by the floor beside it. Also keeps the batch whole: DepthMode is
-    // pipeline state, so interleaving would flush between alternating tiles.
+    // submit all ground before upright geometry; depth-free ground could otherwise cover walls.
     Tilemap tm = MakeMap();
     for (int x = 18; x <= 22; ++x)
     {
         tm.SetLayerTile(x, 12, kLayer, 1);  // ground
         tm.SetLayerTile(x, 11, kLayer, 1);  // more ground
-        // Some upright, interleaved with flat, so the partition cannot be an
-        // accident of authoring order.
-        tm.SetLayerStance(
-            x, 11, kLayer, (x % 2 == 0) ? TileStance::Structure : TileStance::Flat);
+
+        tm.SetLayerStance(x, 11, kLayer, (x % 2 == 0) ? TileStance::Structure : TileStance::Flat);
     }
 
     MockRenderer renderer;
@@ -580,14 +505,7 @@ TEST(World3DStackingTest, AllGroundIsSubmittedBeforeAnyUprightArtwork)
 
 TEST(World3DStackingTest, YSortFlagsAloneLeaveATileFlat)
 {
-    // Regression guard for the rule this stance enum replaced. IsUpright used to
-    // be `noProjection || ySortPlus || ySortMinus`, which stood every flat decal
-    // an author had tagged for sorting on its edge - 387 cells of the shipped map.
-    //
-    // The flat pipeline settles the argument: there the two y-sort flags change
-    // draw ORDER only and never reach a geometry branch. They keep that meaning
-    // and no longer touch geometry, so a tile carrying nothing but a y-sort flag
-    // is ground artwork in the depth-free pass.
+    // y-sort flags change order only; an otherwise Flat tile stays in the ground pass.
     for (const bool useMinus : {false, true})
     {
         Tilemap tm = MakeMap();
@@ -608,7 +526,6 @@ TEST(World3DStackingTest, YSortFlagsAloneLeaveATileFlat)
         EXPECT_EQ(renderer.quads3D[0].depth, renderModes::DepthMode::None)
             << "ySortMinus=" << useMinus;
 
-        // Lying on the floor: every corner is on the ground plane.
         for (const glm::vec3& corner : renderer.quads3D[0].corners)
         {
             EXPECT_NEAR(corner.y, 0.0f, kTol) << "ySortMinus=" << useMinus;
@@ -618,39 +535,30 @@ TEST(World3DStackingTest, YSortFlagsAloneLeaveATileFlat)
 
 TEST(World3DStackingTest, AWallColumnRecedesAlongTheGroundInsteadOfStacking)
 {
-    // The reported bug: a fence running north-south was read as a building and
-    // climbed into a tower. A vertical run of tiles is ambiguous - one tall
-    // image, or a line of separate panels receding into the distance - and only
-    // TileStance::Structure says "stacks". Three fence panels are three panels.
+    // only Structure stacks vertically; a north-south Wall run stays on separate ground rows.
     Tilemap tm = MakeMap();
-    PaintStanceColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/3, TileStance::Wall);
+    PaintStanceColumn(tm, 20, 10, 3, TileStance::Wall);
 
     MockRenderer renderer;
     tm.RenderWorld3D(renderer, MakeRig({20 * kTileSize + kTileSize * 0.5f, 11 * kTileSize}));
     ASSERT_EQ(renderer.quads3D.size(), 3u);
 
-    // Every panel stands on the ground...
     for (const auto& quad : renderer.quads3D)
     {
         EXPECT_NEAR(quad.corners[sceneMath::QUAD_BOTTOM_LEFT].y, 0.0f, kTol)
             << "a fence panel was lifted into the air";
-        // ...and genuinely stands: its top edge is above its base. Checking the
-        // scene-Y rise rather than the edge length is deliberate - a flat ground
-        // quad has the same one-tile edge length, so length alone would pass
-        // whether the panel stood up or lay down.
+        // check scene-Y rise: a flat quad has the same edge length and could pass a length-only
+        // check.
         EXPECT_GT(quad.corners[sceneMath::QUAD_TOP_LEFT].y,
                   quad.corners[sceneMath::QUAD_BOTTOM_LEFT].y)
             << "a fence panel is lying on the ground";
-        // ...exactly one tile tall. (Measured along the quad's own edge: it
-        // leans, so its extent in scene Y alone is shorter than a tile.)
+
         EXPECT_NEAR(glm::distance(quad.corners[sceneMath::QUAD_TOP_LEFT],
                                   quad.corners[sceneMath::QUAD_BOTTOM_LEFT]),
                     static_cast<float>(kTileSize),
                     kTol);
     }
 
-    // ...and each on its OWN row, so the fence recedes north rather than
-    // collapsing onto one depth the way a stacked wall does.
     std::vector<float> depths;
     depths.reserve(renderer.quads3D.size());
     for (const auto& quad : renderer.quads3D)
@@ -667,21 +575,17 @@ TEST(World3DStackingTest, AWallColumnRecedesAlongTheGroundInsteadOfStacking)
 
 TEST(World3DStackingTest, APropBelowABuildingIsNotItsGroundFloor)
 {
-    // The base-row search walks only Structure artwork. A bush or fence post
-    // painted directly south of a building must not become that building's
-    // foundation - which would lift the whole structure by one tile and leave
-    // the prop welded to a wall it has nothing to do with.
+    // base-row scans stop at non-Structure cells so a neighboring prop cannot lift the building.
     Tilemap tm = MakeMap();
-    PaintUprightColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/2);  // building, rows 10-11
-    tm.SetLayerTile(20, 12, kLayer, 1);                               // prop, row 12
+    PaintUprightColumn(tm, 20, 10, 2);   // building, rows 10-11
+    tm.SetLayerTile(20, 12, kLayer, 1);  // prop, row 12
     tm.SetLayerStance(20, 12, kLayer, TileStance::Prop);
 
     MockRenderer renderer;
     tm.RenderWorld3D(renderer, MakeRig({20 * kTileSize + kTileSize * 0.5f, 11 * kTileSize}));
     ASSERT_EQ(renderer.quads3D.size(), 3u);
 
-    // Two feet on the ground: the building's base and the prop. If the prop had
-    // been absorbed as the base row there would be only one.
+    // the building base and separate prop each contribute one ground contact.
     int onGround = 0;
     for (const auto& quad : renderer.quads3D)
     {
@@ -692,8 +596,6 @@ TEST(World3DStackingTest, APropBelowABuildingIsNotItsGroundFloor)
     }
     EXPECT_EQ(onGround, 2);
 
-    // The building stands on row 11, the prop on row 12 - each on its own south
-    // edge, one tile apart in depth.
     std::vector<float> groundDepths;
     groundDepths.reserve(renderer.quads3D.size());
     for (const auto& quad : renderer.quads3D)
@@ -711,13 +613,10 @@ TEST(World3DStackingTest, APropBelowABuildingIsNotItsGroundFloor)
 
 TEST(World3DStackingTest, APropDoesNotJoinAnAdjacentStructuresRun)
 {
-    // The horizontal counterpart. A Structure run welds its tiles into one rigid
-    // body and a body wider than a tile is grid-locked, so a lone post touching
-    // the east end of a wall must not be frozen along with it. A Prop does not
-    // scan for a run at all, which makes this structural rather than incidental.
+    // a neighboring Prop must turn independently of a wide Structure's fixed yaw.
     Tilemap tm = MakeMap();
-    PaintUprightRow(tm, /*leftX=*/20, /*y=*/12, /*columnCount=*/2);  // building, columns 20-21
-    tm.SetLayerTile(22, 12, kLayer, 1);                              // post, column 22
+    PaintUprightRow(tm, 20, 12, 2);      // building, columns 20-21
+    tm.SetLayerTile(22, 12, kLayer, 1);  // post, column 22
     tm.SetLayerStance(22, 12, kLayer, TileStance::Prop);
 
     const glm::vec2 target{21 * kTileSize, 12 * kTileSize};
@@ -736,7 +635,6 @@ TEST(World3DStackingTest, APropDoesNotJoinAnAdjacentStructuresRun)
     ASSERT_EQ(straight.size(), 3u);
     ASSERT_EQ(turned.size(), 3u);
 
-    // The two wall tiles are grid-locked: unchanged by the orbit.
     for (size_t i = 0; i < 2; ++i)
     {
         for (int c = 0; c < sceneMath::QUAD_CORNER_COUNT; ++c)
@@ -746,13 +644,11 @@ TEST(World3DStackingTest, APropDoesNotJoinAnAdjacentStructuresRun)
         }
     }
 
-    // The post is a pole of its own and still turns...
     EXPECT_GT(glm::distance(turned[2].corners[sceneMath::QUAD_BOTTOM_LEFT],
                             straight[2].corners[sceneMath::QUAD_BOTTOM_LEFT]),
               0.1f)
         << "the post was absorbed into the wall's run and frozen with it";
 
-    // ...about its own authored anchor.
     const glm::vec3 mid = (turned[2].corners[sceneMath::QUAD_BOTTOM_LEFT] +
                            turned[2].corners[sceneMath::QUAD_BOTTOM_RIGHT]) *
                           0.5f;
@@ -762,17 +658,10 @@ TEST(World3DStackingTest, APropDoesNotJoinAnAdjacentStructuresRun)
 
 TEST(World3DStackingTest, NorthSouthWallRunIsGridLocked)
 {
-    // THE FENCE REGRESSION. A fence running north-south is a run of panels at
-    // successive DEPTHS, so the horizontal run scan - which only ever looked
-    // along X - measured each one as width 1 and gave it the pivoting
-    // orientation. Every panel then twisted about its own centre, and because a
-    // turned card's edges sweep +/-(tileW/2)*sin(yaw) in Z, the run opened up
-    // like venetian blinds.
-    //
-    // TileStance::Wall says "surface" outright, so no scan and no neighbour
-    // decides anything: the panels stay parallel at every camera angle.
+    // Wall uses fixed yaw regardless of run direction; rotating each panel would
+    // move its edges by +/-(tileW/2)*sin(yaw) in Z and open gaps.
     Tilemap tm = MakeMap();
-    PaintStanceColumn(tm, /*x=*/20, /*topRow=*/10, /*rowCount=*/3, TileStance::Wall);
+    PaintStanceColumn(tm, 20, 10, 3, TileStance::Wall);
 
     const glm::vec2 target{20 * kTileSize + kTileSize * 0.5f, 11 * kTileSize};
 
@@ -805,10 +694,7 @@ TEST(World3DStackingTest, NorthSouthWallRunIsGridLocked)
 
 TEST(World3DStackingTest, AdjacentPropsBothStillTurn)
 {
-    // The false positive bought out by authoring surface-vs-pole instead of
-    // deriving it. Under the old rule a horizontal run longer than one tile was
-    // grid-locked, so two unrelated bushes placed side by side both silently
-    // stopped facing the camera. A Prop is a pole whatever it is standing next to.
+    // adjacent Props each keep their own rotating anchor; proximity must not lock their yaw.
     Tilemap tm = MakeMap();
     for (int x = 20; x <= 21; ++x)
     {
@@ -834,13 +720,11 @@ TEST(World3DStackingTest, AdjacentPropsBothStillTurn)
 
     for (size_t i = 0; i < turned.size(); ++i)
     {
-        // Each turned...
         EXPECT_GT(glm::distance(turned[i].corners[sceneMath::QUAD_BOTTOM_LEFT],
                                 straight[i].corners[sceneMath::QUAD_BOTTOM_LEFT]),
                   0.1f)
             << "prop " << i << " was frozen by its neighbour";
 
-        // ...about its own authored cell, so neither wandered off its footprint.
         const glm::vec3 mid = (turned[i].corners[sceneMath::QUAD_BOTTOM_LEFT] +
                                turned[i].corners[sceneMath::QUAD_BOTTOM_RIGHT]) *
                               0.5f;
@@ -851,11 +735,8 @@ TEST(World3DStackingTest, AdjacentPropsBothStillTurn)
 
 TEST(World3DStackingTest, AdjacentWallsShareAnEdgeExactlyAtEveryYaw)
 {
-    // A Wall needs no shared-pivot machinery: at yawFollow 0 its right axis is
-    // exactly world +X, so placing it at its own cell gives the same corners a
-    // run pivot would - and two Walls side by side derive their common edge from
-    // the identical grid expression. This is the same argument that lets ground
-    // quads drop the flat path's seamFix fudge.
+    // at yawFollow zero, world +X is the right axis; neighboring Walls derive
+    // shared edges from identical grid expressions.
     Tilemap tm = MakeMap();
     for (int x = 20; x <= 21; ++x)
     {
@@ -887,10 +768,7 @@ TEST(World3DStackingTest, AdjacentWallsShareAnEdgeExactlyAtEveryYaw)
 
 TEST(World3DStackingTest, ElevationWithoutARoleDoesNotDisplaceTiles)
 {
-    // Elevation alone still changes nothing. The per-cell value drives collision,
-    // the support graph and walkability; only an authored ElevationRole makes a
-    // LAYER rise to it. This is what keeps an unmarked map rendering exactly as it
-    // did before the field existed.
+    // cell elevation drives physical surfaces; only a layer's ElevationRole lifts its artwork.
     Tilemap plain = MakeMap();
     plain.SetLayerTile(20, 12, kLayer, 1);
 
@@ -933,9 +811,7 @@ TEST(World3DStackingTest, RaisedTilesSitAtTheirCellElevation)
 
 TEST(World3DStackingTest, LayersAtOneCellRiseIndependently)
 {
-    // THE case the per-layer decision exists for: water painted on layer 0 stays
-    // on the ground while the bridge deck on layer 2 lifts. Lifting per CELL
-    // instead would carry the water up with the bridge.
+    // water on layer 0 stays at ground height while the deck on layer 2 rises.
     Tilemap tm = MakeMap();
     tm.SetElevation(20, 12, 6);
     tm.SetLayerTile(20, 12, 0, 1);
@@ -954,9 +830,8 @@ TEST(World3DStackingTest, LayersAtOneCellRiseIndependently)
 
 TEST(World3DStackingTest, ARampRunMeetsTheDeckWithNoSeam)
 {
-    // The shipped bridge reproduced cell for cell along X: bare ground, ramps at 2
-    // and 4, deck at 6. Each cell's high edge must equal the next cell's low edge,
-    // and the run must land on the deck exactly rather than at an average.
+    // along X: ground 0 -> ramp 2 -> ramp 4 -> deck 6.
+    // each high edge must meet the next low edge.
     Tilemap tm = MakeMap();
     for (int x = 20; x <= 24; ++x)
     {
@@ -976,9 +851,6 @@ TEST(World3DStackingTest, ARampRunMeetsTheDeckWithNoSeam)
 
     const std::vector<MockRenderer::Quad3D> quads = SortedByRunOrder(renderer.quads3D);
     ASSERT_EQ(quads.size(), 5u);
-    // If this count is lower, the frustum cull dropped an end of the run rather
-    // than the geometry being wrong. Widen MakeRig's visibleWorldSize or recentre
-    // the rig. Do NOT weaken the assertion to match.
 
     const auto westY = [](const MockRenderer::Quad3D& q)
     { return q.corners[sceneMath::QUAD_TOP_LEFT].y; };
@@ -1004,19 +876,16 @@ TEST(World3DStackingTest, ARampRunMeetsTheDeckWithNoSeam)
 
 TEST(World3DStackingTest, ARampReadsNeighboursOnItsOwnLayerOnly)
 {
-    // A ramp's edge heights come from what the SAME layer does next door. Reading
-    // the raw cell elevation instead would let a layer that is not participating
-    // pull the ramp up - the per-layer split would leak.
+    // ramp edges read the neighboring role on the same layer; raw elevation
+    // cannot raise a neighbor whose role is Ground.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetLayerTile(21, 12, kLayer, 1);
     tm.SetElevation(20, 12, 6);  // neighbour cell IS elevated...
     tm.SetElevation(21, 12, 4);
-    // ...but on THIS layer it is Ground, so it must contribute 0.
+
     tm.SetLayerElevationRole(21, 12, kLayer, ElevationRole::Ramp);
 
-    // A real destination to climb to on the EAST side, so a regression where
-    // every ramp resolves flat at 0 cannot pass by coincidence.
     tm.SetLayerTile(22, 12, kLayer, 1);
     tm.SetElevation(22, 12, 6);
     tm.SetLayerElevationRole(22, 12, kLayer, ElevationRole::Raised);
@@ -1026,23 +895,17 @@ TEST(World3DStackingTest, ARampReadsNeighboursOnItsOwnLayerOnly)
 
     const std::vector<MockRenderer::Quad3D> quads = SortedByRunOrder(renderer.quads3D);
     ASSERT_EQ(quads.size(), 3u);
-    // The ramp's west edge must be 0, not 6: the elevated-but-Ground neighbour at
-    // x=20 contributes nothing.
+
     EXPECT_NEAR(quads[1].corners[sceneMath::QUAD_TOP_LEFT].y, 0.0f, kTol)
         << "the ramp read the neighbour's cell elevation instead of its layer role";
-    // ...but it DOES climb when the neighbour actually participates.
+
     EXPECT_NEAR(quads[1].corners[sceneMath::QUAD_TOP_RIGHT].y, 6.0f, kTol)
         << "the ramp failed to climb toward a participating neighbour";
 }
 
 TEST(World3DStackingTest, ARampRunMeetsTheDeckWithNoSeamGoingNorthSouth)
 {
-    // The Y-axis counterpart of ARampRunMeetsTheDeckWithNoSeam. A ramp can also
-    // climb north-south down a single column: GetElevationAxisAt must read this
-    // as ElevationAxis::Y (the elevation gradient runs along Y, not X), which
-    // sends ResolveSurfaceSlope down the alongZ branch - stepping neighbours in
-    // Y instead of X - and that path is otherwise only covered indirectly via
-    // ApplySlopeHeights, not at the Tilemap level.
+    // the Y-axis ramp must select ElevationAxis::Y and sample neighbors along scene Z.
     Tilemap tm = MakeMap();
     for (int y = 20; y <= 23; ++y)
     {
@@ -1058,14 +921,12 @@ TEST(World3DStackingTest, ARampRunMeetsTheDeckWithNoSeamGoingNorthSouth)
     MockRenderer renderer;
     tm.RenderWorld3D(renderer, MakeRig({20 * kTileSize + kTileSize * 0.5f, 22 * kTileSize}));
 
-    // Sorted by depth (scene Z), not by run order (scene X): this run advances
-    // south, not east, so every tile shares the same X.
+    // sort by scene Z because this run advances south in one column.
     const std::vector<MockRenderer::Quad3D> quads = SortedByDepth(renderer.quads3D);
     ASSERT_EQ(quads.size(), 4u);
 
-    // North is the low-coordinate edge here (TOP_LEFT/TOP_RIGHT share it, since
-    // ApplySlopeHeights samples along Z when alongZ is true), south is the
-    // high-coordinate edge (BOTTOM_LEFT/BOTTOM_RIGHT).
+    // along Z, TOP_LEFT/TOP_RIGHT form the north edge; BOTTOM_LEFT/BOTTOM_RIGHT form the south
+    // edge.
     const auto northY = [](const MockRenderer::Quad3D& q)
     { return q.corners[sceneMath::QUAD_TOP_LEFT].y; };
     const auto southY = [](const MockRenderer::Quad3D& q)
@@ -1088,8 +949,6 @@ TEST(World3DStackingTest, ARampRunMeetsTheDeckWithNoSeamGoingNorthSouth)
 
 TEST(World3DStackingTest, TileRotationReachesTheQuad)
 {
-    // Per-tile rotation was dropped entirely by the first 3D implementation, so
-    // every rotated tile silently rendered unrotated.
     Tilemap plain = MakeMap();
     plain.SetLayerTile(20, 12, kLayer, 1);
 
@@ -1107,7 +966,6 @@ TEST(World3DStackingTest, TileRotationReachesTheQuad)
     ASSERT_EQ(plainRenderer.quads3D.size(), 1u);
     ASSERT_EQ(turnedRenderer.quads3D.size(), 1u);
 
-    // A quarter turn maps each corner onto its neighbour's old position.
     for (int i = 0; i < sceneMath::QUAD_CORNER_COUNT; ++i)
     {
         const int next = (i + 1) % sceneMath::QUAD_CORNER_COUNT;
@@ -1121,8 +979,6 @@ TEST(World3DStackingTest, TileRotationReachesTheQuad)
 
 TEST(World3DStackingTest, GroundTilesStayFlatAndInPlace)
 {
-    // The flat path must be untouched by the upright handling: an unflagged
-    // background tile is still a ground quad on its own cell.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
 
@@ -1141,8 +997,6 @@ TEST(World3DStackingTest, GroundTilesStayFlatAndInPlace)
 
 TEST(World3DStackingTest, UprightFeetRiseToTheDeck)
 {
-    // The "borders on each side" half: a railing marked Raised on a deck cell must
-    // stand ON the deck, not on the ground under it.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetElevation(20, 12, 6);
@@ -1155,8 +1009,6 @@ TEST(World3DStackingTest, UprightFeetRiseToTheDeck)
     ASSERT_EQ(renderer.quads3D.size(), 1u);
     EXPECT_NEAR(renderer.quads3D[0].corners[sceneMath::QUAD_BOTTOM_LEFT].y, 6.0f, kTol);
 
-    // Still exactly one tile tall, measured along its own leaning edge - the lift
-    // must move the quad, not stretch it.
     EXPECT_NEAR(glm::distance(renderer.quads3D[0].corners[sceneMath::QUAD_TOP_LEFT],
                               renderer.quads3D[0].corners[sceneMath::QUAD_BOTTOM_LEFT]),
                 static_cast<float>(kTileSize),
@@ -1165,8 +1017,6 @@ TEST(World3DStackingTest, UprightFeetRiseToTheDeck)
 
 TEST(World3DStackingTest, AnUnmarkedUprightTileStillStandsOnZero)
 {
-    // The regression net: elevation without a role must not lift artwork, upright
-    // or otherwise.
     Tilemap tm = MakeMap();
     tm.SetLayerTile(20, 12, kLayer, 1);
     tm.SetElevation(20, 12, 6);
@@ -1181,11 +1031,8 @@ TEST(World3DStackingTest, AnUnmarkedUprightTileStillStandsOnZero)
 
 TEST(World3DStackingTest, ARaisedStructureRunStaysRigid)
 {
-    // A multi-tile body shares ONE foot height so it cannot tilt, even where its
-    // base row spans cells of differing elevation. Per-slice heights would shear
-    // the body apart at its seams. The shared height itself pins the centre-column
-    // choice specifically: footColumn = (20+21)/2 = 20 (integer division), whose
-    // elevation is 6 - not the 10 at column 21, and not their average.
+    // one foot height keeps all Structure slices joined. footColumn = (20+21)/2 = 20,
+    // so the shared height is 6, not column 21's 10 or their average.
     Tilemap tm = MakeMap();
     for (int x = 20; x <= 21; ++x)
     {
@@ -1207,4 +1054,149 @@ TEST(World3DStackingTest, ARaisedStructureRunStaysRigid)
         << "the structure tilted instead of staying rigid";
     EXPECT_NEAR(quads[0].corners[sceneMath::QUAD_BOTTOM_LEFT].y, 6.0f, kTol)
         << "the shared foot did not land on the run's centre-column elevation";
+}
+
+TEST(StructureFacadeTest, SurfaceHeightReadsOnlyOptedInLayers)
+{
+    Tilemap tm = MakeMap(80, 60);
+    ASSERT_GE(tm.GetLayerCount(), 2u);
+
+    // Cell (10, 10) spans world x 160..176 and y 160..176, so (168, 168) is inside it.
+    tm.SetLayerTile(10, 10, kLayer, 1);
+    tm.SetElevation(10, 10, 8);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({168.0f, 168.0f}), 0.0f, kTol)
+        << "elevation alone lifted the surface without a role opting in";
+
+    tm.SetLayerElevationRole(10, 10, kLayer, ElevationRole::Raised);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({168.0f, 168.0f}), 8.0f, kTol);
+
+    tm.SetLayerTile(10, 10, 1, 1);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({168.0f, 168.0f}), 8.0f, kTol);
+
+    tm.SetLayerTile(10, 10, kLayer, -1);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({168.0f, 168.0f}), 0.0f, kTol);
+}
+
+TEST(StructureFacadeTest, SurfaceHeightIsZeroOffMapAndOnEmptyCells)
+{
+    const Tilemap tm = MakeMap(80, 60);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({-8.0f, -8.0f}), 0.0f, kTol);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({1e6f, 1e6f}), 0.0f, kTol);
+    EXPECT_NEAR(tm.SurfaceHeightAtWorldPos({168.0f, 168.0f}), 0.0f, kTol);
+}
+
+TEST(StructureFacadeTest, FacadeReportsTheAutoFloodFillBody)
+{
+    Tilemap tm = MakeMap(80, 60);
+    PaintStructureBlock(tm, 62, 30, 3, 3);
+
+    // (1010, 500) is cell (63, 31), the middle of the block.
+    const auto facade = tm.FindStructureFacade({1010.0f, 500.0f});
+    ASSERT_TRUE(facade.has_value());
+
+    // runCentreX = (62 + 64 + 1) * 0.5 * 16 and baseSouthEdgeY = (32 + 1) * 16.
+    // every cell is elevation 0 on a Ground role, so the foot stays on the ground.
+    EXPECT_EQ(facade->widthTiles, 3);
+    EXPECT_NEAR(facade->runCentreX, 1016.0f, kTol);
+    EXPECT_NEAR(facade->baseSouthEdgeY, 528.0f, kTol);
+    EXPECT_NEAR(facade->foot.x, 1016.0f, kTol);
+    EXPECT_NEAR(facade->foot.y, 0.0f, kTol);
+    EXPECT_NEAR(facade->foot.z, 528.0f, kTol);
+}
+
+TEST(StructureFacadeTest, FacadeAgreesWithTheTilePass)
+{
+    Tilemap tm = MakeMap(80, 60);
+    PaintStructureBlock(tm, 62, 30, 3, 3);
+
+    const auto facade = tm.FindStructureFacade({1010.0f, 500.0f});
+    ASSERT_TRUE(facade.has_value());
+
+    MockRenderer renderer;
+    tm.RenderWorld3D(renderer, MakeRig({1016.0f, 500.0f}));
+
+    std::vector<MockRenderer::Quad3D> upright;
+    for (const MockRenderer::Quad3D& quad : renderer.quads3D)
+    {
+        if (quad.depth == renderModes::DepthMode::TestAndWrite)
+        {
+            upright.push_back(quad);
+        }
+    }
+    ASSERT_EQ(upright.size(), 9u);
+
+    // billboard::MakeQuad anchors at the feet; the base-row center tile has zero
+    // slice offset and lift, so its bottom midpoint is the decal anchor.
+    bool matched = false;
+    for (const MockRenderer::Quad3D& quad : upright)
+    {
+        const glm::vec3 bottomCentre = (quad.corners[sceneMath::QUAD_BOTTOM_LEFT] +
+                                        quad.corners[sceneMath::QUAD_BOTTOM_RIGHT]) *
+                                       0.5f;
+        if (glm::distance(bottomCentre, facade->foot) < kTol)
+        {
+            matched = true;
+        }
+    }
+    EXPECT_TRUE(matched) << "no tile quad stands on the reported facade foot";
+}
+
+TEST(StructureFacadeTest, FacadeIsFoundFromAboveButNotBeyondTheWalk)
+{
+    Tilemap tm = MakeMap(80, 60);
+    PaintStructureBlock(tm, 62, 30, 3, 3);
+
+    const auto fromAbove = tm.FindStructureFacade({1010.0f, 424.0f});
+    ASSERT_TRUE(fromAbove.has_value());
+    EXPECT_NEAR(fromAbove->runCentreX, 1016.0f, kTol);
+    EXPECT_NEAR(fromAbove->baseSouthEdgeY, 528.0f, kTol);
+
+    EXPECT_FALSE(tm.FindStructureFacade({1010.0f, 328.0f}).has_value());
+
+    EXPECT_FALSE(tm.FindStructureFacade({100.0f, 100.0f}).has_value());
+}
+
+TEST(StructureFacadeTest, FacadeUsesTheAuthoredStructureBounds)
+{
+    Tilemap tm = MakeMap(80, 60);
+    PaintStructureBlock(tm, 20, 10, 3, 3);
+
+    const int id = tm.AddNoProjectionStructure({320.0f, 208.0f}, {368.0f, 208.0f});
+    for (int y = 10; y <= 12; ++y)
+    {
+        for (int x = 20; x <= 22; ++x)
+        {
+            tm.SetTileStructureId(x, y, 1, id);
+        }
+    }
+
+    // an extra automatic cell would extend the contiguity scan; width 3 confirms
+    // that the authored group bounds take precedence.
+    tm.SetLayerTile(23, 11, kLayer, 1);
+    tm.SetLayerStance(23, 11, kLayer, TileStance::Structure);
+
+    const auto facade = tm.FindStructureFacade({336.0f, 176.0f});
+    ASSERT_TRUE(facade.has_value());
+    EXPECT_EQ(facade->widthTiles, 3);
+    EXPECT_NEAR(facade->runCentreX, 344.0f, kTol);
+    EXPECT_NEAR(facade->baseSouthEdgeY, 208.0f, kTol);
+    EXPECT_NEAR(facade->foot.x, 344.0f, kTol);
+    EXPECT_NEAR(facade->foot.y, 0.0f, kTol);
+    EXPECT_NEAR(facade->foot.z, 208.0f, kTol);
+}
+
+TEST(StructureFacadeTest, FacadeLiftsWithTheBodysFootHeight)
+{
+    Tilemap tm = MakeMap(80, 60);
+    PaintStructureBlock(tm, 62, 30, 3, 3);
+
+    // foot height comes from center column (62 + 64) / 2 = 63 at base row 32.
+    tm.SetElevation(63, 32, 8);
+    tm.SetLayerElevationRole(63, 32, kLayer, ElevationRole::Raised);
+
+    const auto facade = tm.FindStructureFacade({1010.0f, 500.0f});
+    ASSERT_TRUE(facade.has_value());
+    EXPECT_NEAR(facade->foot.y, 8.0f, kTol);
+    EXPECT_NEAR(facade->foot.x, 1016.0f, kTol);
+    EXPECT_NEAR(facade->foot.z, 528.0f, kTol);
 }
