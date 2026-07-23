@@ -17,14 +17,11 @@
 
 #include <algorithm>
 
-// Column = walk frame (wrapped to the walk count); row = facing, via the logical
-// order {DOWN=0, UP=1, LEFT=2, RIGHT=3} then the GL permutation below.
 glm::vec2 PlayerRender::SpriteCoords(int frame, CharacterDirection dir, bool requiresYFlip)
 {
     int clampedFrame = frame % CharacterConstants::WALK_FRAME_COUNT;
     int spriteX = clampedFrame * CharacterConstants::SPRITE_WIDTH;
 
-    // Map direction to logical row index (player row order).
     int dirRow = 0;
     switch (dir)
     {
@@ -62,22 +59,17 @@ glm::vec2 PlayerRender::SpriteCoords(int frame, CharacterDirection dir, bool req
                      static_cast<float>(dirRow * CharacterConstants::SPRITE_HEIGHT));
 }
 
-// Pick the sheet the current movement mode draws from, and - when the player is
-// atlas-bound - shift spriteCoords by that mode's baked atlas offset instead. Mode
-// priority is bicycle > run > walk; the local sheet is still resolved on the atlas
-// path because the ternary is evaluated first, which is harmless (a store lookup).
-const Texture& PlayerRender::ResolveRenderSheet(const ecs::registry& world,
+const Texture& PlayerRender::ResolveRenderSheet(const entt::registry& world,
                                                 const PlayerModes& modes,
                                                 const PlayerSprite& sprite,
                                                 glm::vec2& spriteCoords)
 {
-    // Select sprite sheet based on movement mode (bicycle > run > walk).
     const Texture& localSheet = modes.isBicycling
                                     ? PlayerSystem::GetBicycleSpriteSheet(world, sprite)
                                 : (modes.animationType == AnimationType::RUN)
                                     ? PlayerSystem::GetRunningSpriteSheet(world, sprite)
                                     : PlayerSystem::GetSpriteSheet(world, sprite);
-    // When atlas-bound, draw out of the shared atlas with the mode's baked offset.
+
     if (sprite.atlas != nullptr)
     {
         spriteCoords += modes.isBicycling                             ? sprite.atlasBicycleOffset
@@ -91,7 +83,7 @@ const Texture& PlayerRender::ResolveRenderSheet(const ecs::registry& world,
 // Pipeline: pick UVs (SpriteCoords, with the renderer's flip convention) -> resolve
 // sheet + fold the mode's atlas offset (ResolveRenderSheet) -> place with elevation
 // (ComputeRenderPos) -> draw the requested half (DrawPart).
-void PlayerRender::DrawHalf(const ecs::registry& world,
+void PlayerRender::DrawHalf(const entt::registry& world,
                             IRenderer& renderer,
                             glm::vec2 cameraPos,
                             bool topHalf,
@@ -117,11 +109,7 @@ void PlayerRender::DrawHalf(const ecs::registry& world,
         topHalf ? CharacterRender::Part::TopHalf : CharacterRender::Part::BottomHalf);
 }
 
-// 3D pipeline: same sheet/UV resolution as DrawHalf, but the anchor stays in
-// world space and the elevation lift becomes a real height instead of a
-// pre-projection screen nudge - so a character on a ramp is genuinely higher in
-// the scene rather than merely drawn higher on screen.
-void PlayerRender::Draw3D(const ecs::registry& world,
+void PlayerRender::Draw3D(const entt::registry& world,
                           IRenderer& renderer,
                           const billboard::Orientation& orientation,
                           const Transform& xf,
@@ -131,12 +119,7 @@ void PlayerRender::Draw3D(const ecs::registry& world,
                           const PlayerModes& modes,
                           const PlayerSprite& sprite)
 {
-    // Sheet rows are screen directions, not world ones, so the row is chosen
-    // from the facing rotated into the camera's frame - otherwise orbiting
-    // behind a character would still show their front. The billboard's own yaw
-    // is used rather than the raw camera yaw so the row always agrees with how
-    // far the quad actually turned. The stored Facing is left alone; only this
-    // lookup rotates.
+    // Rotate the row lookup by billboard yaw to match the visible side; retain stored facing.
     const CharacterDirection screenDir =
         cameraFacing::ScreenFacing(facing.dir, orientation.yawRadians);
 
@@ -145,10 +128,7 @@ void PlayerRender::Draw3D(const ecs::registry& world,
     const glm::vec2 spriteSize(CharacterConstants::SPRITE_WIDTH_F,
                                CharacterConstants::SPRITE_HEIGHT_F);
 
-    // Elevation::offset only - not the plane index. The flat path lifts the
-    // sprite by exactly this (ComputeRenderPos subtracts it in Y-down screen
-    // space), and the plane is a logical collision/sorting value that was never
-    // a render offset.
+    // Visual height is elev.offset; the plane index is for collision and sorting.
     const glm::vec3 footCenter = sceneMath::ToScene(xf.position, elev.offset);
 
     CharacterRender::DrawBillboard(
