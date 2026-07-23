@@ -7,85 +7,82 @@
 #include <string_view>
 
 /**
- * @brief Blend and depth state selectors for the world-space 3D draw path.
- * @author Alex (https://github.com/lextpf)
+ * @brief Controls blend, depth, and lighting for world-space passes.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * Kept in their own tiny header rather than inside @c IRenderer.hpp so that
- * geometry-building code (and its tests) can name a pass without pulling in the
- * whole renderer interface.
+ * | pass        | depth        | blend          | light   |
+ * |-------------|--------------|----------------|---------|
+ * | ground      | none         | Alpha          | Ambient |
+ * | opaque      | TestAndWrite | Alpha          | Ambient |
+ * | facade      | TestOnly     | Alpha/Additive | SelfLit |
+ * | cards       | none         | Alpha/Additive | SelfLit |
+ * | light pools | none         | Additive       | SelfLit |
+ * | sky sheet   | none         | Additive       | SelfLit |
  *
- * @par The pass contract
- * A world frame draws in a fixed order, and each pass is defined by the pair of
- * modes it submits with:
+ * Ground keeps authored layer order because layers are coplanar. opaque cutout
+ * fragments write neither color nor depth below the alpha threshold.
+ * Light pools ignore depth to cover actors and walls as in the flat path.
+ * Particles keep non-additive draws before additive draws on their shared plane.
  *
- * | Pass           | Depth           | Blend                  | Contents                       |
- * |----------------|-----------------|------------------------|--------------------------------|
- * | A0 ground      | @c None         | @c Alpha (cutout)      | flat ground tiles, layer order |
- * | A1 opaque      | @c TestAndWrite | @c Alpha (cutout)      | upright tiles, actors          |
- * | B translucent  | @c TestOnly     | @c Alpha / @c Additive | particles, light pools         |
- *
- * Pass A0 turns depth off because every ground layer of a cell is coplanar, and
- * rotated quads spill into neighbouring cells where coplanar surfaces of different
- * geometry z-fight. Authored layer order carries the ordering instead.
- *
- * Pass A1 relies on the fragment shader's alpha cutout: fragments below the
- * threshold are discarded, so they write neither color nor depth and cutout
- * artwork gets correct occlusion **without any sorting**. That is what lets the
- * opaque pass batch purely by texture.
- *
- * Pass B is **planned, not shipped**: particles, light pools and shadows still
- * draw on the flat 2.5D pipeline, and @c TestOnly has no production caller today.
- * When it lands it must be submitted back-to-front, because blended fragments are
- * order-dependent - but it will not write depth, so translucent geometry never
- * occludes anything.
- *
- * Screen-space UI is not a pass here at all: it goes through the 2D primitives,
- * which take no @ref DepthMode.
+ * SelfLit supplies neutral ambient per batch. changing global ambient cannot safely
+ * replace it because SetAmbientColor flushes only the OpenGL 2D batch.
  */
 namespace renderModes
 {
 
-/// @brief How a draw's color combines with what is already in the target.
+/// How a draw's color combines with what is already in the target.
 enum class BlendMode
 {
-    /// Standard `src.a, 1 - src.a` compositing.
+    /// Standard src.a, 1 - src.a compositing.
     Alpha = 0,
-    /// `src.a, 1` accumulation for glows (fireflies, sparkles, light pools).
+    /// src.a, 1 accumulation for glows (fireflies, sparkles, light pools).
     Additive = 1
 };
 
-/// @brief How a draw interacts with the depth buffer.
+/// How a draw interacts with the depth buffer.
 enum class DepthMode
 {
-    /// Ignore depth entirely: no test, no write. The flat ground sheet, whose
-    /// layers are coplanar and must keep authored layer order.
+    /**
+     * @brief Ignore depth entirely: no test, no write.
+     *
+     * the flat ground sheet, whose layers are coplanar and must keep authored layer order.
+     */
     None = 0,
-    /// Test against existing depth but do not write. Reserved for translucent world
-    /// geometry, which must not occlude whatever is drawn after it; no caller yet.
+    /**
+     * @brief Test against existing depth but do not write.
+     *
+     * translucent world geometry, which must not occlude whatever is drawn after it.
+     */
     TestOnly = 1,
-    /// Test and write. Opaque (alpha-cutout) world geometry.
+    /// Test and write. opaque (alpha-cutout) world geometry.
     TestAndWrite = 2
 };
 
-/// @brief Number of entries in @ref BlendMode.
+/// Whether the scene's day/night ambient tints a draw.
+enum class LightMode
+{
+    /// Multiply the scene ambient into the sampled texel. world geometry.
+    Ambient = 0,
+    /// Ignore the scene ambient. particles and other self-lit artwork.
+    SelfLit = 1
+};
+
 inline constexpr std::size_t BLEND_MODE_COUNT = 2;
-/// @brief Number of entries in @ref DepthMode.
+
 inline constexpr std::size_t DEPTH_MODE_COUNT = 3;
 
+inline constexpr std::size_t LIGHT_MODE_COUNT = 2;
+
 /**
- * @brief Alpha below which a fragment is discarded in the opaque pass.
+ * @brief Alpha cutoff for opaque geometry.
  *
- * Pixel-art sprites have hard edges, so a mid-range cutoff cleanly separates
- * "solid" from "empty" without eating antialiased fringes. Comparable tile-map
- * tools cut at 0.9; Rift's artwork has less partial alpha around silhouettes, and
- * 0.5 keeps single-pixel details that 0.9 would erode.
+ * The 0.5 threshold preserves partially covered single-pixel edges.
  */
 inline constexpr float OPAQUE_ALPHA_CUTOFF = 0.5f;
 
 }  // namespace renderModes
 
-/// @brief Reflection for @ref renderModes::BlendMode (debug output, console).
 template <>
 struct EnumTraits<renderModes::BlendMode>
     : EnumTraitsBase<renderModes::BlendMode, EnumTraits<renderModes::BlendMode>>
@@ -94,7 +91,6 @@ struct EnumTraits<renderModes::BlendMode>
     static constexpr std::string_view Names[] = {"Alpha", "Additive"};
 };
 
-/// @brief Reflection for @ref renderModes::DepthMode (debug output, console).
 template <>
 struct EnumTraits<renderModes::DepthMode>
     : EnumTraitsBase<renderModes::DepthMode, EnumTraits<renderModes::DepthMode>>
@@ -103,7 +99,17 @@ struct EnumTraits<renderModes::DepthMode>
     static constexpr std::string_view Names[] = {"None", "TestOnly", "TestAndWrite"};
 };
 
+template <>
+struct EnumTraits<renderModes::LightMode>
+    : EnumTraitsBase<renderModes::LightMode, EnumTraits<renderModes::LightMode>>
+{
+    static constexpr std::size_t Count = renderModes::LIGHT_MODE_COUNT;
+    static constexpr std::string_view Names[] = {"Ambient", "SelfLit"};
+};
+
 static_assert(std::size(EnumTraits<renderModes::BlendMode>::Names) == renderModes::BLEND_MODE_COUNT,
               "renderModes::BlendMode names must stay in step with BLEND_MODE_COUNT");
 static_assert(std::size(EnumTraits<renderModes::DepthMode>::Names) == renderModes::DEPTH_MODE_COUNT,
               "renderModes::DepthMode names must stay in step with DEPTH_MODE_COUNT");
+static_assert(std::size(EnumTraits<renderModes::LightMode>::Names) == renderModes::LIGHT_MODE_COUNT,
+              "renderModes::LightMode names must stay in step with LIGHT_MODE_COUNT");
