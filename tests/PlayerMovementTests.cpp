@@ -1,6 +1,5 @@
-// Integration tests for momentum-based player movement: drives a real Tilemap +
-// a player ECS entity through PlayerSystem::Move (data paths only, no renderer /
-// WorldServices). Tile size is 16x16; feet positions are bottom-center anchored.
+// a real Tilemap and player entity exercise movement, collision, and release settling together.
+
 #include <gtest/gtest.h>
 
 #include <glm/glm.hpp>
@@ -19,7 +18,7 @@
 #include "../src/Tilemap.hpp"
 #include "../src/Transform.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 namespace
 {
@@ -38,8 +37,8 @@ float AlignedBottomY(float y)
 class PlayerMovementTest : public ::testing::Test
 {
 protected:
-    ecs::registry world;
-    ecs::entity player{};
+    entt::registry world;
+    entt::entity player = entt::null;
     Tilemap tilemap;
 
     void SetUp() override
@@ -53,7 +52,6 @@ protected:
 };
 }  // namespace
 
-// Holding right then releasing: the player glides to rest tile-aligned on both axes.
 TEST_F(PlayerMovementTest, GlideToRestLandsTileAligned)
 {
     PlayerSystem::SetPositionRaw(
@@ -81,7 +79,6 @@ TEST_F(PlayerMovementTest, GlideToRestLandsTileAligned)
     EXPECT_NEAR(pos.y, AlignedBottomY(pos.y), 0.6f);
 }
 
-// Releasing input does not stop the player on the same frame (momentum is felt).
 TEST_F(PlayerMovementTest, ReleaseDoesNotStopInstantly)
 {
     PlayerSystem::SetPositionRaw(
@@ -97,12 +94,11 @@ TEST_F(PlayerMovementTest, ReleaseDoesNotStopInstantly)
     EXPECT_TRUE(IsMoving());
 }
 
-// A solid wall to the right stops X movement and does not accumulate velocity.
 TEST_F(PlayerMovementTest, WallStopsMovementCleanly)
 {
     PlayerSystem::SetPositionRaw(
         world, player, glm::vec2(10.0f * TILE + 8.0f, 10.0f * TILE + 16.0f));
-    // Three-tile column so the middle tile is a flat-wall face (no slide-around escape).
+    // three wall tiles prevent sliding around the middle tile during this probe.
     tilemap.SetTileCollision(11, 9, true);
     tilemap.SetTileCollision(11, 10, true);
     tilemap.SetTileCollision(11, 11, true);
@@ -111,14 +107,13 @@ TEST_F(PlayerMovementTest, WallStopsMovementCleanly)
     {
         PlayerSystem::Move(world, player, glm::vec2(1.0f, 0.0f), DT, &tilemap, nullptr);
     }
-    // Player must not have passed into the solid tile column.
+
     EXPECT_LT(Pos().x, 11.0f * TILE);
-    // Velocity into the wall must not have built up.
+
     EXPECT_LT(std::abs(world.get<Motor>(player).velocity.x), 5.0f);
 }
 
-// Animation stays "moving" through the glide after input is released (velocity-driven),
-// unlike the old binary input-driven gate.
+// walking animation follows velocity through the release glide.
 TEST_F(PlayerMovementTest, AnimationFollowsVelocityNotInput)
 {
     PlayerSystem::SetPositionRaw(
@@ -155,8 +150,8 @@ TEST_F(PlayerMovementTest, InputCaptureStopClearsLatchedWalkAnimation)
     ASSERT_GT(glm::length(world.get<Motor>(player).velocity), 0.0f);
     ASSERT_NE(world.get<PlayerModes>(player).animationType, AnimationType::IDLE);
 
-    // Console input capture skips subsequent movement steps, while the cosmetic
-    // update continues. Its explicit stop must clear both sources of walk animation.
+    // console capture skips movement but still runs cosmetic updates; stop must clear both walk
+    // inputs.
     PlayerSystem::Stop(world, player);
     for (int i = 0; i < 60; ++i)
     {
@@ -173,18 +168,12 @@ TEST_F(PlayerMovementTest, InputCaptureStopClearsLatchedWalkAnimation)
     EXPECT_EQ(animation.walkSequenceIndex, 0);
 }
 
-// Regression: rounding a collision-box corner while holding a direction must not
-// stutter to a crawl ("jelly"). A perpendicular corner slide redirects the blocked
-// forward velocity into a productive move, so the motor must KEEP that velocity
-// instead of zeroing it as if pinned against a flat wall. If it is zeroed, the next
-// frames ramp the forward speed up from zero, the player drifts slowly back into the
-// corner, slides again, and re-zeros - the climb runs at roughly a third of full speed.
+// a perpendicular corner slide redirects forward motion. keep forward velocity
+// to avoid accelerating from rest again on each contact.
 TEST_F(PlayerMovementTest, CornerSlideRoundsAtFullSpeedNotJelly)
 {
-    // One solid tile with clear space above it: holding RIGHT, the player slides up and
-    // around the tile. Approach it from a couple tiles to the left (natural ramp + contact)
-    // so the player's resting feet land just shy of the wall - the geometry where, with the
-    // bug, an up-slide breaks contact and the player must drift slowly back in to re-engage.
+    // approach one solid tile from the left with clear space above, so held right
+    // input can slide around its corner.
     tilemap.SetTileCollision(15, 11, true);
     PlayerSystem::SetPositionRaw(
         world, player, glm::vec2(13.0f * TILE + 8.0f, 11.0f * TILE + 16.0f));
@@ -197,19 +186,15 @@ TEST_F(PlayerMovementTest, CornerSlideRoundsAtFullSpeedNotJelly)
     }
     const float forwardProgress = Pos().x - startX;
 
-    // Straight-line full speed over the window would be ~45 px; rounding the tile costs some
-    // of that to the upward slide. Measured: ~38 px with the fix, ~29 px with the jelly bug
-    // (forward velocity zeroed each slide). 33 px sits cleanly between the two.
+    // full-speed travel is about 45 px. a corner slide reaches about 38 px;
+    // resetting forward velocity gives about 29 px. the 33 px bound separates them.
     EXPECT_GT(forwardProgress, 33.0f);
 }
 
 TEST_F(PlayerMovementTest, LaneSnapCorrectionDoesNotBecomeDiagonalInput)
 {
-    // The player is moving RIGHT while a gentle lane correction nudges DOWN.
-    // The correction grazes the blocked tile's bottom-left corner. Cardinal
-    // collision intentionally permits that shallow diagonal-tile overlap; a
-    // second probe that reclassifies the correction as diagonal input rejects
-    // the exact same movement and leaves the player stuck in place.
+    // lane correction may graze a diagonal tile during cardinal movement. probing
+    // that correction as diagonal input would reject a permitted corner overlap.
     tilemap.SetTileCollision(6, 4, true);
     tilemap.SetCornerCutBlocked(6, 4, Tilemap::CORNER_BL, true);
     PlayerSystem::SetPositionRaw(world, player, glm::vec2(89.0f, 92.0f));
@@ -221,18 +206,16 @@ TEST_F(PlayerMovementTest, LaneSnapCorrectionDoesNotBecomeDiagonalInput)
     EXPECT_GT(Pos().y, before.y);
 }
 
-// A faster WALK (speed multiplier) advances the walk cycle in fewer frames than a
-// normal walk. This isolates *continuous* speed-linked cadence: both players are in the
-// WALK state, which the old binary cadence treats identically regardless of speed.
+// keep both players walking to isolate cadence changes from movement-state changes.
 TEST_F(PlayerMovementTest, FasterSpeedAnimatesQuicker)
 {
     auto framesForAdvances = [](float speedMult, int advances)
     {
-        ecs::registry w;
-        ecs::entity p = EntityStore::SpawnPlayer(w);
+        entt::registry w;
+        entt::entity p = EntityStore::SpawnPlayer(w);
         PlayerSystem::SetPositionRaw(w, p, glm::vec2(5.0f * TILE + 8.0f, 5.0f * TILE + 16.0f));
         w.get<PlayerModes>(p).speedMultiplier = speedMult;
-        // Warm up to steady-state speed so cadence (not the ramp) dominates.
+
         for (int i = 0; i < 180; ++i)
         {
             PlayerSystem::Move(w, p, glm::vec2(1.0f, 0.0f), DT, nullptr, nullptr);
@@ -255,8 +238,8 @@ TEST_F(PlayerMovementTest, FasterSpeedAnimatesQuicker)
         return frames;
     };
 
-    int normalFrames = framesForAdvances(1.0f, 8);  // ~50 px/s, WALK
-    int fastFrames = framesForAdvances(2.0f, 8);    // ~100 px/s, WALK
+    int normalFrames = framesForAdvances(1.0f, 8);  // ~50 px/s, walk state
+    int fastFrames = framesForAdvances(2.0f, 8);    // ~100 px/s, walk state
     EXPECT_LT(fastFrames, normalFrames);
 }
 
