@@ -14,20 +14,20 @@ body
 
 .mermaid-cell
 {
-  flex: 0 1 auto;  /* shrink-wrap = no gaps */
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
 }
 
 .mermaid-cell > .mermaid
 {
-  display: inline-block;  /* hug svg width */
+  display: inline-block;
 }
 
 .mermaid-cell > .mermaid > svg
 {
   display: block;
-  width: auto;      /* width follows aspect ratio */
-  max-width: 100%;  /* never overflow cell */
-  height: auto;     /* JS will set px height */
+  width: auto;
+  max-width: 100%;
+  height: auto;
 }
