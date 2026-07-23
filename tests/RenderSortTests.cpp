@@ -2,16 +2,13 @@
 
 #include "../src/RenderDrawable.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <vector>
 
-// Pure render-queue tests: no renderer is invoked. They lock the ordinary
-// Y-sort rules, structure-local support constraints, and the invariant that a
-// character contributes one atomic queue item.
-
+// the queue must treat each character as one atomic item while applying structure-local ordering.
 namespace
 {
 Drawable MakeEntity(float sortY,
@@ -62,9 +59,8 @@ TEST(RenderSort, LowerYDrawsFirst)
 
 TEST(RenderSort, EqualDepthTileSortsBeforeEntity)
 {
-    // At identical depth, higher tieBias draws first (TILE > entity), so a tile
-    // sorts ahead of an entity -> entity renders on top of terrain.
-    const Drawable tile = MakeTile(100.0f, /*ySortMinus=*/false);
+    // at equal depth, the tile's higher tieBias puts it first so the entity renders above it.
+    const Drawable tile = MakeTile(100.0f, false);
     const Drawable entity = MakeEntity(100.0f, TIE_PLAYER);
     EXPECT_TRUE(DrawableDepthLess(tile, entity));
     EXPECT_FALSE(DrawableDepthLess(entity, tile));
@@ -82,7 +78,7 @@ TEST(RenderSort, YSortMinusTileGetsHalfTileOffsetVsEntity)
 {
     // A ysortMinus tile anchored at Y=96 compares at 96+8=104, so an entity at
     // Y=100 sorts before it and the tile is drawn last (tile in front).
-    const Drawable tile = MakeTile(96.0f, /*ySortMinus=*/true);
+    const Drawable tile = MakeTile(96.0f, true);
     const Drawable entity = MakeEntity(100.0f, TIE_NPC);
     EXPECT_TRUE(DrawableDepthLess(entity, tile));
     EXPECT_FALSE(DrawableDepthLess(tile, entity));
@@ -103,8 +99,8 @@ TEST(RenderSort, FullSceneOrdersTileThenNpcThenPlayer)
 
 TEST(RenderSort, AddNpcDrawableIsAtomic)
 {
-    ecs::registry world;
-    const ecs::entity npc{};  // build path never dereferences the handle
+    entt::registry world;
+    const entt::entity npc = entt::null;  // build path never dereferences the handle
     std::vector<Drawable> list;
     AddNpcDrawable(
         list, world, npc, glm::vec2(40.0f, 200.0f), SupportSurface::Elevation, 10.0f, 7, TIE_NPC);
@@ -123,8 +119,8 @@ TEST(RenderSort, AddNpcDrawableIsAtomic)
 
 TEST(RenderSort, AddPlayerDrawableIsAtomic)
 {
-    ecs::registry world;
-    const ecs::entity player{};
+    entt::registry world;
+    const entt::entity player = entt::null;
     std::vector<Drawable> list;
     AddPlayerDrawable(
         list, world, player, glm::vec2(0.0f, 150.0f), SupportSurface::Ground, 0.0f, -1, TIE_PLAYER);
@@ -138,9 +134,8 @@ TEST(RenderSort, AddPlayerDrawableIsAtomic)
 
 TEST(RenderSort, ActorBesideRampPreservesForegroundYSortRule)
 {
-    // This mirrors the real ramp's bottom foreground Y-sort row: the actor and
-    // ramp share an authored anchor, but the actor's feet are outside region 7.
-    // Elevation metadata must not push the ramp 10px forward and cover the actor.
+    // the actor and ramp share an anchor, but the feet are outside support region 7;
+    // elevation must not shift the foreground tile's sorting depth.
     Drawable actor = MakeEntity(1760.0f, TIE_PLAYER);
     Drawable ramp = MakeTile(1760.0f, false, 10.0f, DrawablePhase::YSorted, 7, true);
 
