@@ -39,7 +39,7 @@ namespace
 HMODULE g_VulkanLib = nullptr;
 }  // namespace
 
-// Explicitly load vulkan-1.dll.
+// explicitly load vulkan-1.dll.
 static bool LoadVulkanLibrary()
 {
     g_VulkanLib = LoadLibraryA("vulkan-1.dll");
@@ -55,7 +55,7 @@ static bool LoadVulkanLibrary()
 
 namespace
 {
-// Validation layers are enabled only in debug builds (gated by NDEBUG).
+// Validation layers are enabled in debug builds.
 bool ShouldEnableValidationLayers()
 {
 #ifndef NDEBUG
@@ -66,7 +66,7 @@ bool ShouldEnableValidationLayers()
 }
 }  // namespace
 
-// Push constants layout shared by all Vulkan draw calls.
+// 2D push layout shared with Geometry shaders.
 struct CombinedPushConstants
 {
     glm::mat4 projection;    // 0-63
@@ -77,9 +77,7 @@ struct CombinedPushConstants
     glm::vec3 ambientColor;  // 160-171
     float spriteAlpha;       // 172-175
 };
-// This pins the block against the shader layout only. 176 bytes is above Vulkan's
-// guaranteed maxPushConstantsSize of 128, and the limit is never queried, so the backend
-// silently requires a device that advertises at least 176.
+// 176 bytes exceeds Vulkan's guaranteed 128-byte limit; the device limit is not queried.
 static_assert(sizeof(CombinedPushConstants) == 176,
               "CombinedPushConstants must be 176 bytes to match SPIR-V shader layout");
 
@@ -134,10 +132,6 @@ void VulkanRenderer::SetFontCandidates(const std::vector<std::string>& fontCandi
     m_FontCandidates = fontCandidates;
 }
 
-// Full renderer bring-up: load the Vulkan loader, then run the create-* steps in
-// dependency order (instance -> surface -> device -> swapchain -> render pass ->
-// pipeline -> resources -> font), and cache device info for GetBackendInfo. Every
-// step may throw; failures are caught here, logged, and reported as false.
 bool VulkanRenderer::Init()
 {
     try
@@ -157,15 +151,14 @@ bool VulkanRenderer::Init()
         CreateLogicalDevice();
         CreateSwapchain();
         CreateImageViews();
-        // Depth resources first: CreateRenderPass needs m_DepthFormat, and
-        // CreateFramebuffers needs m_DepthImageView.
+        // Depth format and view must exist before render-pass and framebuffer creation.
         CreateDepthResources();
         CreateRenderPass();
         CreateGraphicsPipeline();
         CreatePipeline3D();
         CreateFramebuffers();
         CreateCommandPool();
-        // Shared fence must exist before the first upload.
+        // Create the transfer fence before uploads.
         CreateSyncObjects();
         CreateBuffers();
         CreateDescriptorPool();
@@ -237,10 +230,6 @@ RendererInfo VulkanRenderer::GetBackendInfo() const
     return m_Info;
 }
 
-// Tear down every Vulkan object in reverse creation order after idling the device.
-// Safe to call more than once (guards on m_Device / m_Instance) and tolerant of a
-// lost device. Releases resources owned by uploaded Texture objects first, since
-// they must outlive neither the device nor this teardown.
 void VulkanRenderer::Shutdown()
 {
     if (m_Device != VK_NULL_HANDLE)
@@ -249,7 +238,7 @@ void VulkanRenderer::Shutdown()
         VkResult waitResult = vkDeviceWaitIdle(m_Device);
         if (waitResult != VK_SUCCESS && waitResult != VK_ERROR_DEVICE_LOST)
         {
-            // Device may already be lost/invalid; continue cleanup anyway.
+            // Continue destruction even if the device is lost.
             Logger::WarnF(
                 LOG_SUBSYSTEM, "vkDeviceWaitIdle failed: {}", static_cast<int>(waitResult));
         }
@@ -263,8 +252,7 @@ void VulkanRenderer::Shutdown()
             }
         }
 
-        // Release Vulkan resources owned by uploaded Texture objects. Must run
-        // before destroying the device.
+        // Release uploaded texture resources before their device.
         for (const Texture* tex : m_UploadedTextures)
         {
             if (tex)
@@ -275,8 +263,7 @@ void VulkanRenderer::Shutdown()
         m_UploadedTextures.clear();
         m_UploadedTextureSet.clear();
 
-        // Cache only holds non-owning references; DestroyVulkanTexture above
-        // already released the owned resources.
+        // Cache handles are borrowed; owning textures were released above.
         m_TextureCache.clear();
 
         if (m_TextureSampler != VK_NULL_HANDLE)
@@ -321,7 +308,7 @@ void VulkanRenderer::Shutdown()
             vkFreeMemory(m_Device, m_WhiteTextureImageMemory, nullptr);
         }
 
-        // Skip glyphs that use the white texture as fallback (avoid double-destroy).
+        // Shared white views are borrowed by empty glyphs.
         for (auto& [c, glyph] : m_Glyphs)
         {
             if (glyph.imageView != VK_NULL_HANDLE && glyph.imageView != m_WhiteTextureImageView)
@@ -419,7 +406,7 @@ void VulkanRenderer::Shutdown()
             }
             if (m_Vertex3DMemories[i] != VK_NULL_HANDLE)
             {
-                // Persistently mapped; freeing the memory implicitly unmaps it.
+                // Freeing persistently mapped memory also unmaps it.
                 vkFreeMemory(m_Device, m_Vertex3DMemories[i], nullptr);
                 m_Vertex3DMemories[i] = VK_NULL_HANDLE;
                 m_Vertex3DMapped[i] = nullptr;
@@ -466,7 +453,7 @@ void VulkanRenderer::Shutdown()
 }
 
 // Destroy the swapchain-derived objects (framebuffers, image views, and the
-// swapchain itself) ahead of a resize-driven recreate. Leaves the device intact.
+// swapchain itself) ahead of a resize-driven recreate. leaves the device intact.
 void VulkanRenderer::CleanupSwapchain()
 {
     DestroyDepthResources();
@@ -493,9 +480,6 @@ void VulkanRenderer::CleanupSwapchain()
     m_ImagesInFlight.clear();
 }
 
-// Rebuild the swapchain and its dependents after a resize or out-of-date result.
-// Blocks while the window is minimized (zero-size), idles the device, then recreates
-// swapchain + image views + framebuffers.
 void VulkanRenderer::RecreateSwapchain()
 {
     int width = 0, height = 0;
@@ -514,19 +498,15 @@ void VulkanRenderer::RecreateSwapchain()
 
     CreateSwapchain();
     CreateImageViews();
-    // The depth image is sized to the swapchain extent, so it is recreated with
-    // it. The render pass and pipelines survive: the depth FORMAT is unchanged,
-    // and only the attachment's dimensions moved.
+    // Resize depth storage with the swapchain; unchanged format permits pipeline reuse.
     CreateDepthResources();
     CreateFramebuffers();
 
     m_FramebufferResized = false;
 }
 
-// Create the VkInstance with the GLFW-required extensions and, in debug builds, the
-// validation layers plus a pNext-chained debug-messenger create-info. No persistent
-// messenger is created, so that callback covers instance creation and destruction only -
-// runtime validation messages go to the layer's default output, not to Logger.
+// The temporary debug callback covers instance creation/destruction only.
+// Runtime validation uses the layer's default output.
 void VulkanRenderer::CreateInstance()
 {
     VkApplicationInfo appInfo{};
@@ -590,14 +570,14 @@ void VulkanRenderer::CreateInstance()
     VK_CHECK(vkCreateInstance(&createInfo, nullptr, &m_Instance));
 }
 
-// Create the window surface rendered into. Platform-specific, so it is delegated to GLFW.
+// Create the window surface rendered into. platform-specific, so it is delegated to GLFW.
 void VulkanRenderer::CreateSurface()
 {
     VK_CHECK(glfwCreateWindowSurface(m_Instance, m_Window, nullptr, &m_Surface));
 }
 
 // Select the first GPU that exposes both a graphics queue family and a queue that
-// can present to the surface, recording those family indices. Throws if none fits.
+// can present to the surface, recording those family indices. throws if none fits.
 void VulkanRenderer::PickPhysicalDevice()
 {
     uint32_t deviceCount = 0;
@@ -701,9 +681,6 @@ void VulkanRenderer::CreateLogicalDevice()
     vkGetDeviceQueue(m_Device, m_PresentFamily, 0, &m_PresentQueue);
 }
 
-// Create the swapchain: prefer B8G8R8A8_UNORM (to match OpenGL's non-sRGB output)
-// and an uncapped present mode (IMMEDIATE > MAILBOX > FIFO) so app-side FPS limiting
-// works, sized to the current framebuffer. Retrieves the swapchain images.
 void VulkanRenderer::CreateSwapchain()
 {
     VkSurfaceCapabilitiesKHR capabilities;
@@ -721,8 +698,7 @@ void VulkanRenderer::CreateSwapchain()
     VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(
         m_PhysicalDevice, m_Surface, &formatCount, formats.data()));
 
-    // Prefer UNORM to match OpenGL's non-gamma-corrected output (SRGB would
-    // apply gamma correction and make textures appear brighter).
+    // Unorm matches OpenGL output without another gamma conversion.
     VkSurfaceFormatKHR surfaceFormat = formats[0];
     for (const auto& availableFormat : formats)
     {
@@ -745,9 +721,7 @@ void VulkanRenderer::CreateSwapchain()
     VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(
         m_PhysicalDevice, m_Surface, &presentModeCount, presentModes.data()));
 
-    // Prefer uncapped presentation so app-side FPS limiting can work.
-    // Fallback order: IMMEDIATE (no vsync, may tear) -> MAILBOX (low-latency
-    // vsync) -> FIFO (always supported, vsync).
+    // Prefer immediate, then mailbox, then FIFO for application fps limiting.
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     for (const auto& availablePresentMode : presentModes)
     {
@@ -859,9 +833,7 @@ void VulkanRenderer::CreateImageViews()
     }
 }
 
-// Choose the best supported depth format. D32_SFLOAT first: 32 bits of float depth
-// costs the same bandwidth as D24S8 on modern hardware and avoids the precision
-// cliff a 24-bit integer format hits when the camera dollies out.
+// Prefer floating-point depth for distant-camera precision.
 VkFormat VulkanRenderer::FindDepthFormat() const
 {
     const VkFormat candidates[] = {
@@ -877,8 +849,7 @@ VkFormat VulkanRenderer::FindDepthFormat() const
         }
     }
 
-    // Guaranteed by the spec to be supported as a depth attachment, so this is a
-    // real fallback rather than a failure path.
+    // D16_UNORM is the required fallback.
     return VK_FORMAT_D16_UNORM;
 }
 
@@ -928,9 +899,7 @@ void VulkanRenderer::CreateDepthResources()
 
     VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &m_DepthImageView));
 
-    // No explicit layout transition: the render pass declares initialLayout
-    // UNDEFINED and its CLEAR load op writes every texel, so the first use
-    // inside the pass performs the transition.
+    // The render pass clears from undefined, which performs the initial transition.
 }
 
 void VulkanRenderer::DestroyDepthResources()
@@ -952,11 +921,6 @@ void VulkanRenderer::DestroyDepthResources()
     }
 }
 
-// Create the single-subpass render pass shared by the 2D and world-space paths: two
-// attachments (0 = color, cleared on load and stored as PRESENT_SRC; 1 = depth, cleared
-// on load and DONT_CARE on store so a tiler can discard it) and one VK_SUBPASS_EXTERNAL
-// dependency covering both the color-output and early-fragment-test stages.
-// Requires m_DepthFormat, so CreateDepthResources() must run first.
 void VulkanRenderer::CreateRenderPass()
 {
     VkAttachmentDescription attachments[2]{};
@@ -997,8 +961,7 @@ void VulkanRenderer::CreateRenderPass()
     subpass.pColorAttachments = &colorAttachmentRef;
     subpass.pDepthStencilAttachment = &depthAttachmentRef;
 
-    // The dependency now has to cover the depth attachment as well as color,
-    // hence the early/late fragment-test stages and the depth write access bit.
+    // The dependency covers color output and depth tests/writes.
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
@@ -1022,12 +985,6 @@ void VulkanRenderer::CreateRenderPass()
     VK_CHECK(vkCreateRenderPass(m_Device, &renderPassInfo, nullptr, &m_RenderPass));
 }
 
-// Build the one graphics pipeline shared by every 2D draw: the SpriteVertex input
-// layout (pos + uv), alpha blending, dynamic viewport/scissor (for the Y-flip), the
-// combined 176-byte push-constant range, and a single descriptor set layout
-// (set 0, binding 0 = combined image sampler, fragment stage). All per-draw data
-// travels in push constants; this backend has no uniform buffer. Loads the SPIR-V
-// shaders and throws if they are missing or the pipeline fails to create.
 void VulkanRenderer::CreateGraphicsPipeline()
 {
     Logger::Debug(LOG_SUBSYSTEM, "CreateGraphicsPipeline() step 1: Starting...");
@@ -1112,12 +1069,6 @@ void VulkanRenderer::CreateGraphicsPipeline()
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
 
-    // Push constants for matrices and uniforms.
-    // Vertex: mat4 projection (0..63), mat4 model (64..127).
-    // Fragment: vec3 spriteColor (128..139), float useColorOnly (140..143),
-    // vec4 colorOnly (144..159), vec3 ambientColor (160..171),
-    // float spriteAlpha (172..175). vec4 needs 16-byte alignment.
-    // See CombinedPushConstants for the canonical layout (sizeof = 176).
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstantRange.offset = 0;
@@ -1204,10 +1155,7 @@ void VulkanRenderer::CreateGraphicsPipeline()
     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    // Required now that the subpass has a depth attachment: a pipeline used with
-    // such a subpass may not leave pDepthStencilState null. The 2D sprite path is
-    // screen-space UI and must keep ignoring depth entirely, so everything here
-    // is disabled - this is a compliance requirement, not a behavior change.
+    // The depth attachment requires a depth-state object; 2D draws disable both test and write.
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = VK_FALSE;
@@ -1287,13 +1235,7 @@ void VulkanRenderer::CreateGraphicsPipeline()
     Logger::Debug(LOG_SUBSYSTEM, "CreateGraphicsPipeline() complete!");
 }
 
-// Build the world-space Geometry3D pipelines - one per (DepthMode, BlendMode)
-// combination, because Vulkan bakes both into the pipeline object rather than
-// exposing them as dynamic state on a baseline device.
-//
-// Failure here is non-fatal and deliberately so: the 2D path is untouched and
-// fully functional, so a missing Geometry3D.spv degrades to "world does not draw
-// on Vulkan" with a clear log line, rather than refusing to start the game.
+// Geometry3D failure disables world draws while keeping 2D rendering available.
 void VulkanRenderer::CreatePipeline3D()
 {
     const std::vector<uint32_t> vertCode = VulkanShader::LoadSPIRV("shaders/Geometry3D.vert.spv");
@@ -1306,9 +1248,7 @@ void VulkanRenderer::CreatePipeline3D()
         return;
     }
 
-    // Reuses the 2D m_DescriptorSetLayout (set 0, binding 0 = combined image
-    // sampler), so both paths share one descriptor cache. Only the push-constant
-    // range differs: Push3D is 80 bytes against CombinedPushConstants' 176.
+    // Share the 2D sampler layout and descriptor cache; only the push range differs.
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushRange.offset = 0;
@@ -1374,10 +1314,7 @@ void VulkanRenderer::CreatePipeline3D()
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    // No back-face culling: billboards are viewed from both sides as the camera
-    // orbits past them, and ground quads flip winding under the Y-flipped
-    // viewport. Pokemon DS Map Studio disables culling in its map view for the
-    // same reason.
+    // Disable culling for two-sided billboards and Y-flipped ground winding.
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.depthClampEnable = VK_FALSE;
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
@@ -1494,9 +1431,7 @@ void VulkanRenderer::CreateFramebuffers()
 
     for (size_t i = 0; i < m_SwapchainImageViews.size(); i++)
     {
-        // One depth buffer shared by every swapchain framebuffer. Safe because
-        // rendering is serialized on a single queue and the depth contents never
-        // outlive the frame that cleared them.
+        // One graphics queue serializes shared depth storage; depth is discarded each frame.
         VkImageView attachments[] = {m_SwapchainImageViews[i], m_DepthImageView};
 
         VkFramebufferCreateInfo framebufferInfo{};
@@ -1524,10 +1459,6 @@ void VulkanRenderer::CreateCommandPool()
     VK_CHECK(vkCreateCommandPool(m_Device, &poolInfo, nullptr, &m_CommandPool));
 }
 
-// Allocate one primary command buffer per swapchain framebuffer. Note the index domains
-// differ: every recording site uses m_CurrentFrame (0..MAX_FRAMES_IN_FLIGHT-1), so any
-// surplus buffers are never recorded. RecreateSwapchain does not run this, so the vector
-// keeps its Init-time size even when the new swapchain reports a different image count.
 void VulkanRenderer::CreateCommandBuffers()
 {
     m_CommandBuffers.resize(m_SwapchainFramebuffers.size());
@@ -1541,9 +1472,6 @@ void VulkanRenderer::CreateCommandBuffers()
     VK_CHECK(vkAllocateCommandBuffers(m_Device, &allocInfo, m_CommandBuffers.data()));
 }
 
-// Create the per-frame-in-flight sync objects (image-available and render-finished
-// semaphores, in-flight fences created signaled) plus the transfer fence used for
-// synchronous buffer/image uploads.
 void VulkanRenderer::CreateSyncObjects()
 {
     m_ImageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
@@ -1566,16 +1494,13 @@ void VulkanRenderer::CreateSyncObjects()
         VK_CHECK(vkCreateFence(m_Device, &fenceInfo, nullptr, &m_InFlightFences[i]));
     }
 
-    // Transfer fence for synchronous buffer and image uploads. Not created SIGNALED,
+    // Transfer fence for synchronous buffer and image uploads. not created signaled,
     // because it is reset before each use.
     VkFenceCreateInfo transferFenceInfo{};
     transferFenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VK_CHECK(vkCreateFence(m_Device, &transferFenceInfo, nullptr, &m_TransferFence));
 }
 
-// Destroy and recreate one frame's image-available semaphore. Needed after an
-// acquire returns OUT_OF_DATE/error with a pending signal, since reusing such a
-// semaphore on the next acquire is illegal (VUID-...-semaphore-01779).
 void VulkanRenderer::RecreateImageAvailableSemaphore(size_t frame)
 {
     if (frame >= m_ImageAvailableSemaphores.size() || m_Device == VK_NULL_HANDLE)
@@ -1702,19 +1627,13 @@ std::vector<const char*> VulkanRenderer::GetRequiredExtensions()
     return extensions;
 }
 
-// Start a frame: reset per-frame batch and 3D-bind state, wait on the in-flight fence,
-// and acquire the next swapchain image (recreating the swapchain on OUT_OF_DATE). Then
-// begin the command buffer + render pass and bind the pipeline with a Y-flipped dynamic
-// viewport (to match OpenGL's coordinate space).
 void VulkanRenderer::BeginFrame()
 {
     m_FrameActive = false;
 
     m_CurrentVertexCount = 0;
     m_Current3DVertexCount = 0;
-    // Pipeline bindings do not survive a command buffer, so the cached "already
-    // bound" handle must be cleared or the first 3D draw of the frame would skip
-    // its bind and inherit the 2D pipeline.
+    // Clear cached bindings because command-buffer state does not persist across frames.
     m_Bound3DPipeline = VK_NULL_HANDLE;
     m_BatchImageView = VK_NULL_HANDLE;
     m_BatchDescriptorSet = VK_NULL_HANDLE;
@@ -1744,10 +1663,7 @@ void VulkanRenderer::BeginFrame()
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
     {
-        // vkAcquireNextImageKHR may have signaled the semaphore before
-        // returning OUT_OF_DATE. Using a semaphore with a pending signal on
-        // the next acquire is illegal (VUID-...-semaphore-01779), so recreate
-        // it before recovering the swapchain.
+        // An out-of-date acquire can leave a pending signal; replace the semaphore before retrying.
         RecreateImageAvailableSemaphore(m_CurrentFrame);
         RecreateSwapchain();
         return;
@@ -1757,7 +1673,7 @@ void VulkanRenderer::BeginFrame()
         Logger::ErrorF(LOG_SUBSYSTEM,
                        "Failed to acquire swapchain image! Result: {}",
                        static_cast<int>(result));
-        // Semaphore state is ambiguous after an error - recreate.
+        // Replace the semaphore after an ambiguous acquire error.
         RecreateImageAvailableSemaphore(m_CurrentFrame);
         return;
     }
@@ -1823,7 +1739,7 @@ void VulkanRenderer::BeginFrame()
     renderPassInfo.renderArea.offset = {0, 0};
     renderPassInfo.renderArea.extent = m_SwapchainExtent;
 
-    // One clear value per attachment, in attachment order. Depth clears to 1.0
+    // One clear value per attachment, in attachment order. depth clears to 1.0
     // (the far plane) so LESS_OR_EQUAL accepts the first fragment at any depth.
     VkClearValue clearValues[2]{};
     clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
@@ -1840,13 +1756,8 @@ void VulkanRenderer::BeginFrame()
         vkCmdBindPipeline(
             m_CommandBuffers[m_CurrentFrame], VK_PIPELINE_BIND_POINT_GRAPHICS, m_GraphicsPipeline);
 
-        // Dynamic viewport with Y-flip to match OpenGL. Uses VK_KHR_maintenance1
-        // behavior (core in Vulkan 1.1+): negative height flips Y.
-        //
-        // Neither precondition is declared: CreateInstance requests apiVersion 1.0 and
-        // CreateLogicalDevice enables only VK_KHR_SWAPCHAIN. The flip therefore relies on
-        // de-facto driver behavior and trips VUID-VkViewport-height-01773 under the
-        // validation layers on a strict 1.0 device.
+        // Negative viewport height requires Vulkan 1.1 or VK_KHR_maintenance1;
+        // Instance/device creation does not declare either requirement.
         VkViewport viewport{};
         viewport.x = 0.0f;
         viewport.y = static_cast<float>(m_SwapchainExtent.height);
@@ -1871,21 +1782,15 @@ void VulkanRenderer::BeginFrame()
 // renders straight to the swapchain with no bloom/grading/vignette/grain.
 void VulkanRenderer::BeginScene()
 {
-    // Vulkan Post-FX is a later phase - the path currently renders directly
-    // to swapchain without bloom/grading/vignette/grain. The `postfx` console
-    // command still toggles the flag; Vulkan users see the unprocessed scene.
+    // Vulkan draws directly to the swapchain; PostFX controls have no effect.
 }
 
 // PostFX composite hook. No-op on Vulkan for now (see BeginScene).
-void VulkanRenderer::EndSceneApplyPostFX(const PostFXParams& /*params*/)
+void VulkanRenderer::EndSceneApplyPostFX(const PostFXParams&)
 {
     // No-op: see BeginScene() comment.
 }
 
-// Finish the frame: flush the pending sprite batch, end the render pass and command
-// buffer, submit (waiting on image-available, signaling render-finished), present,
-// and advance the frame index. Recreates the swapchain on resize/out-of-date and
-// recovers the sync objects on any mid-submit failure so the next frame can proceed.
 void VulkanRenderer::EndFrame()
 {
     if (!m_FrameActive)
@@ -1903,8 +1808,7 @@ void VulkanRenderer::EndFrame()
     if (m_CurrentFrame >= m_CommandBuffers.size())
     {
         Logger::Error(LOG_SUBSYSTEM, "CurrentFrame out of bounds in EndFrame!");
-        // BeginFrame signaled image-available. Bailing out without submitting leaves that
-        // signal unconsumed, which makes the next acquire on the same slot illegal.
+        // A skipped submit leaves the acquired semaphore signal unconsumed.
         RecreateImageAvailableSemaphore(m_CurrentFrame);
         m_FrameActive = false;
         return;
@@ -1967,9 +1871,8 @@ void VulkanRenderer::EndFrame()
         Logger::ErrorF(LOG_SUBSYSTEM,
                        "Failed to submit command buffer! Result: {}",
                        static_cast<int>(submitResult));
-        // vkResetFences succeeded but submit failed: fence is unsignaled with
-        // no work to signal it. Next BeginFrame would block forever on
-        // vkWaitForFences. Destroy+recreate as signaled so the next frame can proceed.
+        // A failed submit leaves the reset fence unsignaled; recreate it signaled to avoid a
+        // deadlock.
         if (m_InFlightFences[m_CurrentFrame] != VK_NULL_HANDLE)
         {
             vkDestroyFence(m_Device, m_InFlightFences[m_CurrentFrame], nullptr);
@@ -2037,17 +1940,13 @@ void VulkanRenderer::SetViewport(int x, int y, int width, int height)
     }
 }
 
-// Set the projection matrix for subsequent draws. The FlushSpriteBatch call is the
-// structural mirror of the OpenGL path (projection is a push constant, so a real
-// batch could not span a change); here it is inert, because SubmitQuad copies
-// m_Projection into each quad's push constants and draws it on the spot.
 void VulkanRenderer::SetProjection(const glm::mat4& projection)
 {
     FlushSpriteBatch();
     m_Projection = projection;
 }
 
-// World-space 3D draw. Records one draw per quad, matching how every other
+// World-space 3D draw. records one draw per quad, matching how every other
 // Vulkan draw path here works (SubmitQuad does the same for 2D).
 void VulkanRenderer::DrawQuad3D(const Texture& texture,
                                 const glm::vec3 corners[4],
@@ -2058,7 +1957,8 @@ void VulkanRenderer::DrawQuad3D(const Texture& texture,
                                 renderModes::DepthMode depth,
                                 bool flipY,
                                 bool tileFlipX,
-                                bool tileFlipY)
+                                bool tileFlipY,
+                                renderModes::LightMode light)
 {
     if (!m_FrameActive || m_Pipeline3DLayout == VK_NULL_HANDLE)
     {
@@ -2141,7 +2041,7 @@ void VulkanRenderer::DrawQuad3D(const Texture& texture,
                         color.a};
     };
 
-    // Two triangles: (TL, BR, BL) and (TL, TR, BR) - same winding as OpenGL.
+    // Two triangles: (tl, br, bl) and (tl, tr, br) - same winding as OpenGL.
     const Vertex3D vertices[6] = {
         makeVertex(0),
         makeVertex(2),
@@ -2161,9 +2061,6 @@ void VulkanRenderer::DrawQuad3D(const Texture& texture,
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         m_Bound3DPipeline = pipeline;
 
-        // Viewport/scissor are dynamic state and belong to the command buffer,
-        // not the pipeline, so they survive the rebind - but the Y-flip must be
-        // re-applied because BeginFrame set it before any 3D pipeline existed.
         VkViewport viewport{};
         viewport.x = 0.0f;
         viewport.y = static_cast<float>(m_SwapchainExtent.height);
@@ -2181,10 +2078,10 @@ void VulkanRenderer::DrawQuad3D(const Texture& texture,
 
     Push3D push{};
     push.viewProjection = m_ViewProjection;
-    push.ambientColor = m_AmbientColor;
-    // Only the depth-writing pass cuts out. A discarded fragment writes no depth,
-    // which is what removes the need to sort opaque geometry; the translucent
-    // pass must keep partially transparent texels and so drops only empty ones.
+    // Neutral ambient preserves self-lit artwork at night.
+    push.ambientColor =
+        (light == renderModes::LightMode::SelfLit) ? glm::vec3(1.0f) : m_AmbientColor;
+    // Only opaque depth-writing draws use the hard alpha cutoff.
     push.alphaCutoff = (depth == renderModes::DepthMode::TestAndWrite)
                            ? renderModes::OPAQUE_ALPHA_CUTOFF
                            : (1.0f / 255.0f);
@@ -2216,14 +2113,9 @@ void VulkanRenderer::DrawQuad3D(const Texture& texture,
 // Store the world matrix, corrected for Vulkan's clip space.
 void VulkanRenderer::SetViewProjection(const glm::mat4& viewProjection)
 {
-    // cameraRig builds GL-convention matrices, whose clip-space Z spans [-w, w].
-    // Vulkan expects [0, w], so without this remap everything nearer than the
-    // midpoint of the depth range would be clipped away. Y is deliberately not
-    // flipped here - the negative-height dynamic viewport already handles that,
-    // and doing it twice would invert the world.
+    // Remap GL clip Z from [-w, w] to Vulkan [0, w]. The viewport already flips Y.
     //
     //     Z_vk = (Z_gl + W) / 2
-    //
     glm::mat4 clipCorrection(1.0f);
     clipCorrection[2][2] = 0.5f;
     clipCorrection[3][2] = 0.5f;
@@ -2250,10 +2142,6 @@ void VulkanRenderer::BuildQuadVertices(SpriteVertex outVertices[6],
     outVertices[5] = {{corners[2].x, corners[2].y}, {texCoords[2].x, texCoords[2].y}};
 }
 
-// Append one quad's six vertices to this frame's vertex buffer and record an
-// immediate 6-vertex draw with the given color/alpha/color-only push constants.
-// Returns false if there is no active frame or the
-// vertex buffer is full.
 bool VulkanRenderer::SubmitQuad(VkDescriptorSet descriptorSet,
                                 const SpriteVertex vertices[6],
                                 glm::vec3 spriteColor,
@@ -2272,10 +2160,7 @@ bool VulkanRenderer::SubmitQuad(VkDescriptorSet descriptorSet,
     SpriteVertex* mapped = static_cast<SpriteVertex*>(m_VertexBuffersMapped[m_CurrentFrame]);
     memcpy(&mapped[m_CurrentVertexCount], vertices, sizeof(SpriteVertex) * 6);
 
-    // A 3D draw earlier in this frame left one of the Geometry3D pipelines bound.
-    // Pipeline binding is command-buffer state, so the 2D path must claim it back
-    // before recording - otherwise UI would be rasterized with the world's vertex
-    // layout and depth state.
+    // Reclaim the 2D pipeline after world geometry before recording UI vertices.
     if (m_Bound3DPipeline != VK_NULL_HANDLE && m_GraphicsPipeline != VK_NULL_HANDLE)
     {
         vkCmdBindPipeline(
@@ -2291,10 +2176,7 @@ bool VulkanRenderer::SubmitQuad(VkDescriptorSet descriptorSet,
     pc.useColorOnly = useColorOnly ? 1.0f : 0.0f;
     pc.colorOnly = colorOnly;
     pc.spriteAlpha = spriteAlpha;
-    // Particles and sky elements (applyAmbient=false) keep their own color
-    // instead of being tinted by the day/night ambient, matching the OpenGL
-    // particle batch (which draws them with per-vertex color only). Without
-    // this, fog/smoke/stars darken to grey as the ambient dims through the day.
+    // Self-lit particles and sky bypass day/night ambient.
     pc.ambientColor = applyAmbient ? m_AmbientColor : glm::vec3(1.0f);
 
     VkCommandBuffer commandBuffer = m_CommandBuffers[m_CurrentFrame];
@@ -2341,10 +2223,6 @@ void VulkanRenderer::DrawSprite(
         false);
 }
 
-// Draw a sub-rectangle of a texture as an (optionally rotated/mirrored) sprite. The
-// main tile/sprite workhorse: normalizes the pixel region to UVs (with optional
-// stb-style Y-flip), applies per-tile mirror as flip-then-rotate, and submits the
-// quad. Falls back to the white texture if the texture has not been uploaded yet.
 void VulkanRenderer::DrawSpriteRegion(const Texture& texture,
                                       glm::vec2 position,
                                       glm::vec2 size,
@@ -2378,10 +2256,7 @@ void VulkanRenderer::DrawSpriteRegion(const Texture& texture,
         return;
     }
 
-    // Vulkan image view for the texture (white texture as fallback). Uploads
-    // must happen outside a frame - callers call UploadTexture() at load
-    // time. A cache miss here renders white rather than stalling the graphics
-    // queue mid-render-pass.
+    // Missing uploads use white; uploads must occur outside the render pass.
     VkImageView imageView = m_WhiteTextureImageView;
     VkImageView texImageView = texture.GetVulkanImageView();
     if (texImageView != VK_NULL_HANDLE)
@@ -2425,8 +2300,7 @@ void VulkanRenderer::DrawSpriteRegion(const Texture& texture,
         vBottom = texY + texH;
     }
 
-    // Per-tile mirror: swap UV before rotation so the composition is
-    // flip-then-rotate (geometrically correct order for reflections).
+    // Swap UVs before rotating to preserve flip-then-rotate composition.
     if (tileFlipX)
     {
         std::swap(u0, u1);
@@ -2436,7 +2310,7 @@ void VulkanRenderer::DrawSpriteRegion(const Texture& texture,
         std::swap(vTop, vBottom);
     }
 
-    // Top-left gets vBottom to match OpenGL's inverted V (V=0 at bottom).
+    // Top-left uses vBottom to match OpenGL texture orientation.
     glm::vec2 texCoords[4] = {
         {u0, vBottom},  // Top-left (matches OpenGL)
         {u1, vBottom},  // Top-right
@@ -2463,9 +2337,7 @@ void VulkanRenderer::DrawSpriteAlpha(const Texture& texture,
                                      glm::vec4 color,
                                      bool additive)
 {
-    // TODO(vulkan): Implement additive blending via a second VkPipeline with
-    // VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE. Flush and
-    // switch pipelines when the additive flag changes, mirroring OpenGL behavior.
+    // TODO: add an additive 2D pipeline and select it when the blend flag changes.
     (void)additive;
 
     if (!m_FrameActive)
@@ -2515,8 +2387,7 @@ void VulkanRenderer::DrawSpriteAtlas(const Texture& texture,
                                      glm::vec4 color,
                                      bool additive)
 {
-    // TODO(vulkan): Implement additive blending via a second VkPipeline.
-    // See DrawSpriteAlpha TODO for details.
+    // TODO: select an additive 2D pipeline when requested.
     (void)additive;
 
     if (!m_FrameActive)
@@ -2554,15 +2425,14 @@ void VulkanRenderer::DrawSpriteAtlas(const Texture& texture,
         corners[i] += position;
     SpriteVertex vertices[6];
     BuildQuadVertices(vertices, corners, texCoords);
-    // Atlas draws are particles (ParticleSystem) and sky elements (SkyRenderer),
-    // both self-lit: skip the ambient tint so they don't darken with daytime.
+    // Atlas particles and sky are self-lit.
     SubmitQuad(descriptorSet,
                vertices,
                glm::vec3(color.r, color.g, color.b),
                color.a,
-               /*useColorOnly=*/false,
-               /*colorOnly=*/glm::vec4(0.0f),
-               /*applyAmbient=*/false);
+               false,
+               glm::vec4(0.0f),
+               false);
 }
 
 // Draw a solid-color rectangle (no texture) via the white texture and the shader's
@@ -2572,8 +2442,7 @@ void VulkanRenderer::DrawColoredRect(glm::vec2 position,
                                      glm::vec4 color,
                                      bool additive)
 {
-    // TODO(vulkan): Implement additive blending via a second VkPipeline.
-    // See DrawSpriteAlpha TODO for details.
+    // TODO: select an additive 2D pipeline when requested.
     (void)additive;
     if (!m_FrameActive)
         return;
@@ -2601,9 +2470,6 @@ void VulkanRenderer::DrawColoredRect(glm::vec2 position,
     SubmitQuad(descriptorSet, vertices, glm::vec3(1.0f), 1.0f, true, color);
 }
 
-// Return the combined-image-sampler descriptor set for an image view, creating and
-// caching it on first use. Spills into an overflow descriptor pool when the main pool
-// is exhausted. Returns VK_NULL_HANDLE on a null view or allocation failure.
 VkDescriptorSet VulkanRenderer::GetOrCreateDescriptorSet(VkImageView imageView)
 {
     if (imageView == VK_NULL_HANDLE || m_DescriptorPool == VK_NULL_HANDLE)
@@ -2703,16 +2569,6 @@ VkDescriptorSet VulkanRenderer::GetOrCreateDescriptorSet(VkImageView imageView)
     return descriptorSet;
 }
 
-// Would emit a single draw for the sprite vertices accumulated in the current batch
-// range (m_BatchStartVertex..m_CurrentVertexCount) with the batch's bound texture,
-// then advance the batch cursor.
-//
-// Currently unreachable past the second guard: nothing ever assigns a non-null
-// m_BatchImageView / m_BatchDescriptorSet (they are only ever set to
-// VK_NULL_HANDLE, here and in the ctor and BeginFrame), because every draw path
-// goes through SubmitQuad, which records its own vkCmdDraw per quad. Kept as the
-// seam for reinstating real batching; the body below is the intended behavior,
-// not a description of what runs today.
 void VulkanRenderer::FlushSpriteBatch()
 {
     if (m_CurrentVertexCount == m_BatchStartVertex)
@@ -2767,14 +2623,9 @@ void VulkanRenderer::FlushSpriteBatch()
     m_BatchDescriptorSet = VK_NULL_HANDLE;
 }
 
-// Build the model matrix for a quad: translate to position, rotate about the quad's
-// center, then scale unit (0..1) vertices up to `size`. Matches the OpenGL path (the
-// vertex Y is pre-flipped so the math is identical).
 glm::mat4 VulkanRenderer::CalculateModelMatrix(glm::vec2 position, glm::vec2 size, float rotation)
 {
-    // Matches OpenGL: vertices are 0..1 (top-left to bottom-right). Vulkan
-    // clip-space Y points down, but vertex Y is already flipped, so the math matches
-    // OpenGL.
+    // Vertices use the same 0-1 quad basis as OpenGL; Y is already flipped.
     glm::mat4 model = glm::mat4(1.0f);
 
     // Translate to position (top-left corner).
@@ -2797,9 +2648,6 @@ glm::mat4 VulkanRenderer::CalculateModelMatrix(glm::vec2 position, glm::vec2 siz
     return model;
 }
 
-// Upload a texture's pixels to the GPU (creating its Vulkan image/view/memory) and
-// register it for cleanup at shutdown. Must be called at load time, outside a frame,
-// so the render path never stalls the queue on a mid-render cache miss.
 void VulkanRenderer::UploadTexture(const Texture& texture)
 {
     // Upload the texture to the GPU. CreateVulkanTexture is logically const
@@ -2807,7 +2655,7 @@ void VulkanRenderer::UploadTexture(const Texture& texture)
     texture.CreateVulkanTexture(m_Device, m_PhysicalDevice, m_CommandPool, m_GraphicsQueue);
     m_TextureCache.erase(&texture);
 
-    // Track for cleanup during shutdown (set provides O(1) dedup)
+    // Track for cleanup during shutdown (set provides o(1) dedup)
     if (m_UploadedTextureSet.insert(&texture).second)
     {
         m_UploadedTextures.push_back(&texture);
@@ -2815,7 +2663,7 @@ void VulkanRenderer::UploadTexture(const Texture& texture)
 }
 
 // Return the maximum glyph ascent (bearing.y) across loaded glyphs, scaled by
-// `scale`. Falls back to 24px when no glyphs are loaded.
+// `scale`. falls back to 24px when no glyphs are loaded.
 float VulkanRenderer::GetTextAscent(float scale) const
 {
     // Find the maximum bearing.y (ascent) across all loaded glyphs
@@ -2834,7 +2682,7 @@ float VulkanRenderer::GetTextAscent(float scale) const
     return static_cast<float>(maxAscent) * scale;
 }
 
-// Return the pixel width of `text` at the given scale, summing per-glyph advances.
+// Return the pixel width of text at the given scale, summing per-glyph advances.
 float VulkanRenderer::GetTextWidth(const std::string& text, float scale) const
 {
     if (m_Glyphs.empty() || text.empty())
@@ -2854,10 +2702,6 @@ float VulkanRenderer::GetTextWidth(const std::string& text, float scale) const
     return width;
 }
 
-// Draw a string as textured glyph quads at `position`, laying out left-to-right with
-// '\n' line breaks. Renders a black outline in four cardinal offsets first, then the
-// main colored text on top. Glyph quads use the same screen-space m_Projection as
-// sprites, but force ambient to white so UI text does not dim with the day/night cycle.
 void VulkanRenderer::DrawText(const std::string& text,
                               glm::vec2 position,
                               float scale,
@@ -3000,7 +2844,7 @@ void VulkanRenderer::DrawText(const std::string& text,
     renderTextPass(position, color);
 }
 
-// Create a sampled R8G8B8A8 image + view for one glyph and upload its RGBA bitmap via
+// Create a sampled r8g8b8a8 image + view for one glyph and upload its RGBA bitmap via
 // a staging buffer. Zero-sized glyphs fall back to the shared white texture view.
 void VulkanRenderer::CreateGlyphTexture(int width,
                                         int height,
@@ -3077,9 +2921,6 @@ void VulkanRenderer::CreateGlyphTexture(int width,
     VK_CHECK(vkCreateImageView(m_Device, &viewInfo, nullptr, &outGlyph.imageView));
 }
 
-// Load the first available font (project candidates, then OS fallbacks) via FreeType
-// and rasterize ASCII 0-127 into per-glyph textures. No-op with a warning when
-// FreeType is unavailable or no font is found (text is then skipped at draw time).
 void VulkanRenderer::LoadFont()
 {
 #ifdef USE_FREETYPE
@@ -3129,8 +2970,7 @@ void VulkanRenderer::LoadFont()
             glyph.bearing = glm::ivec2(m_Face->glyph->bitmap_left, m_Face->glyph->bitmap_top);
             glyph.advance = static_cast<unsigned int>(m_Face->glyph->advance.x);
 
-            // Some glyphs (e.g., space) have zero-sized bitmaps. Reuse the
-            // white texture to avoid invalid images.
+            // Zero-size glyphs borrow the white view to avoid invalid images.
             if (width == 0 || height == 0)
             {
                 glyph.imageView = m_WhiteTextureImageView;
