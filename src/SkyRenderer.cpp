@@ -1,49 +1,4 @@
-// SkyRenderer - procedural sky atmosphere driven by TimeManager + weather.
-//
-// Three responsibilities, in file order: generate the procedural textures,
-// cache the weather-resolved state once per frame, and draw the layered
-// effects.
-//
-// Textures
-// --------
-// Initialize() builds every sprite the sky needs (ray gradient, star point,
-// star glow, meteor streak, atmospheric glow, WorldLight pool, aurora curtain,
-// aurora beam) as raw RGBA and hands them to the TextureStore, which owns them
-// and re-uploads them on a renderer switch. Only the hand-painted aurora mote
-// comes from disk. Initialize() early-outs when already initialized, so it
-// never regenerates.
-//
-// Every per-element draw goes through the file-local DrawSkyElement helper.
-// When Game has packed the sky sprites into the shared tile atlas and called
-// SetAtlasBinding, that helper converts the recorded pixel offset into UVs and
-// issues DrawSpriteAtlas, collapsing the sky's separate-texture flushes into
-// the tile batch; otherwise it falls back to DrawSpriteAlpha on the standalone
-// texture. Two aurora draws bypass it: the beam (no atlas slot) and the ribbon
-// halo (draws the glow texture standalone), so both still flush.
-//
-// Per-frame state (Update)
-// ------------------------
-// Update() reads the EFFECTIVE weather definition - the WeatherDirector's
-// blended def mid-transition - and caches the aurora fade, celestial fade and
-// meteor-rate multiplier that Render() gates on, then runs the lightning
-// countdown and the shooting-star spawner. Note the ordering constraint: both
-// depend on a viewport size that only Render() caches, so before the first
-// Render() the meteor spawner is skipped outright and a lightning bolt
-// generated there would collapse to a 1x1 path.
-//
-// World anchoring
-// ---------------
-// Sky elements are world-anchored, not screen overlays. Positions are computed
-// in world space and handed to the renderer camera-relative. Two schemes:
-//
-//   - Stars and shooting stars live in one fixed star-field tile,
-//     STAR_FIELD_X_PERIODS x STAR_FIELD_Y_PERIODS viewports (3 x 2). Drawing
-//     wraps each anchor to the congruent copy nearest the camera with
-//     std::remainder, which covers an arbitrarily large map from one array and
-//     avoids the seam a plain [0, period) wrap leaves near the origin.
-//   - The sun and moon travel a band 3 viewports wide, re-anchored to the
-//     camera's world X in whole band steps (GetLightSourcePosition), so the
-//     body is walked past but never lost.
+
 
 #include "SkyRenderer.hpp"
 #include "TimeManager.hpp"
@@ -51,13 +6,21 @@
 #include "AmbienceConfig.hpp"
 #include "AuroraMath.hpp"
 #include "AuroraTextures.hpp"
+#include "Frustum.hpp"
+#include "Logger.hpp"
 #include "MathConstants.hpp"
+#include "ParticleCards.hpp"
 #include "ProceduralTexture.hpp"
+#include "RenderModes.hpp"
+#include "SceneMath.hpp"
+#include "SkyCards.hpp"
 #include "TextureStore.hpp"
 #include "WeatherDefinitions.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <glm/gtc/matrix_transform.hpp>
 #include <random>
 
@@ -103,12 +66,8 @@ void SkyRenderer::Initialize(TextureStore& store, const std::string& auroraSprit
 
             int idx = (y * GLOW_TEXTURE_SIZE + x) * 4;
 
-            // Three concentric glow layers, each with a different falloff curve,
-            // blended together to approximate realistic light bloom:
-            //   core  - cubic falloff (very sharp), reaches zero at dist=0.5
-            //   inner - quadratic falloff, reaches zero at dist~=0.83
-            //   outer - exponential falloff, never fully zero (soft halo)
-            // The weights (0.8/0.5/0.3) control relative brightness of each ring.
+            // Combine cubic core, quadratic inner glow, and exponential halo with weights
+            // 0.8/0.5/0.3.
             float core = std::max(0.0f, 1.0f - dist * 2.0f);
             core = core * core * core;
 
@@ -132,14 +91,10 @@ void SkyRenderer::Initialize(TextureStore& store, const std::string& auroraSprit
     m_GlowHandle = m_Store->Adopt(std::move(glowTex));
 
     GenerateLightPoolTexture();
+    GenerateSolidTexture();
     GenerateAuroraCurtainTexture();
     GenerateAuroraBeamTexture();
-    // Hand-painted soft aurora mote for the floating sky-wisp layer (the
-    // procedural dot read worse). The path comes from the project manifest's
-    // "particles" links (asset file names are opaque GUIDs); falls back to a
-    // colored rect when unlinked or missing. Separate from the Aurora
-    // weather Aurora/Wisp motes (ParticleSystem), which drift through the
-    // world below the sky ribbons.
+    // The manifest supplies the sky-wisp texture; missing assets fall back to a colored rectangle.
     Texture auroraSmallTex;
     if (!auroraSpritePath.empty())
     {
@@ -170,8 +125,9 @@ void SkyRenderer::DrawLightPool(IRenderer& renderer,
             const glm::vec2 regionSize(
                 static_cast<float>(m_Store->Get(m_LightPoolHandle).GetWidth()),
                 static_cast<float>(m_Store->Get(m_LightPoolHandle).GetHeight()));
-            const glm::vec2 uvMin = m_LightPoolAtlasOffset / glm::vec2(aw, ah);
-            const glm::vec2 uvMax = (m_LightPoolAtlasOffset + regionSize) / glm::vec2(aw, ah);
+            const glm::vec2 offset = m_AtlasOffsets[skyDraw::Sprite::LightPool];
+            const glm::vec2 uvMin = offset / glm::vec2(aw, ah);
+            const glm::vec2 uvMax = (offset + regionSize) / glm::vec2(aw, ah);
             renderer.DrawSpriteAtlas(
                 *m_AtlasTexture, pos, size, uvMin, uvMax, rotation, color, additive);
             return;
@@ -180,33 +136,62 @@ void SkyRenderer::DrawLightPool(IRenderer& renderer,
     renderer.DrawSpriteAlpha(m_Store->Get(m_LightPoolHandle), pos, size, rotation, color, additive);
 }
 
-void SkyRenderer::SetAtlasBinding(const Texture* atlasTex,
-                                  glm::vec2 rayOffset,
-                                  glm::vec2 starOffset,
-                                  glm::vec2 starGlowOffset,
-                                  glm::vec2 shootingStarOffset,
-                                  glm::vec2 glowOffset,
-                                  glm::vec2 lightPoolOffset,
-                                  glm::vec2 auroraCurtainOffset,
-                                  glm::vec2 auroraSmallOffset)
+void SkyRenderer::SetAtlasBinding(const Texture* atlasTex, const SkyAtlasOffsets& offsets)
 {
     m_AtlasTexture = atlasTex;
-    m_RayAtlasOffset = rayOffset;
-    m_StarAtlasOffset = starOffset;
-    m_StarGlowAtlasOffset = starGlowOffset;
-    m_ShootingStarAtlasOffset = shootingStarOffset;
-    m_GlowAtlasOffset = glowOffset;
-    m_LightPoolAtlasOffset = lightPoolOffset;
-    m_AuroraCurtainAtlasOffset = auroraCurtainOffset;
-    m_AuroraSmallAtlasOffset = auroraSmallOffset;
+    m_AtlasOffsets = offsets;
+}
+
+SkyRenderer::SpriteBinding SkyRenderer::ResolveSprite(skyDraw::Sprite sprite,
+                                                      bool forceStandalone) const
+{
+    SpriteBinding binding;
+    binding.atlasOffset = m_AtlasOffsets[sprite];
+    switch (sprite)
+    {
+        case skyDraw::Sprite::Ray:
+            binding.standalone = &m_Store->Get(m_RayHandle);
+            break;
+        case skyDraw::Sprite::Star:
+            binding.standalone = &m_Store->Get(m_StarHandle);
+            break;
+        case skyDraw::Sprite::StarGlow:
+            binding.standalone = &m_Store->Get(m_StarGlowHandle);
+            break;
+        case skyDraw::Sprite::ShootingStar:
+            binding.standalone = &m_Store->Get(m_ShootingStarHandle);
+            break;
+        case skyDraw::Sprite::Glow:
+            binding.standalone = &m_Store->Get(m_GlowHandle);
+            break;
+        case skyDraw::Sprite::LightPool:
+            binding.standalone = &m_Store->Get(m_LightPoolHandle);
+            break;
+        case skyDraw::Sprite::AuroraCurtain:
+            binding.standalone = &m_Store->Get(m_AuroraCurtainHandle);
+            break;
+        case skyDraw::Sprite::AuroraSmall:
+            binding.standalone = &m_Store->Get(m_AuroraSmallHandle);
+            break;
+        case skyDraw::Sprite::AuroraBeam:
+            binding.standalone = &m_Store->Get(m_AuroraBeamHandle);
+            break;
+        case skyDraw::Sprite::Solid:
+            binding.standalone = &m_Store->Get(m_SolidHandle);
+            break;
+    }
+
+    // A zero-size atlas indicates failed packing; use standalone textures.
+    const bool atlasUsable = m_AtlasTexture != nullptr && m_AtlasTexture->GetWidth() > 0 &&
+                             m_AtlasTexture->GetHeight() > 0;
+    binding.atlas = (forceStandalone || !atlasUsable) ? nullptr : m_AtlasTexture;
+    return binding;
 }
 
 namespace
 {
-// Helper: route a sky-element draw through the bound atlas if any,
-// else fall back to the per-element texture. Keeps the existing
-// DrawSpriteAlpha semantics (full-texture sample) while collapsing
-// the GPU-side flush count when the atlas is bound.
+constexpr const char* LOG_SUBSYSTEM = "Sky";
+
 void DrawSkyElement(IRenderer& renderer,
                     const Texture* atlasTex,
                     glm::vec2 atlasOffset,
@@ -223,12 +208,8 @@ void DrawSkyElement(IRenderer& renderer,
         const float ah = static_cast<float>(atlasTex->GetHeight());
         if (aw > 0.0f && ah > 0.0f)
         {
-            // The tile atlas is pre-flipped before GPU upload, so the GL row
-            // PackAdditionalSheets flips each source on copy so the atlas
-            // sub-region preserves the source's m_ImageData layout exactly.
-            // That means uv (atlasOffset/atlasSize, (atlasOffset+regionSize)
-            // /atlasSize) on the atlas samples the same texels as uv
-            // (0,0)-(1,1) on the standalone texture - no Y inversion here.
+            // Packing preserves source row order inside each atlas region, so UVs need no extra Y
+            // flip.
             const glm::vec2 regionSize(static_cast<float>(fallback.GetWidth()),
                                        static_cast<float>(fallback.GetHeight()));
             const glm::vec2 uvMin = atlasOffset / glm::vec2(aw, ah);
@@ -274,6 +255,16 @@ void SkyRenderer::GenerateLightPoolTexture()
     m_LightPoolHandle = m_Store->Adopt(std::move(lightPoolTex));
 }
 
+void SkyRenderer::GenerateSolidTexture()
+{
+    // White texels supply solid 3D quads; 4x4 leaves atlas-packing margin.
+    constexpr int kSize = 4;
+    std::vector<unsigned char> pixels(kSize * kSize * 4, 255);
+    Texture solidTex;
+    solidTex.LoadFromData(pixels.data(), kSize, kSize, 4, false);
+    m_SolidHandle = m_Store->Adopt(std::move(solidTex));
+}
+
 void SkyRenderer::GenerateAuroraCurtainTexture()
 {
     constexpr int kW = 128;
@@ -306,20 +297,18 @@ void SkyRenderer::Update(float deltaTime, const TimeManager& time)
     m_AuroraVisible = m_AuroraFade > 0.01f;
     m_MeteorRateMultiplier = time.GetEffectiveMeteorRate();
 
-    // Lightning: only when the weather wants flashes. Decrement countdown,
+    // Lightning: only when the weather wants flashes. decrement countdown,
     // trigger a flash, jitter the next interval.
     if (def.lightningIntervalSeconds > 0.0f)
     {
         std::uniform_real_distribution<float> jitter(0.7f, 1.3f);
         if (m_LightningTimer <= 0.0f)
         {
-            // Just enabled (0 is the disabled sentinel): arm a full countdown
-            // so a ramped-in storm doesn't open with a flash.
+            // Arm a full interval when lightning enables; do not flash immediately.
             m_LightningTimer = def.lightningIntervalSeconds * jitter(m_Rng);
         }
-        // The blended interval starts huge (frequency-space blend) and tightens
-        // as a transition progresses; clamp so the countdown follows it down -
-        // without this the first flash of a ramped-in storm arrives minutes late.
+        // Follow decreasing blended intervals so storm onset does not retain a long initial
+        // countdown.
         m_LightningTimer = std::min(m_LightningTimer, def.lightningIntervalSeconds * 1.3f);
         m_LightningTimer -= deltaTime;
         if (m_LightningTimer <= 0.0f)
@@ -347,7 +336,7 @@ void SkyRenderer::Update(float deltaTime, const TimeManager& time)
         m_LightningBoltTimer = std::max(0.0f, m_LightningBoltTimer - deltaTime);
     }
 
-    // Shooting stars: gated only by darkness now. Density scales by the
+    // Shooting stars: gated only by darkness now. density scales by the
     // weather's meteor multiplier (MeteorShower bumps it 12x, etc.).
     if (m_LastScreenWidth > 0.0f && m_LastScreenHeight > 0.0f && time.GetStarVisibility() > 0.3f)
     {
@@ -362,147 +351,339 @@ void SkyRenderer::Render(IRenderer& renderer,
                          int screenWidth,
                          int screenHeight)
 {
-    if (!m_Initialized)
-        return;
+    SubmitFlat(renderer, Build(time, cameraPos, screenWidth, screenHeight));
+}
 
-    // Store screen size for shooting star spawning
+void SkyRenderer::SubmitFlat(IRenderer& renderer, const skyDraw::List& list) const
+{
+    // SetAmbientColor flushes pending OpenGL sprites before changing their tint.
+    renderer.SetAmbientColor(glm::vec3(1.0f));
+
+    for (const skyDraw::Element& e : list.items)
+    {
+        // Flat atmospheric rectangles bypass texture alpha cutout.
+        if (e.sprite == skyDraw::Sprite::Solid)
+        {
+            renderer.DrawColoredRect(e.pos, e.size, e.color, e.additive);
+            continue;
+        }
+
+        const SpriteBinding binding = ResolveSprite(e.sprite, e.standalone);
+        DrawSkyElement(renderer,
+                       binding.atlas,
+                       binding.atlasOffset,
+                       *binding.standalone,
+                       e.pos,
+                       e.size,
+                       e.rotation,
+                       e.color,
+                       e.additive);
+    }
+}
+
+void SkyRenderer::Render3D(IRenderer& renderer,
+                           const TimeManager& time,
+                           const particleCards::Frame& frame,
+                           glm::vec2 visibleWorldSize)
+{
+    // Derived from the frame rather than taken as a parameter, so the build and
+    // the placement cannot be handed an inconsistent camera.
+    const glm::vec2 cameraPos = skyCards::ViewportTopLeft(frame);
+    Submit3D(renderer,
+             Build(time,
+                   cameraPos,
+                   static_cast<int>(visibleWorldSize.x),
+                   static_cast<int>(visibleWorldSize.y)),
+             frame);
+}
+
+std::size_t SkyRenderer::Submit3D(IRenderer& renderer,
+                                  const skyDraw::List& list,
+                                  const particleCards::Frame& frame)
+{
+    m_LastQuadCount3D = 0;
+
+    // Count visible demand before dividing the sky budget.
+    std::array<std::size_t, skyDraw::LAYER_COUNT> wanted{};
+    for (const skyDraw::Element& e : list.items)
+    {
+        if (skyCards::KeepOnSheet(frame, e))
+        {
+            ++wanted[static_cast<std::size_t>(e.layer)];
+        }
+    }
+
+    std::size_t reserved = 0;
+    std::size_t elasticWanted = 0;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < skyDraw::LAYER_COUNT; ++i)
+    {
+        kept += wanted[i];
+        const std::size_t reserve = skyCards::ReserveFor(static_cast<skyDraw::Layer>(i));
+        if (reserve == 0)
+        {
+            elasticWanted += wanted[i];
+        }
+        else
+        {
+            reserved += std::min(wanted[i], reserve);
+        }
+    }
+    const std::size_t elastic =
+        (skyCards::MAX_SKY_QUADS_3D > reserved) ? skyCards::MAX_SKY_QUADS_3D - reserved : 0;
+    const std::size_t allowance = std::min(elasticWanted, elastic);
+
+    // Submit in emission order; reserves protect flashes and bolts while stars/aurora thin.
+    std::array<std::size_t, skyDraw::LAYER_COUNT> seen{};
+    std::size_t elasticSeen = 0;
+    for (const skyDraw::Element& e : list.items)
+    {
+        if (!skyCards::KeepOnSheet(frame, e))
+        {
+            continue;
+        }
+
+        const std::size_t index = static_cast<std::size_t>(e.layer);
+        const std::size_t reserve = skyCards::ReserveFor(e.layer);
+        bool take = false;
+        if (reserve > 0)
+        {
+            take = seen[index] < reserve;
+        }
+        else
+        {
+            take = skyCards::StrideKeep(elasticSeen, elasticWanted, allowance);
+            ++elasticSeen;
+        }
+        ++seen[index];
+        if (!take)
+        {
+            continue;
+        }
+
+        // The atlas is taken even for the two elements the flat path draws
+        // standalone, which is what keeps the whole sky to one texture here.
+        const SpriteBinding binding = ResolveSprite(e.sprite, false);
+        const Texture& texture = (binding.atlas != nullptr) ? *binding.atlas : *binding.standalone;
+        const glm::vec2 texCoord =
+            (binding.atlas != nullptr) ? binding.atlasOffset : glm::vec2(0.0f);
+        // Always the standalone region size: pairing an atlas offset with the
+        // standalone texture's dimensions would divide by the wrong extent.
+        const glm::vec2 texSize(static_cast<float>(binding.standalone->GetWidth()),
+                                static_cast<float>(binding.standalone->GetHeight()));
+
+        glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
+        skyCards::MakeSkyQuad(frame, e, corners);
+        // Pixel UVs with flipY false match atlas corner orientation on both backends.
+        renderer.DrawQuad3D(
+            texture,
+            corners,
+            texCoord,
+            texSize,
+            e.color,
+            e.additive ? renderModes::BlendMode::Additive : renderModes::BlendMode::Alpha,
+            renderModes::DepthMode::None,
+            false,
+            false,
+            false,
+            renderModes::LightMode::SelfLit);
+        ++m_LastQuadCount3D;
+    }
+
+    if (kept > m_LastQuadCount3D && !m_WarnedQuadBudget)
+    {
+        m_WarnedQuadBudget = true;
+        Logger::WarnF(LOG_SUBSYSTEM,
+                      "3D sky budget exceeded: {} of {} quads dropped (cap {}). The aurora and "
+                      "star layers thin first; reserved layers are unaffected.",
+                      kept - m_LastQuadCount3D,
+                      kept,
+                      skyCards::MAX_SKY_QUADS_3D);
+    }
+    return m_LastQuadCount3D;
+}
+
+void SkyRenderer::DrawLightPool3D(IRenderer& renderer,
+                                  const glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT],
+                                  glm::vec4 color) const
+{
+    const SpriteBinding binding = ResolveSprite(skyDraw::Sprite::LightPool, false);
+    const Texture& texture = (binding.atlas != nullptr) ? *binding.atlas : *binding.standalone;
+    const glm::vec2 texCoord = (binding.atlas != nullptr) ? binding.atlasOffset : glm::vec2(0.0f);
+    const glm::vec2 texSize(static_cast<float>(binding.standalone->GetWidth()),
+                            static_cast<float>(binding.standalone->GetHeight()));
+    renderer.DrawQuad3D(texture,
+                        corners,
+                        texCoord,
+                        texSize,
+                        color,
+                        renderModes::BlendMode::Additive,
+                        renderModes::DepthMode::None,
+                        false,
+                        false,
+                        false,
+                        renderModes::LightMode::SelfLit);
+}
+
+std::size_t SkyRenderer::SubmitLightPools3D(IRenderer& renderer,
+                                            const skyDraw::LightPoolList& pools,
+                                            const particleCards::Frame& frame)
+{
+    std::size_t submitted = 0;
+    for (const skyDraw::LightPool& pool : pools)
+    {
+        if (submitted >= skyCards::MAX_LIGHT_POOL_QUADS_3D)
+        {
+            if (!m_WarnedPoolBudget)
+            {
+                m_WarnedPoolBudget = true;
+                Logger::WarnF(LOG_SUBSYSTEM,
+                              "3D light pool cap reached: only the first {} lit lights of {} draw "
+                              "in world3d.",
+                              skyCards::MAX_LIGHT_POOL_QUADS_3D,
+                              pools.size());
+            }
+            break;
+        }
+
+        // 1.5 radii covers the quad half-diagonal and leaves height-placement margin.
+        const glm::vec3 centre = sceneMath::ToScene(pool.centreWorld, pool.surfaceHeight);
+        if (!frustum::IntersectsSphere(frame.view, centre, pool.radius * 1.5f))
+        {
+            continue;
+        }
+
+        glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
+        skyCards::MakeLightPoolQuad(pool.centreWorld, pool.radius, pool.surfaceHeight, corners);
+        DrawLightPool3D(renderer, corners, pool.color);
+        ++submitted;
+    }
+    return submitted;
+}
+
+const skyDraw::List& SkyRenderer::Build(const TimeManager& time,
+                                        glm::vec2 cameraPos,
+                                        int screenWidth,
+                                        int screenHeight)
+{
+    skyDraw::List& out = m_DrawList;
+    out.Clear();
+    if (!m_Initialized)
+        return out;
+
+    // Cache viewport dimensions for the next Update's meteor and lightning spawners.
     m_LastScreenWidth = static_cast<float>(screenWidth);
     m_LastScreenHeight = static_cast<float>(screenHeight);
-
-    // Disable ambient color for sky rendering
-    renderer.SetAmbientColor(glm::vec3(1.0f));
 
     // Dawn/morning gradient effects (rendered first as background) - these
     // are full-screen washes; no parallax.
     float dawnIntensity = time.GetDawnIntensity();
     if (dawnIntensity > 0.01f)
     {
-        RenderDawnGradient(renderer, time, screenWidth, screenHeight);
-        RenderDawnHorizonGlow(renderer, time, screenWidth, screenHeight);
+        BuildDawnGradient(out, time, screenWidth, screenHeight);
+        BuildDawnHorizonGlow(out, time, screenWidth, screenHeight);
     }
 
     // Render atmospheric glow (subtle night sky color)
     float starVisibility = time.GetStarVisibility();
     if (starVisibility > 0.1f)
     {
-        RenderAtmosphericGlow(renderer, time, screenWidth, screenHeight);
+        BuildAtmosphericGlow(out, time, screenWidth, screenHeight);
     }
 
     // Aurora bands behind stars when active.
     if (m_AuroraVisible)
     {
-        RenderAurora(renderer, time, cameraPos, screenWidth, screenHeight);
+        BuildAurora(out, time, cameraPos, screenWidth, screenHeight);
     }
 
     // Render stars (background, only at night - fades during dawn)
     if (starVisibility > 0.01f)
     {
-        RenderStars(renderer, time, cameraPos, screenWidth, screenHeight);
-        RenderShootingStars(renderer, time, cameraPos, screenWidth, screenHeight);
+        BuildStars(out, time, cameraPos, screenWidth, screenHeight);
+        BuildShootingStars(out, time, cameraPos, screenWidth, screenHeight);
     }
 
     // Dew sparkles during early morning (ground-level effect, no parallax)
     float sunArc = time.GetSunArc();
     if (sunArc >= 0.0f && sunArc < 0.25f)
     {
-        RenderDewSparkles(renderer, time, screenWidth, screenHeight);
+        BuildDewSparkles(out, time, screenWidth, screenHeight);
     }
 
     // Sun rays - hidden when weather covers celestial bodies.
     if (sunArc >= 0.0f && m_CelestialFade > 0.01f)
     {
-        RenderSunRays(renderer, time, cameraPos, screenWidth, screenHeight);
+        BuildSunRays(out, time, cameraPos, screenWidth, screenHeight);
     }
 
     // Moon rays during night - same gating.
     float moonArc = time.GetMoonArc();
     if (moonArc >= 0.0f && starVisibility > 0.3f && m_CelestialFade > 0.01f)
     {
-        RenderMoonRays(renderer, time, cameraPos, screenWidth, screenHeight);
+        BuildMoonRays(out, time, cameraPos, screenWidth, screenHeight);
     }
 
-    // Lightning flash overlay - soft cool-white, no parallax. Tinted slightly
-    // toward blue (1.0, 1.0, 1.1) so the flash reads as electric / atmospheric
-    // rather than a flat white blow-out, and capped at 0.25 alpha so the flash
-    // illuminates the sky without strobing the player's eyes.
+    // Cap the blue-tinted flash at alpha 0.25.
     if (m_LightningFlashTimer > 0.0f)
     {
         constexpr float kFlashDuration = 0.08f;
         float alpha = (m_LightningFlashTimer / kFlashDuration) * 0.25f;
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_GlowAtlasOffset,
-                       m_Store->Get(m_GlowHandle),
-                       glm::vec2(-static_cast<float>(screenWidth) * 0.5f,
-                                 -static_cast<float>(screenHeight) * 0.5f),
-                       glm::vec2(static_cast<float>(screenWidth) * 2.0f,
-                                 static_cast<float>(screenHeight) * 2.0f),
-                       0.0f,
-                       glm::vec4(0.92f, 0.95f, 1.0f, alpha),
-                       true);
+        out.Add(skyDraw::Layer::Flash,
+                skyDraw::Sprite::Glow,
+                glm::vec2(-static_cast<float>(screenWidth) * 0.5f,
+                          -static_cast<float>(screenHeight) * 0.5f),
+                glm::vec2(static_cast<float>(screenWidth) * 2.0f,
+                          static_cast<float>(screenHeight) * 2.0f),
+                0.0f,
+                glm::vec4(0.92f, 0.95f, 1.0f, alpha),
+                true);
     }
 
     // Jagged bolt drawn after the flash so it sits on top of the cool-white
-    // wash. Lingers briefly after the flash ends.
+    // wash. lingers briefly after the flash ends.
     if (m_LightningBoltTimer > 0.0f)
     {
-        RenderLightningBolt(renderer, screenWidth, screenHeight);
+        BuildLightningBolt(out, screenWidth, screenHeight);
     }
+
+    return out;
 }
 
-void SkyRenderer::RenderAurora(IRenderer& renderer,
-                               const TimeManager& time,
-                               glm::vec2 cameraPos,
-                               int screenWidth,
-                               int screenHeight)
+void SkyRenderer::BuildAurora(skyDraw::List& out,
+                              const TimeManager& time,
+                              glm::vec2 cameraPos,
+                              int screenWidth,
+                              int screenHeight)
 {
-    // World-anchored aurora: curtains and wisps wrap near the camera on both
-    // axes, with their vertical distribution biased toward the upper viewport.
-    // The layers remain deliberately sparse and translucent: tangent-rotated
-    // curtains, a few oval beams, and small floating wisps.
+    // Aurora curtains and wisps wrap near the camera with an upper-viewport bias.
     const float t = static_cast<float>(m_Time);
     const float sw = static_cast<float>(screenWidth);
     const float sh = static_cast<float>(screenHeight);
     const glm::vec3 skyTint = time.GetSkyColor();
 
-    // Keep enough of the saturated palette for the ribbon colors to read while
-    // retaining some of the live sky tint so additive layers stay integrated.
+    // Mix the live sky tint without removing the ribbon palette.
     auto environmentalColor = [&](float phase)
     { return glm::mix(skyTint, AuroraMath::AuroraColor(phase), 0.78f); };
 
     // Aurora motion / beam tunables (see the overhaul spec, section 11).
-    constexpr float kSweepSpeed = 0.15f;    // brightness hot-spot travel speed along a band
-    constexpr float kSweepWidth = 0.20f;    // hot-spot half-width (fraction of band length)
-    constexpr int kBeamsPerCurtain = 3;     // sparse floating oval beams per ribbon
-    constexpr float kBeamLifeSpeed = 0.4f;  // beam fade in/out speed (slow ~12-22s cycle)
+    constexpr float kSweepSpeed = 0.15f;    // Brightness hot-spot travel speed along a band
+    constexpr float kSweepWidth = 0.20f;    // Hot-spot half-width (fraction of band length)
+    constexpr int kBeamsPerCurtain = 3;     // Sparse floating oval beams per ribbon
+    constexpr float kBeamLifeSpeed = 0.4f;  // Beam fade in/out speed (slow ~12-22s cycle)
 
-    // Palette, path-tangent and brightness-sweep math live in AuroraMath
+    // palette, path-tangent and brightness-sweep math live in AuroraMath
     // (pure, unit-tested in tests/AuroraMathTests.cpp).
 
-    // Wrap a world-X anchor so it stays close to the camera modulo period.
-    // This keeps curtains/wisps tiling across the world without needing
-    // millions of them, while preserving "true world position" feel within
-    // each period.
+    // Wrap to the nearest world-X copy without generating more curtains.
     auto wrapNearCamera = [](float anchorX, float cameraX, float period)
     { return cameraX + std::remainder(anchorX - cameraX, period); };
 
-    // Layer 1: world-anchored noodle curtains.
-    // Each "curtain" is a horizontal aurora ribbon built from a varying
-    // number of overlapping curtain-texture slices. Every ribbon is unique:
-    // segment count, segment size, ribbon height, baseline Y, X jitter, wave
-    // amplitude, wave frequency, drift speed, and tilt are all driven by
-    // per-curtain seeds so no two read the same.
-    //
-    // Both X and Y are world-anchored. Curtains tile across world X and world Y through
-    // wrapNearCamera, so as the camera pans each curtain scrolls naturally and rebounds through
-    // the wrap instead of staying pinned to the upper viewport.
+    // Seed each curtain's shape independently; wrap both axes for world anchoring.
     constexpr int kCurtainCount = 8;
     const float curtainPeriod = sw * 4.5f;
     const float curtainSpacing = curtainPeriod / static_cast<float>(kCurtainCount);
-    // Vertical wrap. A ~1-screen period keeps the wrap subtle during normal
-    // play while still tiling correctly under free-cam pans. The wrap is
-    // biased toward the upper third of the visible area so most curtains
-    // still land in the sky portion of the screen at any camera position.
+    // Bias the vertical wrap toward the upper third of the viewport.
     const float curtainYPeriod = sh * 1.0f;
     const float curtainYWrapCenter = cameraPos.y + sh * 0.30f;
     for (int i = 0; i < kCurtainCount; ++i)
@@ -522,16 +703,13 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
         // Broad slices overlap deeply so the larger curtains remain continuous when rotated.
         const int segments = 14 + static_cast<int>(r1 * 20.0f);    // 14-34
         const float segWidth = 52.0f + r2 * 52.0f;                 // 52-104px
-        const float segSpacing = segWidth * (0.30f + r3 * 0.14f);  // deep overlap (rotated)
+        const float segSpacing = segWidth * (0.30f + r3 * 0.14f);  // Deep overlap (rotated)
         const float ribbonSpan = segSpacing * static_cast<float>(segments - 1);
 
         // X anchor jittered around the even spacing so positions don't form a grid.
         float anchorWorldX = c * curtainSpacing + (r4 - 0.5f) * curtainSpacing * 0.5f;
         float worldCenterX = wrapNearCamera(anchorWorldX, cameraPos.x, curtainPeriod);
 
-        // Y anchor: per-curtain world Y wrapped near the camera so curtains
-        // tile across world Y. The wrap center sits 30% down the screen so
-        // wrapped values cluster in the upper portion of the visible area.
         float anchorWorldY = (c + 0.5f) * (curtainYPeriod / static_cast<float>(kCurtainCount)) +
                              (r5 - 0.5f) * curtainYPeriod * 0.3f;
         float worldCenterYBase =
@@ -558,28 +736,19 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
         float pulseFreq = 0.20f + r3 * 0.20f;
         float ribbonPulse = 0.5f + 0.5f * std::sin(t * pulseFreq + ti * 1.7f);
 
-        // Render this curtain at 3 vertically-wrapped copies (-1, 0, +1
-        // periods). When the camera moves and one copy exits the top of the
-        // screen, the +1 copy below is already drawn, so the field tiles
-        // continuously - the player sees curtains scroll naturally past in
-        // world coords rather than "snap" or "disappear" at wrap boundaries.
+        // Draw three vertical copies so crossing a wrap boundary keeps the field continuous.
         const float maxAmp = ampMajor + ampMid + ampMicro + std::abs(ribbonTilt) + curtainH * 0.5f;
         for (int wrapDy = -1; wrapDy <= 1; ++wrapDy)
         {
             float baseY =
                 (worldCenterYBase + static_cast<float>(wrapDy) * curtainYPeriod) - cameraPos.y;
-            // Cull: skip entirely off-screen copies. The curtain spans roughly
-            // baseY..baseY+curtainH after wave warp; allow maxAmp slack on
-            // both sides for warp/tilt before skipping.
+
             if (baseY + curtainH + maxAmp < 0.0f || baseY - maxAmp > sh)
             {
                 continue;
             }
 
-            // Warped path point for a fractional segment index, factoring the
-            // multi-frequency Y warp + tilt + x-jitter. Used to place each
-            // segment and to derive the local tangent so segments rotate to
-            // follow the curve (no staircase stepping).
+            // Sample the warped path and its tangent to align overlapping slices.
             auto samplePoint = [&](float fseg) -> glm::vec2
             {
                 float sn = fseg / static_cast<float>(segments - 1);
@@ -590,9 +759,7 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
                            std::sin(wT * microMul + ti * 0.5f) * ampMicro;
                 float tl = (sn - 0.5f) * 2.0f * ribbonTilt;
                 float xj = std::sin(wT * 1.9f + ti * 0.7f) * 9.0f;
-                // Return the ribbon CENTERLINE (band center), so a segment whose
-                // quad-center sits here rotates about its own anchor - adjacent
-                // segments then stay aligned along the curve (no staircase).
+
                 return glm::vec2(sx + xj, baseY + yw + tl + curtainH * 0.5f);
             };
 
@@ -616,23 +783,19 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
                 float endsFade = 1.0f - std::abs(segNorm - 0.5f) * 2.0f;
                 endsFade = std::clamp(endsFade, 0.0f, 1.0f);
                 endsFade = endsFade * endsFade * (3.0f - 2.0f * endsFade);
-                // Lateral sweep: a traveling hot-spot brightens sections of the
-                // band in sequence (the "dancing curtain"); 0.6 floor so the band
-                // never fully vanishes between sweeps. Beams share this envelope.
+                // The brightness sweep keeps a 0.6 floor; beams share this envelope.
                 float sweep = AuroraMath::SweepBoost(segNorm, t, kSweepSpeed, kSweepWidth, ti);
                 float alpha = (0.24f + 0.36f * segPulse) * (0.70f + 0.28f * ribbonPulse) *
                               endsFade * (0.82f + 0.18f * sweep);
 
                 // Master fade: weather transitions ramp the aurora in/out.
-                DrawSkyElement(renderer,
-                               m_AtlasTexture,
-                               m_AuroraCurtainAtlasOffset,
-                               m_Store->Get(m_AuroraCurtainHandle),
-                               glm::vec2(here.x - segWidth * 0.5f, here.y - curtainH * 0.5f),
-                               glm::vec2(segWidth, curtainH),
-                               angleDeg,
-                               glm::vec4(color, alpha * m_AuroraFade),
-                               true);
+                out.Add(skyDraw::Layer::Aurora,
+                        skyDraw::Sprite::AuroraCurtain,
+                        glm::vec2(here.x - segWidth * 0.5f, here.y - curtainH * 0.5f),
+                        glm::vec2(segWidth, curtainH),
+                        angleDeg,
+                        glm::vec4(color, alpha * m_AuroraFade),
+                        true);
             }
 
             // A restrained halo appears near the top of a ribbon's slow breath.
@@ -652,19 +815,17 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
                     float segY = baseY + yWarp + tilt;
                     glm::vec3 color = environmentalColor(t * 0.06f + ti * 0.20f + fs * 0.04f);
                     float glowSize = curtainH * 1.45f;
-                    renderer.DrawSpriteAlpha(
-                        m_Store->Get(m_GlowHandle),
-                        glm::vec2(screenX - glowSize * 0.5f, segY - curtainH * 0.10f),
-                        glm::vec2(glowSize, glowSize * 0.85f),
-                        0.0f,
-                        glm::vec4(color, (ribbonPulse - 0.58f) * 0.22f * m_AuroraFade),
-                        true);
+                    out.Add(skyDraw::Layer::Aurora,
+                            skyDraw::Sprite::Glow,
+                            glm::vec2(screenX - glowSize * 0.5f, segY - curtainH * 0.10f),
+                            glm::vec2(glowSize, glowSize * 0.85f),
+                            0.0f,
+                            glm::vec4(color, (ribbonPulse - 0.58f) * 0.22f * m_AuroraFade),
+                            true,
+                            true);
                 }
             }
 
-            // Beams: soft, feathered vertical glows that float above the band and
-            // breathe slowly in/out on an independent lifecycle (no hard gate, no
-            // fast shimmer) with a gentle drift - so they float rather than flicker.
             for (int b = 0; b < kBeamsPerCurtain; ++b)
             {
                 float bn = (static_cast<float>(b) + 0.5f) / static_cast<float>(kBeamsPerCurtain);
@@ -672,8 +833,7 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
                 float segNorm = std::clamp(bn + (r4 - 0.5f) * 0.12f, 0.05f, 0.95f);
                 float fseg = segNorm * static_cast<float>(segments - 1);
 
-                // Slow smooth lifecycle (~12-22s), staggered per beam so some are
-                // always softly present; squared for a gentle bloom, never a spike.
+                // Stagger squared beam pulses over 12-22 seconds.
                 float lifeFreq = kBeamLifeSpeed * (0.7f + 0.6f * std::fmod(bseed, 1.0f));
                 float life = 0.5f + 0.5f * std::sin(t * lifeFreq + bseed);
                 float alpha = life * life * 0.22f;
@@ -694,21 +854,18 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
                 // Soft oval floats centered just above the band; the texture fades
                 // on every side so there is no hard edge anywhere.
                 glm::vec2 pos(base.x - beamW * 0.5f + driftX, base.y - beamH * 0.55f + driftY);
-                renderer.DrawSpriteAlpha(m_Store->Get(m_AuroraBeamHandle),
-                                         pos,
-                                         glm::vec2(beamW, beamH),
-                                         0.0f,
-                                         glm::vec4(color, alpha * m_AuroraFade),
-                                         true);
+                out.Add(skyDraw::Layer::Aurora,
+                        skyDraw::Sprite::AuroraBeam,
+                        pos,
+                        glm::vec2(beamW, beamH),
+                        0.0f,
+                        glm::vec4(color, alpha * m_AuroraFade),
+                        true,
+                        true);
             }
         }
     }
 
-    // Layer 2: floating wisps (world-anchored, hand-painted texture).
-    // Small, sparse accents frame the ribbons without turning the sky into a
-    // particle field. Each wisp also renders at 3
-    // wrapped Y positions (-1, 0, +1 periods) so the field tiles continuously
-    // - wisps don't snap or vanish when the camera moves vertically past them.
     constexpr int kWispCount = 24;
     const float wispPeriod = sw * 4.0f;
     const float wispSpacing = wispPeriod / static_cast<float>(kWispCount);
@@ -720,15 +877,12 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
         float seed = wi * 1.913f;
 
         // Stable world X anchor with slight per-wisp jitter so they aren't
-        // perfectly evenly spaced. Wrapped near the camera.
+        // perfectly evenly spaced. wrapped near the camera.
         float jitter = (std::fmod(seed * 7.31f, 1.0f) - 0.5f) * wispSpacing;
         float anchorWorldX = wi * wispSpacing + jitter;
         float worldX = wrapNearCamera(anchorWorldX, cameraPos.x, wispPeriod);
 
-        // Two-frequency floating drift so wisps wander instead of
-        // bobbing in place. A larger slow component sweeps across the sky;
-        // a smaller faster component adds organic wobble. Per-wisp speeds
-        // (derived from seed) keep neighboring wisps from moving in sync.
+        // Combine slow drift and faster motion with per-wisp phases.
         float driftSpeedX = 0.10f + std::fmod(seed * 5.13f, 1.0f) * 0.10f;  // 0.10-0.20
         float driftSpeedY = 0.08f + std::fmod(seed * 7.91f, 1.0f) * 0.10f;  // 0.08-0.18
         float orbitX = std::sin(t * driftSpeedX + seed) * sw * 0.14f +
@@ -743,26 +897,17 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
         float worldYBase =
             wispYWrapCenter + std::remainder(anchorWorldY - wispYWrapCenter, wispYPeriod);
 
-        // Lifecycle pulse - slow ~6-8s cycle with a sharp peak. pow(1.8)
-        // means each wisp spends most of its cycle invisible (alpha=0) and
-        // briefly blooms before fading out, giving the "spawn / pulse /
-        // disappear" feel. No persistent state - phase is derived from time
-        // and seed so wisps stay world-anchored.
+        // Derive wisp pulses from time and seed; no spawn state is stored.
         float pulseFreq = 0.16f + 0.06f * std::sin(seed);  // ~5-7s period
         float pulsePhase = t * pulseFreq + seed * 2.0f;
         float rawPulse = 0.5f + 0.5f * std::sin(pulsePhase);
         float life = std::pow(rawPulse, 1.8f);
 
-        // Tiny accent sparks: 1.5-4.5px base. Pulse barely affects size so wisps
+        // Tiny accent sparks: 1.5-4.5px base. pulse barely affects size so wisps
         // don't visually shrink to a dot - alpha does the disappearing.
         float sizeBase = 1.5f + std::fmod(seed * 11.7f, 1.0f) * 3.0f;
         float wispSize = sizeBase * (0.85f + 0.15f * life);
 
-        // Color cycles fast enough to noticeably shift each pulse cycle.
-        // Per-wisp seed offset (x 0.61) gives each wisp a distinct starting
-        // hue, and the t x 0.20 advance means a wisp's color drifts ~1.4
-        // palette stops over a 7s pulse cycle - so when it re-blooms it's
-        // visibly a different color than last time.
         float colorPhase = t * 0.20f + seed * 0.61f;
         glm::vec3 color = environmentalColor(colorPhase);
 
@@ -775,22 +920,18 @@ void SkyRenderer::RenderAurora(IRenderer& renderer,
         {
             float anchorY = (worldYBase + static_cast<float>(wrapDy) * wispYPeriod) - cameraPos.y;
             glm::vec2 pos(worldX - cameraPos.x + orbitX, anchorY + orbitY);
-            // Cull copies that drift entirely off-screen (orbitY can land them
-            // far from anchorY, so check the actual draw position with a small
-            // wispSize-based margin).
+
             if (pos.y + wispSize < 0.0f || pos.y > sh)
             {
                 continue;
             }
-            DrawSkyElement(renderer,
-                           m_AtlasTexture,
-                           m_AuroraSmallAtlasOffset,
-                           m_Store->Get(m_AuroraSmallHandle),
-                           pos - glm::vec2(wispSize * 0.5f),
-                           glm::vec2(wispSize),
-                           0.0f,
-                           glm::vec4(color, alpha * m_AuroraFade),
-                           true);
+            out.Add(skyDraw::Layer::Aurora,
+                    skyDraw::Sprite::AuroraSmall,
+                    pos - glm::vec2(wispSize * 0.5f),
+                    glm::vec2(wispSize),
+                    0.0f,
+                    glm::vec4(color, alpha * m_AuroraFade),
+                    true);
         }
     }
 }
@@ -957,7 +1098,7 @@ void SkyRenderer::GenerateLightRays()
         ray.xPosition = std::max(0.05f, std::min(0.95f, basePos + offset));
 
         // Origin offset - rays originate from different points along the "sun band"
-        // Distribute across the band with some randomness
+        // distribute across the band with some randomness
         float baseOrigin =
             (SUN_RAY_COUNT > 1)
                 ? (static_cast<float>(i) / (SUN_RAY_COUNT - 1)) * 2.0f - 1.0f  // -1 to 1
@@ -967,9 +1108,7 @@ void SkyRenderer::GenerateLightRays()
 
         // Gentle angles - mostly straight down with slight variation
         ray.angle = (posDist(m_Rng) - 0.5f) * 0.3f;
-        // Shaping inputs, not pixels: RenderSunRays resolves length to
-        // screenHeight * (0.5 + length * 0.4), so 0.45-0.90 here spans
-        // 68-86% of the screen height. Width multiplies a fixed 50 px base.
+        // Length and width are shaping inputs; sun-ray length resolves to 68-86% of screen height.
         ray.length = 0.45f + posDist(m_Rng) * 0.45f;
         ray.width = 0.7f + posDist(m_Rng) * 0.5f;
         ray.brightness = 0.5f + posDist(m_Rng) * 0.5f;
@@ -1015,8 +1154,7 @@ void SkyRenderer::GenerateStars(int count)
         // Fully random position across entire 0-1 range for both axes
         star.position = glm::vec2(posDistX(m_Rng), posDistY(m_Rng));
 
-        // Square the random value to bias the distribution toward dim stars,
-        // matching real night-sky brightness distribution (many faint, few bright).
+        // Squaring the sample makes dim stars more frequent.
         float rawBright = brightDist(m_Rng);
         star.baseBrightness = rawBright * rawBright;
 
@@ -1077,19 +1215,13 @@ void SkyRenderer::GenerateBackgroundStars(int count)
 glm::vec2 SkyRenderer::GetLightSourcePosition(
     float arc, int screenWidth, int screenHeight, glm::vec2 cameraPos, float parallaxFactor) const
 {
-    (void)screenHeight;  // height doesn't affect the formula but is kept for symmetry
-    // The sun/moon "world X" arcs across a band 3 viewports wide so the body
-    // travels a substantial distance over the day rather than crossing a
-    // single viewport. Anchor that band to the camera's current world X
-    // (rounded to band steps) so the body is always reachable from the
-    // camera while still being world-anchored - walking past it as the player
-    // moves, but never permanently scrolling out of reach.
+    // Anchor the celestial travel band in 3-viewport steps; screenHeight is unused.
+    (void)screenHeight;
     const float bandWidth = static_cast<float>(screenWidth) * 3.0f;
     const float bandLeftWorld = std::floor(cameraPos.x / bandWidth) * bandWidth - bandWidth * 0.5f;
     float worldX = bandLeftWorld + (1.0f - arc) * bandWidth;
 
-    // Y is sky-relative (above the viewport) - celestial bodies don't
-    // descend with vertical camera motion.
+    // Keep celestial Y relative to the viewport during vertical camera movement.
     float arcHeight = 1.0f - std::pow(2.0f * arc - 1.0f, 2.0f);
     float worldY = cameraPos.y + 20.0f - arcHeight * 40.0f;
 
@@ -1098,11 +1230,11 @@ glm::vec2 SkyRenderer::GetLightSourcePosition(
     return glm::vec2(worldX - cameraPos.x * parallaxFactor, worldY - cameraPos.y * parallaxFactor);
 }
 
-void SkyRenderer::RenderStars(IRenderer& renderer,
-                              const TimeManager& time,
-                              glm::vec2 cameraPos,
-                              int screenWidth,
-                              int screenHeight)
+void SkyRenderer::BuildStars(skyDraw::List& out,
+                             const TimeManager& time,
+                             glm::vec2 cameraPos,
+                             int screenWidth,
+                             int screenHeight)
 {
     float visibility = time.GetStarVisibility();
     if (visibility < 0.01f)
@@ -1111,19 +1243,17 @@ void SkyRenderer::RenderStars(IRenderer& renderer,
     // Reduce overall star intensity - dimmer stars
     visibility *= 0.35f;
 
-    // Stars appear gradually - brightest first, then dimmer ones fade in
-    // visibility goes 0->1 as night falls, use it to threshold which stars appear
+    // Brightness thresholds reveal brighter stars first.
     float appearThreshold =
         1.0f - visibility * 2.0f;  // At full night, threshold is -1 (all visible)
 
-    // Stars live in a fixed world-space tile; std::remainder wraps the world
-    // position near the camera, which gives parallax without per-region generation.
+    // wrap the fixed world field near the camera with std::remainder.
     const float fieldW = static_cast<float>(screenWidth) * STAR_FIELD_X_PERIODS;
     const float fieldH = static_cast<float>(screenHeight) * STAR_FIELD_Y_PERIODS;
     auto wrap1D = [](float anchor, float ref, float period)
     { return ref + std::remainder(anchor - ref, period); };
 
-    // First pass: Background stars - only show some, gradually
+    // First pass: background stars - only show some, gradually
     int bgCount = 0;
     int maxBgStars = static_cast<int>(m_BackgroundStars.size() * visibility * 0.4f);
 
@@ -1151,27 +1281,18 @@ void SkyRenderer::RenderStars(IRenderer& renderer,
 
         float size = 1.0f + star.size * 1.2f;
 
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_StarAtlasOffset,
-                       m_Store->Get(m_StarHandle),
-                       screenPos - glm::vec2(size * 0.5f),
-                       glm::vec2(size),
-                       0.0f,
-                       glm::vec4(star.color, brightness),
-                       true);
+        out.Add(skyDraw::Layer::Star,
+                skyDraw::Sprite::Star,
+                screenPos - glm::vec2(size * 0.5f),
+                glm::vec2(size),
+                0.0f,
+                glm::vec4(star.color, brightness),
+                true);
         bgCount++;
     }
 
-    // Second pass: Main stars - gradual appearance, sparkly twinkle.
-    //
-    // Each visible star can produce a glow (m_Store->Get(m_StarGlowHandle)) and a core
-    // (m_Store->Get(m_StarHandle)). Emitting them inline alternates textures per star and
-    // forces the OpenGL particle batch to flush between every pair, so a few
-    // hundred stars become a few hundred draw calls. Instead the pass collects the
-    // per-star screen data in one compute pass, then emit all glows in one
-    // batch and all cores in another. Both blends are additive, so reordering
-    // the emits does not change the rendered result.
+    // Cache star geometry, then emit glows and cores separately to reduce texture switches.
+    // Additive blending makes this grouping equivalent.
     m_VisibleStarsScratch.clear();
     int maxStars = static_cast<int>(m_Stars.size() * visibility * 0.6f);
     if (m_VisibleStarsScratch.capacity() < static_cast<size_t>(maxStars))
@@ -1189,9 +1310,7 @@ void SkyRenderer::RenderStars(IRenderer& renderer,
         if (star.baseBrightness < appearThreshold * 0.8f)
             continue;
 
-        // Three sine waves at incommensurate frequencies create a non-repeating
-        // twinkle pattern. The frequency ratios (1.2, 2.7, 0.5) are chosen to
-        // avoid simple harmonic relationships so stars don't twinkle in unison.
+        // Combine three frequencies to vary twinkle.
         float twinkle1 =
             std::sin(static_cast<float>(m_Time) * star.twinkleSpeed * 1.2f + star.twinklePhase);
         float twinkle2 = std::sin(static_cast<float>(m_Time) * star.twinkleSpeed * 2.7f +
@@ -1199,8 +1318,7 @@ void SkyRenderer::RenderStars(IRenderer& renderer,
         float twinkle3 = std::sin(static_cast<float>(m_Time) * star.twinkleSpeed * 0.5f +
                                   star.twinklePhase * 2.1f);
 
-        // Multiplying two sines gives a burst when both are positive at once,
-        // creating sharp brief flares that mimic atmospheric scintillation.
+        // The product of two sines produces brief sparkle peaks.
         float sparkle = std::max(0.0f, twinkle1 * twinkle2);
         float twinkle = 0.4f + 0.35f * twinkle1 + 0.15f * twinkle3 + 0.25f * sparkle;
 
@@ -1232,44 +1350,40 @@ void SkyRenderer::RenderStars(IRenderer& renderer,
         starCount++;
     }
 
-    // Emit pass 1: glows for qualifying stars - single m_Store->Get(m_StarGlowHandle) binding.
+    // Emit pass 1: glows for qualifying stars - single m_Store->get(m_StarGlowHandle) binding.
     for (const auto& v : m_VisibleStarsScratch)
     {
         if (v.glowSize <= 0.0f)
         {
             continue;
         }
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_StarGlowAtlasOffset,
-                       m_Store->Get(m_StarGlowHandle),
-                       v.screenPos - glm::vec2(v.glowSize * 0.5f),
-                       glm::vec2(v.glowSize),
-                       0.0f,
-                       glm::vec4(v.color, v.glowAlpha),
-                       true);
+        out.Add(skyDraw::Layer::Star,
+                skyDraw::Sprite::StarGlow,
+                v.screenPos - glm::vec2(v.glowSize * 0.5f),
+                glm::vec2(v.glowSize),
+                0.0f,
+                glm::vec4(v.color, v.glowAlpha),
+                true);
     }
 
-    // Emit pass 2: cores for every visible star - single m_Store->Get(m_StarHandle) binding.
+    // Emit pass 2: cores for every visible star - single m_Store->get(m_StarHandle) binding.
     for (const auto& v : m_VisibleStarsScratch)
     {
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_StarAtlasOffset,
-                       m_Store->Get(m_StarHandle),
-                       v.screenPos - glm::vec2(v.size * 0.5f),
-                       glm::vec2(v.size),
-                       0.0f,
-                       glm::vec4(v.color, v.brightness * 0.7f),
-                       true);
+        out.Add(skyDraw::Layer::Star,
+                skyDraw::Sprite::Star,
+                v.screenPos - glm::vec2(v.size * 0.5f),
+                glm::vec2(v.size),
+                0.0f,
+                glm::vec4(v.color, v.brightness * 0.7f),
+                true);
     }
 }
 
-void SkyRenderer::RenderSunRays(IRenderer& renderer,
-                                const TimeManager& time,
-                                glm::vec2 cameraPos,
-                                int screenWidth,
-                                int screenHeight)
+void SkyRenderer::BuildSunRays(skyDraw::List& out,
+                               const TimeManager& time,
+                               glm::vec2 cameraPos,
+                               int screenWidth,
+                               int screenHeight)
 {
     float sunArc = time.GetSunArc();
     if (sunArc < 0.0f)
@@ -1321,9 +1435,9 @@ void SkyRenderer::RenderSunRays(IRenderer& renderer,
         float cycle = std::fmod(rayTime, cycleTime) / cycleTime;
 
         // Simple fade in/out animation - rays stay in place, just change opacity
-        // 0.00-0.20: Fade in
-        // 0.20-0.70: Hold
-        // 0.70-1.00: Fade out
+        // 0.00-0.20: fade in
+        // 0.20-0.70: hold
+        // 0.70-1.00: fade out
         float fadeAlpha;
         if (cycle < 0.20f)
         {
@@ -1360,8 +1474,7 @@ void SkyRenderer::RenderSunRays(IRenderer& renderer,
         float originOffsetPx = ray.originOffset * (screenWidth * SUN_BAND_WIDTH * 0.5f);
         glm::vec2 rayOrigin = sunPos + glm::vec2(originOffsetPx, 0.0f);
 
-        // Position the ray so its top (origin) is at the offset sun position
-        // Rotation happens around the sprite center, so an offset keeps the top at the origin.
+        // Offset the rotated quad so its top remains at the light origin.
         float halfLength = rayLength * 0.5f;
         float halfWidth = rayWidth * 0.5f;
         glm::vec2 rayPos;
@@ -1378,36 +1491,32 @@ void SkyRenderer::RenderSunRays(IRenderer& renderer,
         glowPos.y = rayOrigin.y + std::cos(rayAngleRad) * glowHalfLength - glowHalfLength;
 
         // Master fade: weather transitions ramp the sun rays in/out.
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_RayAtlasOffset,
-                       m_Store->Get(m_RayHandle),
-                       glowPos,
-                       glm::vec2(glowWidth, glowLength),
-                       rayAngleDeg,
-                       glm::vec4(rayColor, alpha * 0.4f * m_CelestialFade),
-                       true);
+        out.Add(skyDraw::Layer::Ray,
+                skyDraw::Sprite::Ray,
+                glowPos,
+                glm::vec2(glowWidth, glowLength),
+                rayAngleDeg,
+                glm::vec4(rayColor, alpha * 0.4f * m_CelestialFade),
+                true);
 
         // Main ray
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_RayAtlasOffset,
-                       m_Store->Get(m_RayHandle),
-                       rayPos,
-                       glm::vec2(rayWidth, rayLength),
-                       rayAngleDeg,
-                       glm::vec4(rayColor, alpha * m_CelestialFade),
-                       true);
+        out.Add(skyDraw::Layer::Ray,
+                skyDraw::Sprite::Ray,
+                rayPos,
+                glm::vec2(rayWidth, rayLength),
+                rayAngleDeg,
+                glm::vec4(rayColor, alpha * m_CelestialFade),
+                true);
 
         rayIndex++;
     }
 }
 
-void SkyRenderer::RenderMoonRays(IRenderer& renderer,
-                                 const TimeManager& time,
-                                 glm::vec2 cameraPos,
-                                 int screenWidth,
-                                 int screenHeight)
+void SkyRenderer::BuildMoonRays(skyDraw::List& out,
+                                const TimeManager& time,
+                                glm::vec2 cameraPos,
+                                int screenWidth,
+                                int screenHeight)
 {
     float moonArc = time.GetMoonArc();
     if (moonArc < 0.0f)
@@ -1420,9 +1529,7 @@ void SkyRenderer::RenderMoonRays(IRenderer& renderer,
     // Soft blue-white moonlight color
     glm::vec3 moonColor(0.75f, 0.85f, 1.0f);
 
-    // Moon phases 0-7 (0 = new, 4 = full). phaseFactor = 1 - |phase - 4| / 4,
-    // floored at 0.3: full moon 1.0, new moon 0.3 (dim but not invisible). The
-    // dimmest real phase is 7, whose raw 0.25 the floor lifts to 0.3.
+    // Moon phase factor is floored at 0.3 so new moon retains faint rays.
     int phase = time.GetMoonPhase();
     float phaseFactor = 1.0f - std::abs(phase - 4) / 4.0f;
     phaseFactor = std::max(0.3f, phaseFactor);
@@ -1507,26 +1614,22 @@ void SkyRenderer::RenderMoonRays(IRenderer& renderer,
         glowPos.y = rayOrigin.y + std::cos(rayAngleRad) * glowHalfLength - glowHalfLength;
 
         // Master fade: weather transitions ramp the moon rays in/out.
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_RayAtlasOffset,
-                       m_Store->Get(m_RayHandle),
-                       glowPos,
-                       glm::vec2(glowWidth, glowLength),
-                       rayAngleDeg,
-                       glm::vec4(moonColor, alpha * 0.5f * m_CelestialFade),
-                       true);
+        out.Add(skyDraw::Layer::Ray,
+                skyDraw::Sprite::Ray,
+                glowPos,
+                glm::vec2(glowWidth, glowLength),
+                rayAngleDeg,
+                glm::vec4(moonColor, alpha * 0.5f * m_CelestialFade),
+                true);
 
         // Main beam
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_RayAtlasOffset,
-                       m_Store->Get(m_RayHandle),
-                       rayPos,
-                       glm::vec2(rayWidth, rayLength),
-                       rayAngleDeg,
-                       glm::vec4(moonColor, alpha * m_CelestialFade),
-                       true);
+        out.Add(skyDraw::Layer::Ray,
+                skyDraw::Sprite::Ray,
+                rayPos,
+                glm::vec2(rayWidth, rayLength),
+                rayAngleDeg,
+                glm::vec4(moonColor, alpha * m_CelestialFade),
+                true);
 
         rayIndex++;
     }
@@ -1546,10 +1649,7 @@ void SkyRenderer::UpdateShootingStars(float deltaTime, int screenWidth, int scre
             ++it;
     }
 
-    // Spawn new shooting stars occasionally. The base 2-6s interval is divided
-    // by the meteor multiplier (Clear=1.0, MeteorShower=12.0, see
-    // WeatherDefinition::meteorRateMultiplier), so a shower collapses the
-    // interval to ~0.33s and raises the concurrent cap (multiplier * 1.5) to 18.
+    // Meteor rate shortens the spawn interval and raises the concurrent cap.
     m_ShootingStarTimer += deltaTime;
     float baseInterval = 4.0f + std::sin(static_cast<float>(m_Time) * 0.1f) * 2.0f;
     float spawnInterval = baseInterval / std::max(0.1f, m_MeteorRateMultiplier);
@@ -1570,11 +1670,7 @@ void SkyRenderer::SpawnShootingStar(int screenWidth, int screenHeight)
 
     ShootingStar star;
 
-    // Spawn the shooting star anywhere in the world's star-field tile so
-    // RenderShootingStars' wrap places it close to the camera. Using the
-    // larger field (3x viewport wide, 2x tall) means the trail can begin
-    // and end in different "wrap cells", and meteor showers don't all
-    // streak out of the same screen edge.
+    // Spawn across the wrapped field so meteors can cross viewport seams.
     std::uniform_real_distribution<float> posDist(0.0f, 1.0f);
     const float fieldW = static_cast<float>(screenWidth) * STAR_FIELD_X_PERIODS;
     const float fieldH = static_cast<float>(screenHeight) * STAR_FIELD_Y_PERIODS;
@@ -1593,9 +1689,7 @@ void SkyRenderer::SpawnShootingStar(int screenWidth, int screenHeight)
         star.position.y = posDist(m_Rng) * fieldH * 0.4f;
     }
 
-    // Diagonal downward velocity. During MeteorShower (multiplier > 2) speed up
-    // and lengthen the streak so individual meteors register. The base
-    // (Clear-weather) values stay subtle.
+    // Meteor showers increase speed and trail length when the multiplier exceeds 2.
     const bool isMeteorShower = m_MeteorRateMultiplier > 2.0f;
     const float speedBoost = isMeteorShower ? 1.4f : 1.0f;
     float speed = (350.0f + posDist(m_Rng) * 250.0f) * speedBoost;
@@ -1614,19 +1708,17 @@ void SkyRenderer::SpawnShootingStar(int screenWidth, int screenHeight)
     m_ShootingStars.push_back(star);
 }
 
-void SkyRenderer::RenderShootingStars(IRenderer& renderer,
-                                      const TimeManager& time,
-                                      glm::vec2 cameraPos,
-                                      int screenWidth,
-                                      int screenHeight)
+void SkyRenderer::BuildShootingStars(skyDraw::List& out,
+                                     const TimeManager& time,
+                                     glm::vec2 cameraPos,
+                                     int screenWidth,
+                                     int screenHeight)
 {
     float visibility = time.GetStarVisibility();
     if (visibility < 0.3f)
         return;
 
-    // Same star-field wrap as RenderStars: shooting stars are anchored in
-    // the world's star-field tile and wrap around the camera so they always
-    // streak across the visible sky regardless of where the player walks.
+    // Meteors use the same nearest-camera field wrap as stars.
     const float fieldW = static_cast<float>(screenWidth) * STAR_FIELD_X_PERIODS;
     const float fieldH = static_cast<float>(screenHeight) * STAR_FIELD_Y_PERIODS;
     auto wrap1D = [](float anchor, float ref, float period)
@@ -1652,22 +1744,20 @@ void SkyRenderer::RenderShootingStars(IRenderer& renderer,
         float worldY = wrap1D(star.position.y, cameraPos.y, fieldH);
         glm::vec2 screenPos(worldX - cameraPos.x, worldY - cameraPos.y - 1.5f);
 
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_ShootingStarAtlasOffset,
-                       m_Store->Get(m_ShootingStarHandle),
-                       screenPos,
-                       size,
-                       angle,
-                       glm::vec4(1.0f, 1.0f, 1.0f, alpha),
-                       true);
+        out.Add(skyDraw::Layer::Meteor,
+                skyDraw::Sprite::ShootingStar,
+                screenPos,
+                size,
+                angle,
+                glm::vec4(1.0f, 1.0f, 1.0f, alpha),
+                true);
     }
 }
 
-void SkyRenderer::RenderAtmosphericGlow(IRenderer& renderer,
-                                        const TimeManager& time,
-                                        int screenWidth,
-                                        int screenHeight)
+void SkyRenderer::BuildAtmosphericGlow(skyDraw::List& out,
+                                       const TimeManager& time,
+                                       int screenWidth,
+                                       int screenHeight)
 {
     float visibility = time.GetStarVisibility();
     if (visibility < 0.2f)
@@ -1678,10 +1768,13 @@ void SkyRenderer::RenderAtmosphericGlow(IRenderer& renderer,
 
     // Bottom horizon glow
     float glowHeight = screenHeight * 0.12f;
-    renderer.DrawColoredRect(glm::vec2(0, screenHeight - glowHeight),
-                             glm::vec2(static_cast<float>(screenWidth), glowHeight),
-                             glm::vec4(0.08f, 0.12f, 0.25f, horizonGlowAlpha),
-                             true);
+    out.Add(skyDraw::Layer::AtmosphericWash,
+            skyDraw::Sprite::Solid,
+            glm::vec2(0, screenHeight - glowHeight),
+            glm::vec2(static_cast<float>(screenWidth), glowHeight),
+            0.0f,
+            glm::vec4(0.08f, 0.12f, 0.25f, horizonGlowAlpha),
+            true);
 
     // Occasional subtle shimmer at top
     float shimmer = std::sin(static_cast<float>(m_Time) * 0.25f) * 0.5f + 0.5f;
@@ -1689,18 +1782,19 @@ void SkyRenderer::RenderAtmosphericGlow(IRenderer& renderer,
 
     if (auroraAlpha > 0.003f)
     {
-        // When an aurora is active, drift the wash through the same palette the
-        // bands use (dimmed) so the base arc matches the live curtains; otherwise
-        // keep the cool default tint.
+        // Active aurora shifts the atmospheric wash through its palette.
         glm::vec3 washTint(0.15f, 0.3f, 0.25f);
         if (m_AuroraVisible)
         {
             washTint = AuroraMath::AuroraColor(static_cast<float>(m_Time) * 0.02f) * 0.35f;
         }
-        renderer.DrawColoredRect(glm::vec2(0, 0),
-                                 glm::vec2(static_cast<float>(screenWidth), screenHeight * 0.04f),
-                                 glm::vec4(washTint, auroraAlpha),
-                                 true);
+        out.Add(skyDraw::Layer::AtmosphericWash,
+                skyDraw::Sprite::Solid,
+                glm::vec2(0, 0),
+                glm::vec2(static_cast<float>(screenWidth), screenHeight * 0.04f),
+                0.0f,
+                glm::vec4(washTint, auroraAlpha),
+                true);
     }
 }
 
@@ -1726,10 +1820,10 @@ void SkyRenderer::GenerateDewSparkles()
     }
 }
 
-void SkyRenderer::RenderDawnHorizonGlow(IRenderer& renderer,
-                                        const TimeManager& time,
-                                        int screenWidth,
-                                        int screenHeight)
+void SkyRenderer::BuildDawnHorizonGlow(skyDraw::List& out,
+                                       const TimeManager& time,
+                                       int screenWidth,
+                                       int screenHeight)
 {
     float dawnIntensity = time.GetDawnIntensity();
     if (dawnIntensity < 0.01f)
@@ -1742,32 +1836,28 @@ void SkyRenderer::RenderDawnHorizonGlow(IRenderer& renderer,
     float glowSize = std::max(sw, sh) * 2.5f;
 
     // Large soft glow from bottom center (sunrise direction)
-    DrawSkyElement(renderer,
-                   m_AtlasTexture,
-                   m_GlowAtlasOffset,
-                   m_Store->Get(m_GlowHandle),
-                   glm::vec2(sw * 0.5f - glowSize * 0.5f, sh - glowSize * 0.3f),
-                   glm::vec2(glowSize, glowSize),
-                   0.0f,
-                   glm::vec4(1.0f, 0.6f, 0.4f, dawnIntensity * 0.15f),
-                   true);
+    out.Add(skyDraw::Layer::DawnWash,
+            skyDraw::Sprite::Glow,
+            glm::vec2(sw * 0.5f - glowSize * 0.5f, sh - glowSize * 0.3f),
+            glm::vec2(glowSize, glowSize),
+            0.0f,
+            glm::vec4(1.0f, 0.6f, 0.4f, dawnIntensity * 0.15f),
+            true);
 
     // Secondary softer glow higher up
-    DrawSkyElement(renderer,
-                   m_AtlasTexture,
-                   m_GlowAtlasOffset,
-                   m_Store->Get(m_GlowHandle),
-                   glm::vec2(sw * 0.5f - glowSize * 0.5f, sh * 0.3f - glowSize * 0.5f),
-                   glm::vec2(glowSize, glowSize),
-                   0.0f,
-                   glm::vec4(1.0f, 0.7f, 0.55f, dawnIntensity * 0.08f),
-                   true);
+    out.Add(skyDraw::Layer::DawnWash,
+            skyDraw::Sprite::Glow,
+            glm::vec2(sw * 0.5f - glowSize * 0.5f, sh * 0.3f - glowSize * 0.5f),
+            glm::vec2(glowSize, glowSize),
+            0.0f,
+            glm::vec4(1.0f, 0.7f, 0.55f, dawnIntensity * 0.08f),
+            true);
 }
 
-void SkyRenderer::RenderDawnGradient(IRenderer& renderer,
-                                     const TimeManager& time,
-                                     int screenWidth,
-                                     int screenHeight)
+void SkyRenderer::BuildDawnGradient(skyDraw::List& out,
+                                    const TimeManager& time,
+                                    int screenWidth,
+                                    int screenHeight)
 {
     float dawnIntensity = time.GetDawnIntensity();
     if (dawnIntensity < 0.01f)
@@ -1780,32 +1870,28 @@ void SkyRenderer::RenderDawnGradient(IRenderer& renderer,
     float glowSize = std::max(sw, sh) * 2.0f;
 
     // Large soft glow from top (pre-dawn sky color)
-    DrawSkyElement(renderer,
-                   m_AtlasTexture,
-                   m_GlowAtlasOffset,
-                   m_Store->Get(m_GlowHandle),
-                   glm::vec2(sw * 0.5f - glowSize * 0.5f, -glowSize * 0.6f),
-                   glm::vec2(glowSize, glowSize),
-                   0.0f,
-                   glm::vec4(0.6f, 0.4f, 0.7f, dawnIntensity * 0.1f),
-                   true);
+    out.Add(skyDraw::Layer::DawnWash,
+            skyDraw::Sprite::Glow,
+            glm::vec2(sw * 0.5f - glowSize * 0.5f, -glowSize * 0.6f),
+            glm::vec2(glowSize, glowSize),
+            0.0f,
+            glm::vec4(0.6f, 0.4f, 0.7f, dawnIntensity * 0.1f),
+            true);
 
     // Overall soft pink tint across screen
-    DrawSkyElement(renderer,
-                   m_AtlasTexture,
-                   m_GlowAtlasOffset,
-                   m_Store->Get(m_GlowHandle),
-                   glm::vec2(sw * 0.5f - glowSize * 0.5f, sh * 0.5f - glowSize * 0.5f),
-                   glm::vec2(glowSize, glowSize),
-                   0.0f,
-                   glm::vec4(1.0f, 0.65f, 0.6f, dawnIntensity * 0.06f),
-                   true);
+    out.Add(skyDraw::Layer::DawnWash,
+            skyDraw::Sprite::Glow,
+            glm::vec2(sw * 0.5f - glowSize * 0.5f, sh * 0.5f - glowSize * 0.5f),
+            glm::vec2(glowSize, glowSize),
+            0.0f,
+            glm::vec4(1.0f, 0.65f, 0.6f, dawnIntensity * 0.06f),
+            true);
 }
 
-void SkyRenderer::RenderDewSparkles(IRenderer& renderer,
-                                    const TimeManager& time,
-                                    int screenWidth,
-                                    int screenHeight)
+void SkyRenderer::BuildDewSparkles(skyDraw::List& out,
+                                   const TimeManager& time,
+                                   int screenWidth,
+                                   int screenHeight)
 {
     float sunArc = time.GetSunArc();
 
@@ -1843,15 +1929,13 @@ void SkyRenderer::RenderDewSparkles(IRenderer& renderer,
         // Small bright point with warm golden color
         float size = 2.0f + brightness * 3.0f;
 
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_StarAtlasOffset,
-                       m_Store->Get(m_StarHandle),
-                       screenPos - glm::vec2(size * 0.5f),
-                       glm::vec2(size),
-                       0.0f,
-                       glm::vec4(1.0f, 0.92f, 0.65f, brightness),
-                       true);
+        out.Add(skyDraw::Layer::Dew,
+                skyDraw::Sprite::Star,
+                screenPos - glm::vec2(size * 0.5f),
+                glm::vec2(size),
+                0.0f,
+                glm::vec4(1.0f, 0.92f, 0.65f, brightness),
+                true);
     }
 }
 
@@ -1863,14 +1947,12 @@ void SkyRenderer::GenerateLightningBolt(int screenWidth, int screenHeight)
     const float fw = static_cast<float>(std::max(screenWidth, 1));
     const float fh = static_cast<float>(std::max(screenHeight, 1));
 
-    // Origin somewhere in the middle 60% of the screen so the bolt crosses
-    // the visible viewport rather than clipping at an edge.
+    // Start bolts in the middle 60% of the viewport.
     std::uniform_real_distribution<float> originDist(0.2f, 0.8f);
     float currentX = originDist(m_Rng) * fw;
     float currentY = 0.0f;
 
-    // ~25 segments regardless of viewport, so very tall screens still feel
-    // dense and short screens don't get a polyline made of two giant chunks.
+    // Use about 25 segments independently of viewport height.
     constexpr int kStepCount = 25;
     const float stepY = fh / static_cast<float>(kStepCount);
     constexpr float kJitterX = 20.0f;
@@ -1885,8 +1967,7 @@ void SkyRenderer::GenerateLightningBolt(int screenWidth, int screenHeight)
         currentX += sym(m_Rng) * kJitterX;
         m_LightningBolt.mainPath.emplace_back(currentX, currentY);
 
-        // Spawn a sub-branch at this point with low probability. Cap at 3
-        // total branches per bolt so the strike stays visually readable.
+        // Cap bolt branches at three.
         if (m_LightningBolt.branches.size() < 3 && i > 1 && i < kStepCount - 2 &&
             uni(m_Rng) < 0.15f)
         {
@@ -1910,7 +1991,7 @@ void SkyRenderer::GenerateLightningBolt(int screenWidth, int screenHeight)
     }
 }
 
-void SkyRenderer::RenderLightningBolt(IRenderer& renderer, int screenWidth, int screenHeight)
+void SkyRenderer::BuildLightningBolt(skyDraw::List& out, int screenWidth, int screenHeight)
 {
     (void)screenWidth;
     (void)screenHeight;
@@ -1936,21 +2017,18 @@ void SkyRenderer::RenderLightningBolt(IRenderer& renderer, int screenWidth, int 
         const glm::vec2 size(thickness, length);
         const glm::vec2 center = (A + B) * 0.5f;
         const glm::vec2 pos = center - size * 0.5f;
-        // The rect at rotation=0 has its long axis pointing +Y. Rotate so
-        // that long axis aligns with (B - A): angle = atan2(-Dx, Dy).
+        // A zero-angle quad points +Y; align it with B - A using atan2(-dx, dy).
         const float angleDeg = glm::degrees(std::atan2(-d.x, d.y));
-        DrawSkyElement(renderer,
-                       m_AtlasTexture,
-                       m_GlowAtlasOffset,
-                       m_Store->Get(m_GlowHandle),
-                       pos,
-                       size,
-                       angleDeg,
-                       glm::vec4(boltTint, baseAlpha * alphaScale),
-                       true);
+        out.Add(skyDraw::Layer::Bolt,
+                skyDraw::Sprite::Glow,
+                pos,
+                size,
+                angleDeg,
+                glm::vec4(boltTint, baseAlpha * alphaScale),
+                true);
     };
 
-    // Branches first, thinner and dimmer so the main bolt reads on top.
+    // Draw thinner branches first so the main bolt covers their intersections.
     for (const auto& branch : m_LightningBolt.branches)
     {
         for (size_t i = 1; i < branch.size(); ++i)
