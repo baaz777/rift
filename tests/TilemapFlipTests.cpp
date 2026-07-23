@@ -1,6 +1,4 @@
-// Tests for per-tile flipX/flipY fields, the ReflectClipboardRegion math,
-// and the editor commands that propagate them. No GL/Vulkan context is
-// created here; we exercise data paths only.
+// flip flags must survive clipboard transforms, command application, and undo.
 
 #include <gtest/gtest.h>
 
@@ -8,7 +6,7 @@
 #include "../src/EditorCommands.hpp"
 #include "../src/Tilemap.hpp"
 
-#include <ecs.hpp>
+#include <entt/entt.hpp>
 
 #include <cmath>
 #include <memory>
@@ -19,7 +17,6 @@ namespace
 {
 constexpr int kMapSize = 8;
 
-// Saved data that survives a snapshot -> reflect -> paste round-trip in tests
 struct CellState
 {
     int tileId;
@@ -49,12 +46,10 @@ class TilemapFlipTest : public ::testing::Test
 {
 protected:
     Tilemap tilemap;
-    ecs::registry npcs;
+    entt::registry npcs;
 
     void SetUp() override { tilemap.SetTilemapSize(kMapSize, kMapSize, false); }
 };
-
-// --- Accessor round-trip -----------------------------------------------------
 
 TEST_F(TilemapFlipTest, FlipFlagsDefaultToFalse)
 {
@@ -84,8 +79,6 @@ TEST_F(TilemapFlipTest, OutOfBoundsAccessReturnsDefault)
     EXPECT_FALSE(tilemap.GetLayerFlipX(-1, 0, 0));
     EXPECT_FALSE(tilemap.GetLayerFlipY(0, kMapSize, 0));
 }
-
-// --- PlaceTilesCmd preserves flip flags --------------------------------------
 
 TEST_F(TilemapFlipTest, PlaceTilesCmd_AppliesAndRevertsFlipFlags)
 {
@@ -120,8 +113,6 @@ TEST_F(TilemapFlipTest, PlaceTilesCmd_AppliesAndRevertsFlipFlags)
     EXPECT_FALSE(restored.flipY);
 }
 
-// --- Clipboard round-trip preserves flip flags -------------------------------
-
 TEST_F(TilemapFlipTest, SnapshotAndPaste_PreservesFlipFlags)
 {
     SetCell(tilemap, 0, 0, 0, {7, 90.0f, true, false});
@@ -134,7 +125,6 @@ TEST_F(TilemapFlipTest, SnapshotAndPaste_PreservesFlipFlags)
     EXPECT_FALSE(region.cells[1].layers[0].flipX);
     EXPECT_TRUE(region.cells[1].layers[0].flipY);
 
-    // Wipe the source area and paste back at offset 4 to verify writes.
     SetCell(tilemap, 4, 0, 0, {-1, 0.0f, false, false});
     SetCell(tilemap, 5, 0, 0, {-1, 0.0f, false, false});
 
@@ -151,8 +141,6 @@ TEST_F(TilemapFlipTest, SnapshotAndPaste_PreservesFlipFlags)
     EXPECT_TRUE(pasted1.flipY);
 }
 
-// --- ReflectClipboardRegion math --------------------------------------------
-
 TEST_F(TilemapFlipTest, ReflectX_SwapsColumnsAndTogglesFlipX)
 {
     // 3x2 region, layer 0:
@@ -166,9 +154,9 @@ TEST_F(TilemapFlipTest, ReflectX_SwapsColumnsAndTogglesFlipX)
     SetCell(tilemap, 2, 1, 0, {6, 0.0f, false, false});
 
     ClipboardRegion region = PasteRegionCmd::SnapshotRegion(tilemap, 0, 0, 3, 2);
-    ReflectClipboardRegion(region, /*flipXAxis=*/true);
+    ReflectClipboardRegion(region, true);
 
-    // After X-reflect: columns swap (C, B, A) and (F, E, D); each cell's
+    // after X-reflect: columns swap (C, B, A) and (F, E, D); each cell's
     // flipX is toggled while flipY stays.
     EXPECT_EQ(region.cells[0].layers[0].tileId, 3);  // was at (2,0)
     EXPECT_EQ(region.cells[1].layers[0].tileId, 2);  // unchanged column-wise
@@ -177,7 +165,6 @@ TEST_F(TilemapFlipTest, ReflectX_SwapsColumnsAndTogglesFlipX)
     EXPECT_EQ(region.cells[4].layers[0].tileId, 5);
     EXPECT_EQ(region.cells[5].layers[0].tileId, 4);
 
-    // flipX toggles for ALL cells; flipY untouched.
     EXPECT_TRUE(region.cells[0].layers[0].flipX);   // was false
     EXPECT_FALSE(region.cells[1].layers[0].flipX);  // was true (B)
     EXPECT_TRUE(region.cells[2].layers[0].flipX);   // was false
@@ -192,9 +179,9 @@ TEST_F(TilemapFlipTest, ReflectY_SwapsRowsAndTogglesFlipY)
     SetCell(tilemap, 1, 1, 0, {4, 0.0f, false, true});
 
     ClipboardRegion region = PasteRegionCmd::SnapshotRegion(tilemap, 0, 0, 2, 2);
-    ReflectClipboardRegion(region, /*flipXAxis=*/false);
+    ReflectClipboardRegion(region, false);
 
-    // After Y-reflect: rows swap; flipY toggles for all; flipX preserved.
+    // after Y-reflect: rows swap; flipY toggles for all; flipX preserved.
     EXPECT_EQ(region.cells[0].layers[0].tileId, 3);
     EXPECT_EQ(region.cells[1].layers[0].tileId, 4);
     EXPECT_EQ(region.cells[2].layers[0].tileId, 1);
@@ -212,7 +199,7 @@ TEST_F(TilemapFlipTest, ReflectRotation_NegatesAcrossAxis)
     {
         SetCell(tilemap, 0, 0, 0, {1, a, false, false});
         ClipboardRegion region = PasteRegionCmd::SnapshotRegion(tilemap, 0, 0, 1, 1);
-        ReflectClipboardRegion(region, /*flipXAxis=*/true);
+        ReflectClipboardRegion(region, true);
 
         float expected = std::fmod(360.0f - a, 360.0f);
         if (expected < 0.0f)
@@ -269,20 +256,18 @@ TEST_F(TilemapFlipTest, ReflectEmpty_NoChange)
     EXPECT_TRUE(empty.Empty());
 }
 
-// --- End-to-end: snapshot -> reflect -> paste round-trip via undo -----------
-
 TEST_F(TilemapFlipTest, RegionReflectViaPaste_UndoRestoresOriginal)
 {
     SetCell(tilemap, 2, 2, 0, {10, 0.0f, false, false});
     SetCell(tilemap, 3, 2, 0, {11, 90.0f, false, false});
 
     ClipboardRegion region = PasteRegionCmd::SnapshotRegion(tilemap, 2, 2, 2, 1);
-    ReflectClipboardRegion(region, /*flipXAxis=*/true);
+    ReflectClipboardRegion(region, true);
 
     PasteRegionCmd paste{2, 2, region};
     paste.Apply(tilemap, npcs);
 
-    // After reflect-X then paste:
+    // after reflect-X then paste:
     //  (2,2) was 10, now 11 with rotation 270 and flipX=true
     //  (3,2) was 11, now 10 with rotation 0 and flipX=true
     auto a = GetCell(tilemap, 2, 2, 0);
