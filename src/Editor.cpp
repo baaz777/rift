@@ -13,67 +13,57 @@
 namespace
 {
 constexpr const char* LOG_SUBSYSTEM = "Editor";
-}  // namespace
+}  // Namespace
 
 static constexpr glm::vec4 LAYER_COLORS[] = {
-    {0.0f, 0.0f, 0.0f, 0.0f},  // layer 0 - transparent (Ground, unused)
-    {0.2f, 0.5f, 1.0f, 0.4f},  // layer 1 - blue (Ground Detail)
-    {0.2f, 1.0f, 0.2f, 0.4f},  // layer 2 - green (Objects)
-    {1.0f, 0.2f, 0.8f, 0.4f},  // layer 3 - magenta (Objects2)
-    {1.0f, 0.5f, 0.0f, 0.4f},  // layer 4 - orange (Objects3)
-    {1.0f, 1.0f, 0.2f, 0.4f},  // layer 5 - yellow (Foreground)
-    {0.2f, 1.0f, 1.0f, 0.4f},  // layer 6 - cyan (Foreground2)
-    {1.0f, 0.3f, 0.3f, 0.4f},  // layer 7 - red (Overlay)
-    {1.0f, 0.3f, 1.0f, 0.4f},  // layer 8 - magenta (Overlay2)
-    {1.0f, 1.0f, 1.0f, 0.4f},  // layer 9 - white (Overlay3)
+    {0.0f, 0.0f, 0.0f, 0.0f},
+    {0.2f, 0.5f, 1.0f, 0.4f},
+    {0.2f, 1.0f, 0.2f, 0.4f},
+    {1.0f, 0.2f, 0.8f, 0.4f},
+    {1.0f, 0.5f, 0.0f, 0.4f},
+    {1.0f, 1.0f, 0.2f, 0.4f},
+    {0.2f, 1.0f, 1.0f, 0.4f},
+    {1.0f, 0.3f, 0.3f, 0.4f},
+    {1.0f, 0.3f, 1.0f, 0.4f},
+    {1.0f, 1.0f, 1.0f, 0.4f},
 };
 
 Editor::Editor()
     : m_Active(false),
       m_ShowTilePicker(false),
       m_EditMode(EditMode::None),
-      m_CurrentStance(TileStance::Prop),  // first paintable stance; Flat is right-click
+      m_CurrentStance(TileStance::Prop),
 
-      // -- Particle zone editing --
-      m_CurrentParticleType(ParticleType::Firefly),  // default particle visual
+      m_CurrentParticleType(ParticleType::Firefly),
       m_ParticleNoProjection(false),
-      m_PlacingParticleZone(false),  // true while dragging to define a zone
+      m_PlacingParticleZone(false),
       m_ParticleZoneStart(0.0f, 0.0f),
 
-      // -- Structure editing: -1 means no structure selected / no anchor placed --
       m_CurrentStructureId(-1),
-      m_PlacingAnchor(0),  // 0 = not placing, 1 = left anchor, 2 = right anchor
+      m_PlacingAnchor(0),
       m_TempLeftAnchor(-1.0f, -1.0f),
       m_TempRightAnchor(-1.0f, -1.0f),
       m_AssigningTilesToStructure(false),
 
-      // -- Animation editing --
-      m_AnimationFrameDuration(0.2f),  // seconds per frame
-      m_SelectedAnimationId(-1),       // -1 = none selected
+      m_AnimationFrameDuration(0.2f),  // Seconds per frame
+      m_SelectedAnimationId(-1),
 
-      // -- Debug flags --
       m_DebugMode(false),
       m_ShowDebugInfo(false),
       m_ShowNoProjectionAnchors(false),
       m_HasUnsavedChanges(false),
 
-      // -- Tile selection: layer 0 (Ground) and a 4-pixel elevation brush. Elevation is a
-      // raw pixel value handed to Tilemap::SetElevation, where 0 is ground level, so the
-      // initial brush paints one scroll step above ground rather than "ground".
       m_SelectedTileID(0),
       m_CurrentLayer(0),
       m_CurrentElevation(4),
-      m_CurrentElevationRole(ElevationRole::Raised),  // first paintable; Ground is right-click
+      m_CurrentElevationRole(ElevationRole::Raised),
 
-      // -- NPC placement --
       m_SelectedNPCTypeIndex(0),
 
-      // -- Mouse / drag, tile picker, multi-tile: use default member initializers --
       m_Mouse{},
       m_TilePicker{},
       m_MultiTile{},
 
-      // -- Key debounce: m_KeyPressed default-constructs to all-zero --
       m_LastDeletedTileX(-1),
       m_LastDeletedTileY(-1)
 {
@@ -154,10 +144,8 @@ void Editor::ResetTilePickerState()
 
 void Editor::Update(float deltaTime, const EditorContext& ctx)
 {
-    // Smooth tile picker camera movement
     if (m_Active && m_ShowTilePicker)
     {
-        // Exponential decay smoothing for tile picker pan
         float dt = rift::ExpApproachAlpha(deltaTime, 0.16f);
 
         m_TilePicker.offsetX =
@@ -180,7 +168,6 @@ void Editor::Update(float deltaTime, const EditorContext& ctx)
         m_TilePicker.offsetY = m_TilePicker.targetOffsetY;
     }
 
-    // Fade out the status toast.
     if (m_StatusTimer > 0.0f)
     {
         m_StatusTimer = std::max(0.0f, m_StatusTimer - deltaTime);
@@ -227,7 +214,7 @@ Editor::ScreenToTile Editor::ScreenToTileCoords(const EditorContext& ctx,
 
 void Editor::ExecuteEditorCommand(std::unique_ptr<EditorCommand> cmd,
                                   Tilemap& tilemap,
-                                  ecs::registry& npcs)
+                                  entt::registry& npcs)
 {
     if (!cmd)
         return;
@@ -247,33 +234,23 @@ void Editor::PushEditorCommand(std::unique_ptr<EditorCommand> cmd)
 
 void Editor::ClearAllEditModes()
 {
-    // Reset every transient per-mode flag. Must be called before entering or
-    // leaving any mode so that, e.g., a half-drawn particle zone or half-
-    // placed structure anchor can't outlive its owning mode and render a
-    // ghost preview forever.
+    // Clear transient state before changing modes to avoid stale previews.
     m_EditMode = EditMode::None;
 
-    // Particle zone drag state
     m_PlacingParticleZone = false;
 
-    // Structure anchor/flood state
     m_PlacingAnchor = 0;
     m_TempLeftAnchor = glm::vec2(-1.0f, -1.0f);
     m_TempRightAnchor = glm::vec2(-1.0f, -1.0f);
     m_AssigningTilesToStructure = false;
 
-    // Animation editing state
     m_AnimationFrames.clear();
     m_SelectedAnimationId = -1;
 
-    // Drag state (a mid-drag mode switch invalidates the drag)
     m_Mouse.mousePressed = false;
     m_Mouse.rightMousePressed = false;
 
-    // Drop any in-progress stroke accumulators. Tiles already painted during
-    // the discarded drag stay (consistent with prior behavior - the drag
-    // mutated the tilemap frame-by-frame); they just don't produce an
-    // undoable command. Documented in EDITOR.md.
+    // Drop undo data for an unfinished drag; applied tile changes remain.
     m_TileStroke.Drop();
     m_CollisionStroke.Drop();
     m_ElevationStroke.Drop();
@@ -283,13 +260,12 @@ void Editor::ClearAllEditModes()
 void Editor::Render(const EditorContext& ctx)
 {
     m_NoProjBoundsCached = false;
-    // Render editor tile picker UI
+
     if (m_Active && m_ShowTilePicker)
     {
         RenderEditorUI(ctx);
     }
 
-    // Shared overlays: rendered once when either editor or debug mode is active
     if ((m_Active || m_DebugMode) && !m_ShowTilePicker)
     {
         RenderCollisionOverlays(ctx);
@@ -301,7 +277,6 @@ void Editor::Render(const EditorContext& ctx)
         RenderYSortMinusOverlays(ctx);
     }
 
-    // Editor-only overlays: layer highlight and placement preview
     if (m_Active && !m_ShowTilePicker)
     {
         if (!m_DebugMode && m_CurrentLayer >= 1 && m_CurrentLayer <= 9)
@@ -313,7 +288,6 @@ void Editor::Render(const EditorContext& ctx)
         RenderMapSelectionOverlay(ctx);
     }
 
-    // Debug-only overlays: extra visualizations not shown in normal editor mode
     if (m_DebugMode && !m_ShowTilePicker)
     {
         RenderCornerCuttingOverlays(ctx);
@@ -332,12 +306,7 @@ void Editor::Render(const EditorContext& ctx)
         RenderEditorHUD(ctx);
     }
 
-    // Status toast (save success/failure, flip confirmation, etc.). Rendered
-    // last so that:
-    //   - It draws on top of every overlay rather than beneath them.
-    //   - Its UI-ortho SetProjection() does not leak into the world-projection
-    //     overlays above. Game::Render re-binds the world projection after
-    //     Editor::Render returns.
+    // Draw the toast last: it binds a UI projection. Game restores the world projection.
     if (m_Active && m_StatusTimer > 0.0f && !m_StatusMessage.empty())
     {
         glm::mat4 uiProjection = glm::ortho(0.0f,
