@@ -1,77 +1,18 @@
-// ParticleSystem - per-type behavior templates, spawn pipeline, atlas packing.
-//
-// Most of this file is the ParticleBehavior<T> specializations, one per
-// ParticleType. Everything else is the machinery that reaches them.
-//
-// Behavior dispatch
-// -----------------
-// ParticleBehavior<T> is a primary template with a specialization for every
-// enumerator. Each one supplies three things and nothing else:
+// Each ParticleType needs ParticleBehavior, EnumTraits, kParticleVisuals and editor-color entries.
+// Dispatch tables instantiate every behavior; a missing specialization fails at link time.
+// Behaviors receive per-frame or per-spawn contexts instead of accessing ParticleSystem.
+// Defer secondary spawns to pendingSpawns so pool iteration remains valid.
 //
 //     static constexpr float SpawnRate;                    // zone spawns/sec
 //     static void Update(Particle&, const ParticleUpdateContext&);
 //     static void Spawn(int zoneIndex, const ParticleZone&, ParticleSpawnContext&);
-//
-// Near the bottom, MakeSpawnRateTable / MakeUpdateTable / MakeSpawnTable expand
-// an index_sequence over EnumTraits<ParticleType>::Count into three flat arrays
-// indexed by the enum's underlying value (kSpawnRates, kUpdateDispatch,
-// kSpawnDispatch). That expansion is why a new ParticleType without a
-// specialization is a LINK error rather than a silent no-spawn: the table
-// instantiation needs the symbol. Adding a type therefore means: the enumerator,
-// its EnumTraits row, a kParticleVisuals row (order must match the enum), a
-// ParticleBehavior specialization, and an editor color in
-// GetParticleTypeColor.
-//
-// Contexts are plain structs assembled once per frame in Update / per spawn in
-// SpawnParticleInZone, so a behavior never reaches back into ParticleSystem.
-// ParticleUpdateContext carries the shared per-frame inputs (time, night and
-// scene-night factors, fog alpha multiplier, camera position/delta/velocity,
-// view size, player position, wind, RNG) plus a m_PendingSpawns sink - a
-// behavior that wants to emit another particle mid-update (rain/snow impact
-// splashes, blossom halos) appends there instead of mutating the pool it is
-// iterating.
-//
-// Spawn pipeline (one Update call)
-// --------------------------------
-//   1. Age every particle; mark lifetime <= 0. Kill particles whose editor
-//      zone disappeared (zoneIndex >= 0 only). Integrate velocity. Cull
-//      weather particles (zoneIndex == WEATHER_ZONE_INDEX) that drifted past
-//      the spawn rect plus a half-viewport margin.
-//   2. Run kUpdateDispatch[type] for the survivors.
-//   3. Merge m_PendingSpawns into the pool, roll sprite variants for the
-//      appended range, then erase_if the dead in one pass.
-//   4. Rebuild the per-zone live counts (single O(n) pass).
-//   5. UpdateAmbientSpawning  - global leaf/dust/pollen, zoneIndex = -1,
-//      time-of-day biased, capped by ambience::AMBIENT_PARTICLE_TOTAL_CAP.
-//   6. UpdateWeatherSpawning  - the weather streams, zoneIndex =
-//      WEATHER_ZONE_INDEX. See the stream table in ParticleSystem.hpp.
-//   7. Per-zone spawning for visible, enabled zones, at kSpawnRates[type]
-//      scaled by zone area and clamped by the per-zone cap.
-//
-// Every path funnels into the same kSpawnDispatch[type] initializer, so the
-// only difference between a zone spawn, a weather spawn, and a console
-// one-shot is the zoneIndex it is tagged with and the ad-hoc ParticleZone it
-// samples its position from.
-//
-// Atlas
-// -----
-// kParticleVisuals is the per-type sprite spec: up to MAX_PARTICLE_VARIANTS
-// logical names, an animation FPS, and a playback mode (Loop on global time,
-// or LifeMapped across the particle's own lifetime for one-shots). The names
-// are resolved to on-disk GUID files through the project manifest's
-// "particles" links; BuildAtlas prefers the "_strip" sheet (a horizontal
-// animation whose frame count is width / height, sliced into per-frame sub-UVs
-// at draw time), falls back to the single frame, and finally to a procedural
-// soft circle. Lantern and
-// Sunshine are fully procedural by design (empty variant lists). Everything
-// lands in one atlas texture adopted by the TextureStore, so the whole system
-// draws in two batches: no-projection particles, then regular ones.
 
 #include "ParticleSystem.hpp"
 
 #include "AmbienceConfig.hpp"
 #include "Logger.hpp"
 #include "MathConstants.hpp"
+#include "ParticleCards.hpp"
 #include "ProceduralTexture.hpp"
 #include "ProjectManifest.hpp"
 #include "TextureStore.hpp"
@@ -92,148 +33,182 @@ namespace
 {
 constexpr const char* LOG_SUBSYSTEM = "Particle";
 
-// Playback mode for strip-backed particle sprites (see BuildAtlas).
 enum class ParticleAnimMode : uint8_t
 {
     Loop,       // Cycle frames on global time, offset + rate-jittered per particle.
     LifeMapped  // Play the strip exactly once across the particle's lifetime.
 };
 
-// Visual spec per ParticleType: each non-null entry is a logical sprite name resolved to an
-// on-disk GUID file via the manifest's "particles" links. BuildAtlas prefers the "_strip" sheet,
-// else the single frame, else a procedural soft circle; empty lists (Lantern, Sunshine) are
-// procedural. A type's multiple entries are variants rolled at spawn by AssignSpawnVariants.
+// Ground uses per-particle scene depth; Card keeps falling/rising zone motion screen-vertical.
+//
+// Ground anchors keep stationary types at their own world point. rising or falling types use one
+// zone card so their motion remains screen-vertical.
+enum class ParticleAnchor : uint8_t
+{
+    Ground,
+    Card
+};
+
+// Manifest sprite names; empty variant lists generate procedural sprites.
+//
+// Logical sprite names resolve through manifest particle links. variants share one animation and
+// anchor policy per type; empty lists use procedural sprites.
 struct ParticleVisuals
 {
     const char* variants[ParticleSystem::MAX_PARTICLE_VARIANTS];
     float animFps;  // Loop playback rate; ignored for LifeMapped strips.
     ParticleAnimMode animMode;
-    // 0 = spawn rolls among all variants; N = roll among only the first N,
-    // reserving later variants as runtime states a behavior switches to
-    // (e.g. Bubble pins spawns to variant 0 and flips to the bubblepop
-    // strip at the end of its life).
+
+    ParticleAnchor anchor{ParticleAnchor::Ground};
+    // 0 rolls all variants; N reserves later entries for runtime states such as bubble pops.
     uint8_t spawnVariantCount{0};
 };
 
 // Order must match the ParticleType enum.
 constexpr ParticleVisuals kParticleVisuals[] = {
-    /* Firefly */ {{"firefly", nullptr, nullptr, nullptr}, 7.0f, ParticleAnimMode::Loop},
-    /* Rain */ {{"rain", "rain2", "rain3", "rain4"}, 0.0f, ParticleAnimMode::Loop},
-    /* Snow */ {{"snow", "snow2", "snow3", nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Fog */ {{"fog", "fog2", nullptr, nullptr}, 3.0f, ParticleAnimMode::Loop},
-    /* Sparkles */
+    // Firefly
+    {{"firefly", nullptr, nullptr, nullptr}, 7.0f, ParticleAnimMode::Loop},
+    // Rain
+    {{"rain", "rain2", "rain3", "rain4"}, 0.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Snow
+    {{"snow", "snow2", "snow3", nullptr}, 6.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Fog
+    {{"fog", "fog2", nullptr, nullptr}, 3.0f, ParticleAnimMode::Loop},
+    // Sparkles
     {{"glitter", "glitter2", "glitter3", nullptr}, 0.0f, ParticleAnimMode::LifeMapped},
-    /* Wisp */ {{"wisp", "wisp2", "wisp3", nullptr}, 7.0f, ParticleAnimMode::Loop},
-    /* Lantern */ {{nullptr, nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
-    /* Sunshine */ {{nullptr, nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
-    /* DriftingLeaf */ {{"leaf", "leaf2", "leaf3", nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* DustMote */ {{"dust", "dust2", "dust3", "mote"}, 5.0f, ParticleAnimMode::Loop},
-    /* Pollen */ {{"pollen", "pollen2", "pollen3", nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* CherryBlossom */
-    {{"cherryblossom", nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
-    /* Ash */ {{"ash", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Ember */ {{"ember", "ember2", nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop},
-    /* Sand */ {{"sand", nullptr, nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop},
-    /* Smoke */ {{"smoke", "smoke2", "smoke3", nullptr}, 5.0f, ParticleAnimMode::Loop},
-    /* Steam */ {{"steam", nullptr, nullptr, nullptr}, 8.0f, ParticleAnimMode::Loop},
-    /* Aurora */ {{"aurora", "aurora2", "aurora3", nullptr}, 4.0f, ParticleAnimMode::Loop},
-    /* Spark */ {{"spark", "spark2", nullptr, nullptr}, 0.0f, ParticleAnimMode::LifeMapped},
-    /* PixieDust */
-    {{"pixiedust", "pixiedust2", "pixiedust3", nullptr}, 10.0f, ParticleAnimMode::Loop},
-    /* Arcane */ {{"arcane", "arcane2", nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Enchant */ {{"enchant", nullptr, nullptr, nullptr}, 7.0f, ParticleAnimMode::Loop},
-    /* Runes */ {{"runes", nullptr, nullptr, nullptr}, 4.0f, ParticleAnimMode::Loop},
-    /* Hex */ {{"hex", nullptr, nullptr, nullptr}, 5.0f, ParticleAnimMode::Loop},
-    /* Curse */ {{"curse", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Void */ {{"void", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Vortex */ {{"vortex", nullptr, nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop},
-    /* Soul */ {{"soul", nullptr, nullptr, nullptr}, 5.0f, ParticleAnimMode::Loop},
-    /* Fairy */ {{"fairy", nullptr, nullptr, nullptr}, 9.0f, ParticleAnimMode::Loop},
-    /* Butterfly */ {{"butterfly", nullptr, nullptr, nullptr}, 8.0f, ParticleAnimMode::Loop},
-    /* Bat */ {{"bat", nullptr, nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop},
-    /* Bubble */ {{"bubble", "bubblepop", nullptr, nullptr}, 4.0f, ParticleAnimMode::Loop, 1},
-    /* Coin */ {{"coin", nullptr, nullptr, nullptr}, 8.0f, ParticleAnimMode::Loop},
-    /* Gem */ {{"gem", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Confetti */ {{"confetti", "confetti2", nullptr, nullptr}, 9.0f, ParticleAnimMode::Loop},
-    /* Heart */ {{"heart", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
-    /* Zap */ {{"zap", nullptr, nullptr, nullptr}, 14.0f, ParticleAnimMode::Loop},
-    /* Wind */ {{"wind", nullptr, nullptr, nullptr}, 12.0f, ParticleAnimMode::Loop},
-    /* Zzz */ {{"zzz", nullptr, nullptr, nullptr}, 3.0f, ParticleAnimMode::Loop},
-    /* Constellation */
+    // Wisp
+    {{"wisp", "wisp2", "wisp3", nullptr}, 7.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Lantern
+    {{nullptr, nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
+    // Sunshine
+    {{nullptr, nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
+    // DriftingLeaf
+    {{"leaf", "leaf2", "leaf3", nullptr}, 6.0f, ParticleAnimMode::Loop},
+    // DustMote
+    {{"dust", "dust2", "dust3", "mote"}, 5.0f, ParticleAnimMode::Loop},
+    // Pollen
+    {{"pollen", "pollen2", "pollen3", nullptr}, 6.0f, ParticleAnimMode::Loop},
+    // CherryBlossom
+    {{"cherryblossom", nullptr, nullptr, nullptr},
+     0.0f,
+     ParticleAnimMode::Loop,
+     ParticleAnchor::Card},
+    // Ash
+    {{"ash", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Ember
+    {{"ember", "ember2", nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Sand
+    {{"sand", nullptr, nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop},
+    // Smoke
+    {{"smoke", "smoke2", "smoke3", nullptr}, 5.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Steam
+    {{"steam", nullptr, nullptr, nullptr}, 8.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Aurora
+    {{"aurora", "aurora2", "aurora3", nullptr}, 4.0f, ParticleAnimMode::Loop},
+    // Spark
+    {{"spark", "spark2", nullptr, nullptr}, 0.0f, ParticleAnimMode::LifeMapped},
+    // PixieDust
+    {{"pixiedust", "pixiedust2", "pixiedust3", nullptr},
+     10.0f,
+     ParticleAnimMode::Loop,
+     ParticleAnchor::Card},
+    // Arcane
+    {{"arcane", "arcane2", nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Enchant
+    {{"enchant", nullptr, nullptr, nullptr}, 7.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Runes
+    {{"runes", nullptr, nullptr, nullptr}, 4.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Hex
+    {{"hex", nullptr, nullptr, nullptr}, 5.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Curse
+    {{"curse", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Void
+    {{"void", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
+    // Vortex
+    {{"vortex", nullptr, nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Soul
+    {{"soul", nullptr, nullptr, nullptr}, 5.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Fairy
+    {{"fairy", nullptr, nullptr, nullptr}, 9.0f, ParticleAnimMode::Loop},
+    // Butterfly
+    {{"butterfly", nullptr, nullptr, nullptr}, 8.0f, ParticleAnimMode::Loop},
+    // Bat
+    {{"bat", nullptr, nullptr, nullptr}, 10.0f, ParticleAnimMode::Loop},
+    // Bubble
+    {{"bubble", "bubblepop", nullptr, nullptr},
+     4.0f,
+     ParticleAnimMode::Loop,
+     ParticleAnchor::Card,
+     1},
+    // Coin
+    {{"coin", nullptr, nullptr, nullptr}, 8.0f, ParticleAnimMode::Loop},
+    // Gem
+    {{"gem", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop},
+    // Confetti
+    {{"confetti", "confetti2", nullptr, nullptr},
+     9.0f,
+     ParticleAnimMode::Loop,
+     ParticleAnchor::Card},
+    // Heart
+    {{"heart", nullptr, nullptr, nullptr}, 6.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Zap
+    {{"zap", nullptr, nullptr, nullptr}, 14.0f, ParticleAnimMode::Loop},
+    // Wind
+    {{"wind", nullptr, nullptr, nullptr}, 12.0f, ParticleAnimMode::Loop},
+    // Zzz
+    {{"zzz", nullptr, nullptr, nullptr}, 3.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // Constellation
     {{"constellation", "constellation2", "constellation3", nullptr}, 4.0f, ParticleAnimMode::Loop},
-    /* Planet */ {{"planet", nullptr, nullptr, nullptr}, 3.0f, ParticleAnimMode::Loop},
-    /* Moon */ {{"moon", nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
-    /* Ink */ {{"ink", nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
-    /* RainSplash */
+    // Planet
+    {{"planet", nullptr, nullptr, nullptr}, 3.0f, ParticleAnimMode::Loop},
+    // Moon
+    {{"moon", nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop},
+    // Ink
+    {{"ink", nullptr, nullptr, nullptr}, 0.0f, ParticleAnimMode::Loop, ParticleAnchor::Card},
+    // RainSplash
     {{"rainsplash", "rainsplash2", nullptr, nullptr}, 0.0f, ParticleAnimMode::LifeMapped},
-    /* SnowSplash */
+    // SnowSplash
     {{"snowsplash", "snowsplash2", nullptr, nullptr}, 0.0f, ParticleAnimMode::LifeMapped},
 };
 
 static_assert(std::size(kParticleVisuals) == EnumTraits<ParticleType>::Count,
               "kParticleVisuals must have one row per ParticleType");
 
-// Fixed atlas width; height grows as needed (see BuildAtlas). Shared with
-// the render pass for the per-frame UV inset math.
+// Atlas width in texels, shared by packing and UV inset calculations.
 constexpr int kParticleAtlasWidth = 512;
 }  // namespace
 
-// Particle behavior dispatch.
-
-// Context passed to per-type Update specializations.
 struct ParticleUpdateContext
 {
     float time;
     float deltaTime;
     float nightFactor;
-    // Scene darkness for the impact-splash fade only: max(natural, weather star
-    // visibility), so precipitation (which forces weather star visibility to 0)
-    // does not read as daytime at night. nightFactor above stays weather-resolved
-    // for fog / aurora / lantern / celestial behaviors.
+    // Splash darkness includes natural night; weather star visibility is zero during precipitation.
     float sceneNightFactor;
     const std::vector<ParticleZone>* zones;
     bool hasZones;
-    // Per-weather scaling on Fog particle base alpha. 1.0 = unchanged;
-    // values < 1 soften the fog wall without changing density.
+    // Fog alpha scale; 1 leaves alpha unchanged.
     float fogAlphaMultiplier;
-    // Smoothed camera velocity (world px/s). Read by Pollen / DriftingLeaf
-    // to gate the player-avoidance push on "player is currently walking".
+    // Smoothed camera velocity in world px/s; gates weather particle avoidance.
     glm::vec2 cameraVelocity;
-    // Current camera position (world px); kept here so weather-particle
-    // spawn helpers can read it from the same context as the avoidance code.
+    // Camera position in world pixels.
     glm::vec2 cameraPos;
-    // Visible camera area in world pixels. Used by Rain/Snow update paths
-    // to clamp groundY into the viewport when an editor zone is larger
-    // than the visible region (e.g., the title screen's whole-map zones -
-    // without the clamp, splashes happen off-screen below).
+    // World-pixel view extent; clamp oversized zone impacts into this region.
     glm::vec2 viewSize;
-    // Bottom-center of the player's 16x32 avoidance box (player hitbox +
-    // the tile directly above). Pollen and DriftingLeaf use this box as
-    // the repulsion source so particles slide around the actual player
-    // rectangle rather than around the bottom-center anchor. Fog also reads
-    // the y as the anchor of its ground-to-sky alpha gradient.
+    // Player feet in world pixels; anchors the 16x32 avoidance box and fog height gradient.
     glm::vec2 playerPos;
-    // Out-buffer for particles that an Update wants to spawn mid-frame
-    // (e.g., Rain splashes). Direct append to m_Particles during the
-    // update loop would reallocate the vector and invalidate iterators,
-    // so behaviors push here and ParticleSystem::Update merges after.
+    // Deferred spawn sink; direct pool insertion could invalidate iteration.
     std::vector<Particle>* pendingSpawns;
-    // Shared RNG (same source as ParticleSpawnContext) so any randomized
-    // per-frame behaviors (e.g., Rain splash count + droplet jitter) draw
-    // from the same deterministic stream as the Spawn dispatchers.
+    // Shared RNG for spawn and update behaviors.
     std::mt19937* rng;
     std::uniform_real_distribution<float>* dist;
-    // Prevailing wind direction (normalized) and gusted strength (>= 0;
-    // 0.5 = calm default). Mirrors ParticleSystem::m_WindDir/m_WindStrength.
+    // Normalized wind direction; strength is nonnegative, with 0.5 as calm default.
     glm::vec2 windDir;
     float windStrength;
-    // Exact per-frame camera displacement (world px). Weather Rain/Snow
-    // re-base their bakedGroundY band by this so the splash band keeps its
-    // screen-relative position instead of lagging a moving camera.
+    // World-pixel camera displacement for rebasing weather impact bands.
     glm::vec2 cameraDelta;
 };
 
-// Context passed to per-type Spawn specializations.
 struct ParticleSpawnContext
 {
     std::mt19937& rng;
@@ -243,10 +218,7 @@ struct ParticleSpawnContext
     float windStrength;  // Gusted wind strength (>= 0; 0.5 = calm default).
 };
 
-// Cheap 2D pseudo-flow field for billowy drifters (Smoke, Steam, Soul, Ink, ...):
-// two incommensurate sine octaves per axis sampled on world position give a smooth
-// organic wander that never visibly repeats, with per-particle phase decorrelating
-// neighbors. Output is roughly [-1.5, 1.5] per axis - callers scale to px/s.
+// Two sine octaves per axis; output is approximately -1.5 to 1.5 before caller speed scaling.
 inline glm::vec2 FlowNoise(glm::vec2 pos, float time, float phase)
 {
     const float x = pos.x * 0.020f;
@@ -257,10 +229,7 @@ inline glm::vec2 FlowNoise(glm::vec2 pos, float time, float phase)
                 0.5f * std::cos(time * 1.13f + x * 2.7f + phase * 3.1f)};
 }
 
-// Slip a weather particle around the player's 16x32 hitbox by nudging only
-// its position outward while overlapping (velocity/wind drift is untouched,
-// so its trajectory is preserved). The nudge is capped at the penetration
-// depth so it never overshoots, and only fires while the player is moving.
+// Move overlapping weather particles around the 16x32 player box without changing velocity.
 inline void ApplyPlayerHitboxRepulsion(Particle& p,
                                        const ParticleUpdateContext& ctx,
                                        float* outProximity = nullptr)
@@ -268,15 +237,13 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
     if (outProximity)
         *outProximity = 0.0f;
 
-    // Only intervene while the player is actively moving. A stationary
-    // player lets all particles drift past unaffected.
+    // Only a moving camera creates the player wake; a stationary player lets particles pass.
     const float camSpeed = glm::length(ctx.cameraVelocity);
     if (camSpeed <= 5.0f)
     {
         return;
     }
 
-    // Player hitbox: 16 wide x 32 tall, with playerPos at bottom-center.
     const float boxMinX = ctx.playerPos.x - 8.0f;
     const float boxMaxX = ctx.playerPos.x + 8.0f;
     const float boxMinY = ctx.playerPos.y - 32.0f;
@@ -286,10 +253,7 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
     const glm::vec2 fromBox = p.position - glm::vec2(nearestX, nearestY);
     const float dist = glm::length(fromBox);
 
-    // Outward surface normal (from box edge toward particle). If the leaf
-    // is essentially inside the box, fall back to "opposite the player's
-    // motion" so the correction nudges it behind the player rather than
-    // toward whatever face it happens to be nearest.
+    // Inside the box, push opposite player motion instead of choosing an arbitrary nearest face.
     const glm::vec2 motionDir = ctx.cameraVelocity / camSpeed;
     glm::vec2 outward;
     if (dist > 0.01f)
@@ -301,15 +265,10 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
         outward = -motionDir;
     }
 
-    // Three concentric effect zones, all position-only so the wind-driven
-    // velocity.x sign-flag convention used by weather spawns is preserved.
-    // Magnitudes scale with player speed so a slow walk gives a subtle
-    // disturbance and a sprint creates a dramatic swirl + wake.
+    // Position-only effects preserve the velocity.x wind-sign convention.
     const float motionFactor = std::clamp(camSpeed / 100.0f, 0.3f, 1.5f);
 
-    // Zone A - hard shell: keep particles off the sprite. Outward push at
-    // 50 px/s clamped to the remaining gap so the leaf slides cleanly to
-    // the shell boundary instead of popping out of it.
+    // Hard shell: cap outward displacement to the remaining gap.
     constexpr float kHardShellRadius = 6.0f;
     if (dist < kHardShellRadius)
     {
@@ -319,10 +278,7 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
         p.position += outward * pushAmount;
     }
 
-    // Zone B - tangential swirl: soft band from the hard shell out to 20px
-    // that curls particles toward the trailing side. The tangent is whichever
-    // 90-degree rotation of `outward` points more backward along motion, so
-    // leaves on both sides end up trailing behind (flow-around-a-sphere).
+    // Choose the tangent that points behind player motion.
     constexpr float kSwirlOuterRadius = 20.0f;
     constexpr float kSwirlPeak = 40.0f;
     float proximity = 0.0f;
@@ -334,10 +290,7 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
         const glm::vec2 tangentB(-outward.y, outward.x);
         const glm::vec2 backward = -motionDir;
         const glm::vec2 tangent = (glm::dot(tangentA, backward) > 0.0f) ? tangentA : tangentB;
-        // Per-particle speed variance in the swirl so multiple leaves on the
-        // same side don't curl in perfect lockstep - faster-tangent ones
-        // overtake slower-tangent ones and the bundle breaks up before it
-        // reaches the wake region.
+        // Phase variance prevents leaves from moving in lockstep.
         const float tangentVariance = 1.0f + 0.35f * std::sin(p.phase * 1.3f);  // [0.65, 1.35]
         p.position +=
             tangent * (kSwirlPeak * tangentVariance * proximity * motionFactor * ctx.deltaTime);
@@ -345,10 +298,7 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
     if (outProximity)
         *outProximity = proximity;
 
-    // Zone C - slipstream wake: elliptical region trailing the player along
-    // the motion axis (15px half-length, 8px half-width). Particles inside
-    // get a position push along motion (drag, not push-away), catching leaves
-    // that exit Zone B behind the player for a moment before they peel off.
+    // Elliptical wake drags nearby trailing particles along player motion.
     constexpr float kWakeOffset = 15.0f;
     constexpr float kWakeHalfLen = 15.0f;
     constexpr float kWakeHalfWidth = 8.0f;
@@ -362,10 +312,7 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
     if (wakeR < 1.0f)
     {
         const float wakeFactor = 1.0f - wakeR;
-        // Per-particle fan-out so wake-caught particles don't converge into
-        // one line behind the player. Spawn-randomized phase gives each its
-        // own lateral offset and drag rate (spread across motion, overtake/lag
-        // along it). Position-only, so the drift ends cleanly on exit.
+        // Phase varies lateral scatter and drag to prevent a single trailing line.
         const float lateralSign = std::sin(p.phase * 2.0f);                 // [-1, 1]
         const float dragVariance = 1.0f + 0.3f * std::cos(p.phase * 1.7f);  // [0.7, 1.3]
         constexpr float kLateralScatter = 12.0f;
@@ -376,34 +323,17 @@ inline void ApplyPlayerHitboxRepulsion(Particle& p,
     }
 }
 
-// Alpha for rain/snow impact sprites: soft in daylight, very faint at night.
-// Keyed on ParticleUpdateContext::sceneNightFactor (scene darkness, not the
-// weather star visibility, which precipitation forces to 0). `fade` eases the
-// tail. Shared by the impact Update and the spawn helpers so a splash's spawn
-// frame matches its first Update frame exactly - pending spawns render one frame
-// before their first Update, so a mismatched spawn alpha shows as a bright
-// one-frame flash (very visible at night, where the steady state is ~0.15).
+// Match spawn and update alpha; deferred splashes render once before their first update.
 inline float ImpactSplashAlpha(float fade, float sceneNight)
 {
-    // Day peak 0.3; night floor 0.5 -> ~0.15 at full dark (a middle ground:
-    // ~0.35 read as "way too visible", ~0.06 as "not visible enough").
+    // Keep splash alpha below 0.3 by day and 0.15 by night so impacts do not glare over the scene.
     return 0.3f * fade * glm::mix(1.0f, 0.5f, std::clamp(sceneNight, 0.0f, 1.0f));
 }
 
-// Fraction of rain-drop ground impacts that spawn a visible splash; the rest
-// are silent. Below 1.0 so a downpour (hundreds of drops/sec) does not carpet
-// the ground with 16px splash sprites. Named so an accidental inversion or typo
-// stands out in review.
+// Sample impacts sparsely so splash sprites do not cover the ground.
 constexpr float kRainSplashImpactChance = 0.30f;
 
-// Spawn a rain-splash burst at an impact point. Called by Rain::Update from
-// both the editor-zone ground check and the weather bakedGroundY check so the
-// title screen and gameplay weather share the same visual.
-//
-// Throttled by kRainSplashImpactChance so a downpour does not carpet the ground.
-// Emits one life-mapped RainSplash particle whose 4-frame strip plays once
-// across its short lifetime; the a/b sprite variant is rolled when
-// m_PendingSpawns merges (see AssignSpawnVariants), so it is left unset here.
+// Defer one life-mapped rain splash; variants are assigned when pendingSpawns merges.
 inline void SpawnRainSplash(const Particle& parent, float impactY, const ParticleUpdateContext& ctx)
 {
     if (!ctx.pendingSpawns || !ctx.rng || !ctx.dist)
@@ -417,13 +347,16 @@ inline void SpawnRainSplash(const Particle& parent, float impactY, const Particl
 
     Particle s;
     s.zoneIndex = -1;
+    // Borrow parent zone culling and height; weather and ambient splashes remain on the sheet.
+    s.anchorZone = (parent.zoneIndex >= 0) ? parent.zoneIndex : parent.anchorZone;
     s.type = ParticleType::RainSplash;
     s.noProjection = parent.noProjection;
-    // Sits at the impact point; the strip animation carries the spread, so the
-    // splash stays put (zero velocity). Small x jitter decorrelates neighbors.
+
+    // Keep the impact stationary; the strip supplies spreading motion. jitter X to separate nearby
+    // hits.
     s.position = glm::vec2(parent.position.x + (dist(rng) - 0.5f) * 6.0f, impactY);
     s.velocity = glm::vec2(0.0f);
-    // Alpha matches the first Update frame (no bright spawn-frame flash).
+
     s.color = glm::vec4(0.82f, 0.88f, 1.0f, ImpactSplashAlpha(1.0f, ctx.sceneNightFactor));
     s.phase = 0.0f;
     s.size = 12.0f + dist(rng) * 4.0f;
@@ -435,18 +368,10 @@ inline void SpawnRainSplash(const Particle& parent, float impactY, const Particl
     ctx.pendingSpawns->push_back(s);
 }
 
-// Fraction of snow landings that spawn a visible impact puff (mirrors
-// kRainSplashImpactChance). Below 1.0 so a blizzard doesn't carpet the ground.
-// Higher than rain's 0.30 so a blizzard's impacts read as a busy settling layer.
+// Sample snow impacts sparsely to avoid covering the ground with puff sprites.
 constexpr float kSnowSplashImpactChance = 0.45f;
 
-// Spawn a snow-impact puff at a landing point. Called by Snow::Update from both
-// the editor-zone ground check and the weather bakedGroundY check so title and
-// gameplay snow share the visual.
-//
-// Throttled by kSnowSplashImpactChance; emits one life-mapped SnowSplash
-// particle whose 4-frame strip plays once. The a/b sprite variant is rolled
-// when m_PendingSpawns merges (see AssignSpawnVariants), so it is left unset.
+// Defer one life-mapped snow puff; variants are assigned when pendingSpawns merges.
 inline void SpawnSnowPuff(const Particle& parent, float impactY, const ParticleUpdateContext& ctx)
 {
     if (!ctx.pendingSpawns || !ctx.rng || !ctx.dist)
@@ -460,12 +385,15 @@ inline void SpawnSnowPuff(const Particle& parent, float impactY, const ParticleU
 
     Particle s;
     s.zoneIndex = -1;
+    // Borrow parent zone culling and height; weather and ambient puffs remain on the sheet.
+    s.anchorZone = (parent.zoneIndex >= 0) ? parent.zoneIndex : parent.anchorZone;
     s.type = ParticleType::SnowSplash;
     s.noProjection = parent.noProjection;
-    // Sits at the landing point; the strip carries the spread (zero velocity).
+
+    // Keep the snow impact stationary; the strip supplies the spread.
     s.position = glm::vec2(parent.position.x + (dist(rng) - 0.5f) * 6.0f, impactY);
     s.velocity = glm::vec2(0.0f);
-    // Alpha matches the first Update frame (no bright spawn-frame flash).
+
     s.color = glm::vec4(1.0f, 1.0f, 1.0f, ImpactSplashAlpha(1.0f, ctx.sceneNightFactor));
     s.phase = 0.0f;
     s.size = 10.0f + dist(rng) * 4.0f;
@@ -477,7 +405,6 @@ inline void SpawnSnowPuff(const Particle& parent, float impactY, const ParticleU
     ctx.pendingSpawns->push_back(s);
 }
 
-// Primary template - specialize for each ParticleType enumerator.
 template <ParticleType PT>
 struct ParticleBehavior
 {
@@ -486,8 +413,6 @@ struct ParticleBehavior
     static void Spawn(int zoneIndex, const ParticleZone& zone, ParticleSpawnContext& ctx);
 };
 
-// Firefly.
-
 template <>
 struct ParticleBehavior<ParticleType::Firefly>
 {
@@ -495,19 +420,16 @@ struct ParticleBehavior<ParticleType::Firefly>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Gentle random drift
         float driftX = std::sin(ctx.time * 2.0f + p.phase) * 10.0f;
         float driftY = std::cos(ctx.time * 1.5f + p.phase * 1.3f) * 8.0f;
         p.position.x += driftX * ctx.deltaTime;
         p.position.y += driftY * ctx.deltaTime;
 
-        // Slow rotation as they drift
         float rotationSpeed = 20.0f + (p.phase / 6.28f) * 40.0f;  // 20-60 degrees per second
         if (std::fmod(p.phase, 2.0f) < 1.0f)
             rotationSpeed = -rotationSpeed;
         p.rotation += rotationSpeed * ctx.deltaTime;
 
-        // Pulsing glow, alpha oscillates between 0.0 and 0.7
         float pulse = 0.5f + 0.5f * std::sin(ctx.time * 4.0f + p.phase);
         float lifeFade = std::min(1.0f, p.lifetime / (p.maxLifetime * 0.3f));
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.5f);
@@ -530,33 +452,29 @@ struct ParticleBehavior<ParticleType::Firefly>
         float colorChoice = ctx.dist(ctx.rng);
         if (colorChoice < 0.30f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.9f + ctx.dist(ctx.rng) * 0.1f,
-                                0.3f + ctx.dist(ctx.rng) * 0.2f,
-                                0.0f);  // Warm yellow
+            p.color = glm::vec4(
+                1.0f, 0.9f + ctx.dist(ctx.rng) * 0.1f, 0.3f + ctx.dist(ctx.rng) * 0.2f, 0.0f);
         }
         else if (colorChoice < 0.45f)
         {
-            p.color = glm::vec4(0.4f + ctx.dist(ctx.rng) * 0.2f,
-                                1.0f,
-                                0.5f + ctx.dist(ctx.rng) * 0.2f,
-                                0.0f);  // Green
+            p.color = glm::vec4(
+                0.4f + ctx.dist(ctx.rng) * 0.2f, 1.0f, 0.5f + ctx.dist(ctx.rng) * 0.2f, 0.0f);
         }
         else if (colorChoice < 0.60f)
         {
-            p.color = glm::vec4(0.4f, 0.8f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.0f);  // Cyan-blue
+            p.color = glm::vec4(0.4f, 0.8f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.0f);
         }
         else if (colorChoice < 0.75f)
         {
-            p.color = glm::vec4(1.0f, 0.4f + ctx.dist(ctx.rng) * 0.15f, 0.8f, 0.0f);  // Pink
+            p.color = glm::vec4(1.0f, 0.4f + ctx.dist(ctx.rng) * 0.15f, 0.8f, 0.0f);
         }
         else if (colorChoice < 0.90f)
         {
-            p.color = glm::vec4(1.0f, 0.4f + ctx.dist(ctx.rng) * 0.15f, 0.2f, 0.0f);  // Red-orange
+            p.color = glm::vec4(1.0f, 0.4f + ctx.dist(ctx.rng) * 0.15f, 0.2f, 0.0f);
         }
         else
         {
-            p.color = glm::vec4(0.8f + ctx.dist(ctx.rng) * 0.15f, 0.4f, 1.0f, 0.0f);  // Purple
+            p.color = glm::vec4(0.8f + ctx.dist(ctx.rng) * 0.15f, 0.4f, 1.0f, 0.0f);
         }
 
         p.size = 3.0f + ctx.dist(ctx.rng) * 2.0f;
@@ -570,8 +488,6 @@ struct ParticleBehavior<ParticleType::Firefly>
     }
 };
 
-// Rain.
-
 template <>
 struct ParticleBehavior<ParticleType::Rain>
 {
@@ -579,27 +495,20 @@ struct ParticleBehavior<ParticleType::Rain>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Fade in smoothly over first 0.15 seconds
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.15f);
-        // Target alpha stored in phase
+        // Phase stores target alpha for rain.
         p.color.a = fadeIn * p.phase;
 
-        // Editor-zone rain (editor- or title-ambient-placed): die and splash
-        // when crossing the zone's bottom edge, same visual as weather rain.
-        // For zones larger than the viewport (e.g. the title whole-map zone),
-        // groundY is clamped into the visible area so the splash isn't off-screen.
+        // Zone rain lands at the bottom edge; oversized zones clamp impacts to the visible area.
         if (ctx.hasZones && p.zoneIndex >= 0 && p.zoneIndex < static_cast<int>(ctx.zones->size()))
         {
             const auto& zone = (*ctx.zones)[p.zoneIndex];
 
-            // Vary ground height per particle using position.x as seed
             float heightVariation =
                 std::fmod(std::abs(p.position.x * 7.3f + p.phase * 100.0f), 60.0f);
             float groundY = zone.position.y + zone.size.y + 20.0f + heightVariation;
-            // only for zones taller than the viewport (the title whole-map zone):
-            // spread the impact across a wide on-screen band (like HeavyRain/Blizzard
-            // bakedGroundY) so the ground reads as an area and splashes aren't off-screen.
-            // Normal zones keep their real bottom edge, else splashes appear mid-screen.
+            // Only oversized zones spread impacts across the viewport; normal zones retain their
+            // bottom edge.
             if (zone.size.y > ctx.viewSize.y)
             {
                 float spreadT = heightVariation / 60.0f;
@@ -613,10 +522,7 @@ struct ParticleBehavior<ParticleType::Rain>
             }
         }
 
-        // Weather-spawned rain: bakedGroundY (from SpawnWeatherParticle) is a
-        // screen-relative band, so it re-bases to the camera each frame. Else
-        // a camera sprinting down outruns the band and rain lands mid-screen
-        // while the revealed bottom half starves.
+        // Rebase the weather impact band so a moving camera cannot outrun it.
         if (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX && p.bakedGroundY > 0.0f)
         {
             p.bakedGroundY += ctx.cameraDelta.y;
@@ -651,16 +557,11 @@ struct ParticleBehavior<ParticleType::Rain>
         p.rotation = -35.0f - ctx.dist(ctx.rng) * 30.0f;
         p.additive = true;
 
-        // Weather-spawned rain gets bakedGroundY (and a per-particle lifetime
-        // to reach it) later in SpawnWeatherParticle, so its splash spans the
-        // full viewport height. Editor-zone rain keeps bakedGroundY == 0 and
-        // uses the zone-based ground detection above.
-
+        // Weather spawning bakes a per-particle ground band and lifetime later. editor rain keeps
+        // the zone edge as its impact height.
         ctx.particles.push_back(p);
     }
 };
-
-// Snow.
 
 template <>
 struct ParticleBehavior<ParticleType::Snow>
@@ -669,14 +570,10 @@ struct ParticleBehavior<ParticleType::Snow>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Snow drifts side to side
         float drift = std::sin(ctx.time * 1.5f + p.phase) * 20.0f;
         p.position.x += drift * ctx.deltaTime;
 
-        // Blizzard gusts: weather-zone snow layers a ~4 Hz per-particle jerk
-        // and a slow ~0.7 Hz surge on top of the baseline drift. Three
-        // frequencies driving X motion give a jerky, gusty feel; editor-zone
-        // snow keeps just the smooth drift.
+        // Weather snow adds 4 hz jitter and a 0.7 hz surge; editor snow keeps smooth drift.
         if (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX)
         {
             float gust = std::sin(ctx.time * 4.0f + p.phase * 2.3f) * 12.0f +
@@ -684,25 +581,21 @@ struct ParticleBehavior<ParticleType::Snow>
             p.position.x += gust * ctx.deltaTime;
         }
 
-        // Rotate as it falls
         float rotationSpeed = 30.0f + (p.phase / 6.28f) * 60.0f;  // 30-90 degrees per second
         if (std::fmod(p.phase, 2.0f) < 1.0f)
-            rotationSpeed = -rotationSpeed;  // Half rotate clockwise, half counter-clockwise
+            rotationSpeed = -rotationSpeed;
         p.rotation += rotationSpeed * ctx.deltaTime;
 
-        // Editor-zone snow (editor- or title-ambient-placed): puff at impact
-        // on the zone's bottom edge, matching weather snow, with per-particle
-        // ground-Y scatter. For zones larger than the viewport, groundY is
-        // clamped into the visible area so the puff isn't off-screen below.
+        // Zone snow impacts its bottom edge, clamped into view for oversized zones.
         if (ctx.hasZones && p.zoneIndex >= 0 && p.zoneIndex < static_cast<int>(ctx.zones->size()))
         {
             const auto& zone = (*ctx.zones)[p.zoneIndex];
             float heightVariation =
                 std::fmod(std::abs(p.position.x * 5.7f + p.phase * 80.0f), 60.0f);
             float groundY = zone.position.y + zone.size.y + 20.0f + heightVariation;
-            // Same rule as Rain: only zones taller than the viewport (title
-            // whole-map zone) spread impacts across the on-screen band;
-            // normal zones puff at their real bottom edge.
+
+            // A whole-map title zone spreads impacts across the view; normal zones keep their own
+            // bottom edge.
             if (zone.size.y > ctx.viewSize.y)
             {
                 float spreadT = heightVariation / 60.0f;
@@ -716,10 +609,7 @@ struct ParticleBehavior<ParticleType::Snow>
             }
         }
 
-        // Weather-spawned snow: bakedGroundY (from SpawnWeatherParticle) is a
-        // screen-relative band, so it re-bases to the camera each frame. Else
-        // a camera sprinting down outruns the band and snow lands mid-screen
-        // while the revealed bottom half starves.
+        // Rebase the weather impact band with camera motion.
         if (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX && p.bakedGroundY > 0.0f)
         {
             p.bakedGroundY += ctx.cameraDelta.y;
@@ -746,8 +636,8 @@ struct ParticleBehavior<ParticleType::Snow>
 
         p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.6f + ctx.dist(ctx.rng) * 0.15f);
 
-        // Readable flakes without letting the nearest variants dominate the scene.
-        // Weather size scale still multiplies on top in SpawnWeatherParticle.
+        // Keep the base flakes small; SpawnWeatherParticle applies any weather size scale
+        // afterwards.
         p.size = 3.0f + ctx.dist(ctx.rng) * 2.5f;
         p.lifetime = 15.0f;
         p.maxLifetime = p.lifetime;
@@ -759,62 +649,43 @@ struct ParticleBehavior<ParticleType::Snow>
     }
 };
 
-// Fog.
-
 template <>
 struct ParticleBehavior<ParticleType::Fog>
 {
-    // Zone / ambient fog density. Halved from 5.0 so fewer large puffs overlap
-    // into a solid wall (weather fog density is the per-weather baseSpawnRate).
     static constexpr float SpawnRate = 2.5f;
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Fog drifts very slowly
         float driftX = std::sin(ctx.time * 0.15f + p.phase) * 2.5f;
         float driftY = std::cos(ctx.time * 0.1f + p.phase * 0.5f) * 1.0f;
 
-        // Add subtle swirling motion for smoky effect
         float swirl = std::sin(ctx.time * 0.4f + p.phase * 2.0f) * 1.5f;
         p.position.x += (driftX + swirl) * ctx.deltaTime;
         p.position.y += driftY * ctx.deltaTime;
 
-        // Slow pulsing alpha
         float pulse = 0.9f + 0.1f * std::sin(ctx.time * 0.25f + p.phase);
 
-        // Long fade in and fade out for smooth feathered appearance
         float lifeFade = std::min(1.0f, p.lifetime / (p.maxLifetime * 0.4f));
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 4.0f);
 
-        // More visible during day, significantly less at night. The day boost is
-        // kept gentle (peaks at 1.15x, not 1.4x) so daytime fog stays a light
-        // haze instead of an opaque wall.
+        // Reduce alpha at night and keep the daytime boost small to avoid opaque overlapping fog.
         float dayBoost = 1.0f + (1.0f - ctx.nightFactor) * 0.15f;
         float nightReduce = 1.0f - ctx.nightFactor * 0.6f;
 
-        // Softening multiplier on the puff alpha. Weather fog uses the active weather's
-        // fogAlphaMultiplier, clamped to the strongest *designed* softening (0.65) so a
-        // fog->clear transition easing that value toward Clear's 1.0 can't flare dying/
-        // incoming fog. Editor/console/ambient fog uses a fixed 0.5 (never the 1.0 default).
+        // Cap weather fog softening at 0.65 to prevent transition brightening; other sources use
+        // 0.5.
         constexpr float kMaxFogSoftening = 0.65f;
         const float fogMul = (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX)
                                  ? std::min(ctx.fogAlphaMultiplier, kMaxFogSoftening)
                                  : 0.5f;
 
-        // Atmospheric layering: fog thicker near the ground, thinner up high.
-        // Anchored on the player's feet (playerPos.y) so the gradient tracks
-        // the scene's ground line as the player moves vertically. Floor at
-        // 0.3 keeps the very top of the world at 30% rather than vanishing.
+        // Anchor the fog height gradient to player feet; retain a 0.3 floor above ground.
         const float groundRefY = ctx.playerPos.y + 40.0f;
         constexpr float kFadeRange = 200.0f;
         const float verticalFactor =
             std::clamp(1.0f - (groundRefY - p.position.y) / kFadeRange, 0.3f, 1.0f);
 
-        // Master fog knob: the base opacity every fog puff starts from, before per-source
-        // softening through fogMul and the atmospheric factors above. It is tuned so the
-        // resulting per-puff peak lands near 0.30 and stays under the 0.36 ceiling that reads as
-        // a solid wall. Weather fog is cap-bound at 2500 puffs, so per-puff alpha rather than
-        // spawn rate is what moves fog density.
+        // Weather fog reaches its population cap; per-puff alpha then controls visible density.
         constexpr float kBaseAlpha = 0.40f;
         p.color.a = pulse * lifeFade * fadeIn * kBaseAlpha * fogMul * dayBoost * nightReduce *
                     verticalFactor;
@@ -837,8 +708,9 @@ struct ParticleBehavior<ParticleType::Fog>
         p.color = glm::vec4(grey, grey, grey, 0.0f);
 
         p.size = 48.0f + ctx.dist(ctx.rng) * 48.0f;
-        // Shorter lifetime (12-18s, was 18-30s) means fewer simultaneously-live
-        // puffs at the same spawn rate, further reducing stacked-alpha buildup.
+
+        // Limit lifetime as well as spawn rate: long-lived puffs accumulate alpha even when
+        // emission is sparse.
         p.lifetime = 12.0f + ctx.dist(ctx.rng) * 6.0f;
         p.maxLifetime = p.lifetime;
         p.phase = ctx.dist(ctx.rng) * 6.28f;
@@ -849,8 +721,6 @@ struct ParticleBehavior<ParticleType::Fog>
     }
 };
 
-// Sparkles.
-
 template <>
 struct ParticleBehavior<ParticleType::Sparkles>
 {
@@ -858,11 +728,7 @@ struct ParticleBehavior<ParticleType::Sparkles>
 
     static void Update(Particle& p, const ParticleUpdateContext&)
     {
-        // Fast attack, smooth quadratic decay - reads as a twinkle rather
-        // than a hard strobe, and doubles as the snow-puff droplet envelope
-        // (rain impacts use the dedicated RainSplash sprite type). The 4-frame
-        // glitter strip plays once across the same window (life-mapped in the
-        // render pass).
+        // Life-mapped glitter uses a fast attack and quadratic decay.
         float lifeRatio = 1.0f - (p.lifetime / p.maxLifetime);
         float attack = std::min(1.0f, lifeRatio / 0.12f);
         float decay = 1.0f - lifeRatio;
@@ -885,34 +751,31 @@ struct ParticleBehavior<ParticleType::Sparkles>
         float hueChoice = ctx.dist(ctx.rng);
         if (hueChoice < 0.25f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.9f + ctx.dist(ctx.rng) * 0.1f,
-                                0.6f + ctx.dist(ctx.rng) * 0.2f,
-                                1.0f);  // Warm gold
+            p.color = glm::vec4(
+                1.0f, 0.9f + ctx.dist(ctx.rng) * 0.1f, 0.6f + ctx.dist(ctx.rng) * 0.2f, 1.0f);
         }
         else if (hueChoice < 0.45f)
         {
-            p.color = glm::vec4(0.65f + ctx.dist(ctx.rng) * 0.1f, 0.85f, 1.0f, 1.0f);  // Cool blue
+            p.color = glm::vec4(0.65f + ctx.dist(ctx.rng) * 0.1f, 0.85f, 1.0f, 1.0f);
         }
         else if (hueChoice < 0.60f)
         {
-            p.color = glm::vec4(1.0f, 0.65f + ctx.dist(ctx.rng) * 0.1f, 0.9f, 1.0f);  // Pink
+            p.color = glm::vec4(1.0f, 0.65f + ctx.dist(ctx.rng) * 0.1f, 0.9f, 1.0f);
         }
         else if (hueChoice < 0.75f)
         {
-            p.color = glm::vec4(0.7f, 1.0f, 0.8f + ctx.dist(ctx.rng) * 0.1f, 1.0f);  // Mint
+            p.color = glm::vec4(0.7f, 1.0f, 0.8f + ctx.dist(ctx.rng) * 0.1f, 1.0f);
         }
         else if (hueChoice < 0.90f)
         {
-            p.color = glm::vec4(0.75f + ctx.dist(ctx.rng) * 0.1f, 0.7f, 1.0f, 1.0f);  // Lavender
+            p.color = glm::vec4(0.75f + ctx.dist(ctx.rng) * 0.1f, 0.7f, 1.0f, 1.0f);
         }
         else
         {
-            p.color = glm::vec4(1.0f, 0.75f + ctx.dist(ctx.rng) * 0.1f, 0.55f, 1.0f);  // Peach
+            p.color = glm::vec4(1.0f, 0.75f + ctx.dist(ctx.rng) * 0.1f, 0.55f, 1.0f);
         }
 
-        // The attack envelope in Update fades in from zero; spawning at the
-        // roulette's alpha 1.0 would render one full-bright frame first.
+        // Start at zero alpha to match the attack envelope on the first rendered frame.
         p.color.a = 0.0f;
 
         p.size = 2.0f + ctx.dist(ctx.rng) * 2.0f;
@@ -926,8 +789,6 @@ struct ParticleBehavior<ParticleType::Sparkles>
     }
 };
 
-// Wisp.
-
 template <>
 struct ParticleBehavior<ParticleType::Wisp>
 {
@@ -935,20 +796,17 @@ struct ParticleBehavior<ParticleType::Wisp>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Magical spiraling movement
         float spiralX = std::sin(ctx.time * 1.5f + p.phase) * 20.0f;
         float spiralY = std::cos(ctx.time * 1.2f + p.phase * 0.7f) * 15.0f;
         float wobble = std::sin(ctx.time * 3.0f + p.phase * 2.0f) * 8.0f;
         p.position.x += (spiralX + wobble) * ctx.deltaTime;
         p.position.y += spiralY * ctx.deltaTime;
 
-        // Gentle rotation
         float rotSpeed = 45.0f + (p.phase / 6.28f) * 30.0f;  // 45-75 deg/sec
         if (std::fmod(p.phase, 2.0f) < 1.0f)
             rotSpeed = -rotSpeed;
         p.rotation += rotSpeed * ctx.deltaTime;
 
-        // Pulsing glow effect
         float twinkle = 0.5f + 0.5f * std::sin(ctx.time * 4.0f + p.phase * 3.0f);
         float shimmer = 0.8f + 0.2f * std::sin(ctx.time * 7.0f + p.phase);
         float lifeFade = std::min(1.0f, p.lifetime / (p.maxLifetime * 0.25f));
@@ -972,59 +830,43 @@ struct ParticleBehavior<ParticleType::Wisp>
         float colorChoice = ctx.dist(ctx.rng);
         if (colorChoice < 0.16f)
         {
-            p.color = glm::vec4(0.5f + ctx.dist(ctx.rng) * 0.2f,
-                                0.75f + ctx.dist(ctx.rng) * 0.15f,
-                                1.0f,
-                                0.0f);  // Cyan
+            p.color = glm::vec4(
+                0.5f + ctx.dist(ctx.rng) * 0.2f, 0.75f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.0f);
         }
         else if (colorChoice < 0.32f)
         {
-            p.color = glm::vec4(0.75f + ctx.dist(ctx.rng) * 0.15f,
-                                0.5f + ctx.dist(ctx.rng) * 0.15f,
-                                1.0f,
-                                0.0f);  // Purple
+            p.color = glm::vec4(
+                0.75f + ctx.dist(ctx.rng) * 0.15f, 0.5f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.0f);
         }
         else if (colorChoice < 0.46f)
         {
-            p.color = glm::vec4(0.85f + ctx.dist(ctx.rng) * 0.15f,
-                                0.85f + ctx.dist(ctx.rng) * 0.15f,
-                                1.0f,
-                                0.0f);  // White-blue
+            p.color = glm::vec4(
+                0.85f + ctx.dist(ctx.rng) * 0.15f, 0.85f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.0f);
         }
         else if (colorChoice < 0.60f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.5f + ctx.dist(ctx.rng) * 0.2f,
-                                0.85f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Magenta
+            p.color = glm::vec4(
+                1.0f, 0.5f + ctx.dist(ctx.rng) * 0.2f, 0.85f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
         else if (colorChoice < 0.72f)
         {
-            p.color = glm::vec4(0.5f + ctx.dist(ctx.rng) * 0.2f,
-                                1.0f,
-                                0.6f + ctx.dist(ctx.rng) * 0.2f,
-                                0.0f);  // Green
+            p.color = glm::vec4(
+                0.5f + ctx.dist(ctx.rng) * 0.2f, 1.0f, 0.6f + ctx.dist(ctx.rng) * 0.2f, 0.0f);
         }
         else if (colorChoice < 0.82f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.7f + ctx.dist(ctx.rng) * 0.15f,
-                                0.4f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Amber
+            p.color = glm::vec4(
+                1.0f, 0.7f + ctx.dist(ctx.rng) * 0.15f, 0.4f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
         else if (colorChoice < 0.92f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.95f + ctx.dist(ctx.rng) * 0.05f,
-                                0.5f + ctx.dist(ctx.rng) * 0.2f,
-                                0.0f);  // Gold
+            p.color = glm::vec4(
+                1.0f, 0.95f + ctx.dist(ctx.rng) * 0.05f, 0.5f + ctx.dist(ctx.rng) * 0.2f, 0.0f);
         }
         else
         {
-            p.color = glm::vec4(1.0f,
-                                0.4f + ctx.dist(ctx.rng) * 0.2f,
-                                0.4f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Crimson
+            p.color = glm::vec4(
+                1.0f, 0.4f + ctx.dist(ctx.rng) * 0.2f, 0.4f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
 
         p.size = 3.0f + ctx.dist(ctx.rng) * 2.0f;
@@ -1038,8 +880,6 @@ struct ParticleBehavior<ParticleType::Wisp>
     }
 };
 
-// Lantern.
-
 template <>
 struct ParticleBehavior<ParticleType::Lantern>
 {
@@ -1047,7 +887,6 @@ struct ParticleBehavior<ParticleType::Lantern>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Stationary glow, only visible at night
         if (ctx.nightFactor < 0.05f)
         {
             p.color.a = 0.0f;
@@ -1086,8 +925,6 @@ struct ParticleBehavior<ParticleType::Lantern>
     }
 };
 
-// Sunshine.
-
 template <>
 struct ParticleBehavior<ParticleType::Sunshine>
 {
@@ -1095,7 +932,6 @@ struct ParticleBehavior<ParticleType::Sunshine>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Sun & moon rays, yellow during day, blue during night
         float shimmer = 0.95f + 0.05f * std::sin(ctx.time * 1.2f + p.phase);
         float flicker = 0.97f + 0.03f * std::sin(ctx.time * 3.0f + p.phase * 1.5f);
 
@@ -1104,18 +940,16 @@ struct ParticleBehavior<ParticleType::Sunshine>
 
         if (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX)
         {
-            // GodRays weather: each Sunshine beam picks a fixed rainbow
-            // palette tier from its phase. Phase is set once at spawn in
-            // [0, 2pi] so the tier stays stable for the particle's life -
-            // cycling hues mid-flight would read as flicker, not prism.
+            // Derive the rainbow tier from spawn phase so hues stay fixed throughout each beam
+            // lifetime.
             static constexpr glm::vec3 kRainbow[7] = {
-                {1.00f, 0.20f, 0.20f},  // Red
-                {1.00f, 0.55f, 0.15f},  // Orange
-                {1.00f, 0.95f, 0.30f},  // Yellow
-                {0.30f, 0.95f, 0.40f},  // Green
-                {0.30f, 0.85f, 1.00f},  // Cyan
-                {0.30f, 0.45f, 1.00f},  // Blue
-                {0.75f, 0.30f, 1.00f},  // Violet
+                {1.00f, 0.20f, 0.20f},
+                {1.00f, 0.55f, 0.15f},
+                {1.00f, 0.95f, 0.30f},
+                {0.30f, 0.95f, 0.40f},
+                {0.30f, 0.85f, 1.00f},
+                {0.30f, 0.45f, 1.00f},
+                {0.75f, 0.30f, 1.00f},
             };
             const int hue = std::min(6, static_cast<int>(p.phase * (7.0f / 6.2832f)));
             p.color.r = kRainbow[hue].r;
@@ -1124,7 +958,7 @@ struct ParticleBehavior<ParticleType::Sunshine>
         }
         else
         {
-            // Editor zones: interpolate between golden yellow (day) and pale blue (night).
+            // Editor rays interpolate from daytime gold to nighttime blue.
             float nightBlend = ctx.nightFactor;
             p.color.r = 1.0f * (1.0f - nightBlend) + 0.5f * nightBlend;
             p.color.g = 0.9f * (1.0f - nightBlend) + 0.7f * nightBlend;
@@ -1137,7 +971,6 @@ struct ParticleBehavior<ParticleType::Sunshine>
 
     static void Spawn(int zoneIndex, const ParticleZone& zone, ParticleSpawnContext& ctx)
     {
-        // Helper: Check if a point is covered by a sunshine ray
         auto pointInRay = [](glm::vec2 point, const Particle& ray) -> bool
         {
             float halfWidth = ray.size * 0.5f;
@@ -1153,7 +986,6 @@ struct ParticleBehavior<ParticleType::Sunshine>
             return std::abs(rotated.x) <= halfWidth && std::abs(rotated.y) <= halfHeight;
         };
 
-        // Helper: Count how many existing sunshine rays cover a point
         auto countRaysAtPoint = [&](glm::vec2 point) -> int
         {
             int count = 0;
@@ -1165,7 +997,7 @@ struct ParticleBehavior<ParticleType::Sunshine>
             return count;
         };
 
-        // Helper: Check if a candidate ray would create a point with 3+ overlapping rays
+        // Reject a candidate when its coverage would create a third overlapping ray.
         auto wouldOvercrowd = [&](glm::vec2 pos, float rotation, float size) -> bool
         {
             float halfWidth = size * 0.5f;
@@ -1192,7 +1024,6 @@ struct ParticleBehavior<ParticleType::Sunshine>
             return false;
         };
 
-        // Try to find a valid spawn position (max 3 attempts)
         for (int attempt = 0; attempt < 3; attempt++)
         {
             Particle p;
@@ -1227,8 +1058,6 @@ struct ParticleBehavior<ParticleType::Sunshine>
     }
 };
 
-// DriftingLeaf - small leaf drifting on prevailing wind.
-
 template <>
 struct ParticleBehavior<ParticleType::DriftingLeaf>
 {
@@ -1236,10 +1065,7 @@ struct ParticleBehavior<ParticleType::DriftingLeaf>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Wind drift with gentle Y oscillation, scaled by strength (0.5 = 18
-        // px/s baseline). velocity.x is a sign-flag from SpawnWeatherParticle:
-        // > 0 means drift counter to the global wind, so weather spawns enter
-        // from both edges. Ambient (zoneless) spawns stay at zero (default wind).
+        // velocity.x > 0 reverses wind X for left-edge spawns; ambient uses the global direction.
         glm::vec2 wind = glm::normalize(ctx.windDir);
         if (p.velocity.x > 0.0f)
         {
@@ -1248,22 +1074,16 @@ struct ParticleBehavior<ParticleType::DriftingLeaf>
         p.position += wind * (18.0f * 2.0f * ctx.windStrength) * ctx.deltaTime;
         p.position.y += std::sin(ctx.time * 1.4f + p.phase) * 6.0f * ctx.deltaTime;
 
-        // Weather-spawned leaves slide off the player's hitbox like water on
-        // a moving surface, with a swirl band and a slipstream wake layered
-        // on top (see ApplyPlayerHitboxRepulsion). Ambient (zoneless) leaves
-        // drift through without interaction.
+        // Only weather leaves interact with the player avoidance field.
         float proximity = 0.0f;
         if (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX)
         {
             ApplyPlayerHitboxRepulsion(p, ctx, &proximity);
         }
 
-        // Rotation rate gets a boost (up to 3x) when a leaf is caught in the
-        // swirl band, so disturbed leaves visibly tumble harder than ambient
-        // ones drifting on the wind.
+        // Increase tumble in the wake band so disturbed leaves separate from the background drift.
         p.rotation += 25.0f * (1.0f + 2.0f * proximity) * ctx.deltaTime;
 
-        // Subtle alpha curve: fade in / fade out over lifetime.
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.8f);
         float lifeFade = std::min(1.0f, p.lifetime / 1.5f);
         p.color.a = fadeIn * lifeFade * ambience::AMBIENT_PARTICLE_ALPHA_CAP;
@@ -1286,56 +1106,56 @@ struct ParticleBehavior<ParticleType::DriftingLeaf>
             p.color = glm::vec4(0.35f + ctx.dist(ctx.rng) * 0.20f,
                                 0.65f + ctx.dist(ctx.rng) * 0.25f,
                                 0.20f + ctx.dist(ctx.rng) * 0.20f,
-                                0.0f);  // Green (fresh)
+                                0.0f);
         }
         else if (leafChoice < 0.28f)
         {
             p.color = glm::vec4(0.50f + ctx.dist(ctx.rng) * 0.20f,
                                 0.25f + ctx.dist(ctx.rng) * 0.20f,
                                 0.10f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Brown (dead)
+                                0.0f);
         }
         else if (leafChoice < 0.48f)
         {
             p.color = glm::vec4(0.85f + ctx.dist(ctx.rng) * 0.15f,
                                 0.65f + ctx.dist(ctx.rng) * 0.20f,
                                 0.20f + ctx.dist(ctx.rng) * 0.20f,
-                                0.0f);  // Gold (autumn)
+                                0.0f);
         }
         else if (leafChoice < 0.63f)
         {
             p.color = glm::vec4(0.85f + ctx.dist(ctx.rng) * 0.15f,
                                 0.25f + ctx.dist(ctx.rng) * 0.20f,
                                 0.15f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Red (maple)
+                                0.0f);
         }
         else if (leafChoice < 0.71f)
         {
             p.color = glm::vec4(0.60f + ctx.dist(ctx.rng) * 0.15f,
                                 0.85f + ctx.dist(ctx.rng) * 0.15f,
                                 0.30f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Yellow-green
+                                0.0f);
         }
         else if (leafChoice < 0.84f)
         {
             p.color = glm::vec4(0.95f + ctx.dist(ctx.rng) * 0.05f,
                                 0.50f + ctx.dist(ctx.rng) * 0.15f,
                                 0.15f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Orange (pumpkin)
+                                0.0f);
         }
         else if (leafChoice < 0.93f)
         {
             p.color = glm::vec4(0.55f + ctx.dist(ctx.rng) * 0.20f,
                                 0.15f + ctx.dist(ctx.rng) * 0.15f,
                                 0.20f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Burgundy (oak)
+                                0.0f);
         }
         else
         {
             p.color = glm::vec4(0.75f + ctx.dist(ctx.rng) * 0.15f,
                                 0.45f + ctx.dist(ctx.rng) * 0.15f,
                                 0.15f + ctx.dist(ctx.rng) * 0.10f,
-                                0.0f);  // Amber (copper)
+                                0.0f);
         }
         p.size = 4.5f + ctx.dist(ctx.rng) * 2.5f;
         p.lifetime = 10.0f + ctx.dist(ctx.rng) * 5.0f;
@@ -1345,8 +1165,6 @@ struct ParticleBehavior<ParticleType::DriftingLeaf>
     }
 };
 
-// DustMote - tiny golden mote in sunbeams.
-
 template <>
 struct ParticleBehavior<ParticleType::DustMote>
 {
@@ -1354,7 +1172,6 @@ struct ParticleBehavior<ParticleType::DustMote>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Slow vertical rise/fall + small horizontal jitter.
         p.position.y += std::sin(ctx.time * 0.6f + p.phase) * 4.0f * ctx.deltaTime;
         p.position.x += std::cos(ctx.time * 0.4f + p.phase * 1.3f) * 3.0f * ctx.deltaTime;
 
@@ -1375,23 +1192,20 @@ struct ParticleBehavior<ParticleType::DustMote>
         p.velocity = glm::vec2(0.0f);
         p.phase = ctx.dist(ctx.rng) * 6.28f;
         p.rotation = ctx.dist(ctx.rng) * 360.0f;
-        // DustMote is dust caught in light - strictly neutral. R == G == B for
-        // every spawn so the palette never drifts into colored territory.
-        // Spread across white/light-grey/mid-grey buckets; pure-black is
-        // skipped because additive blending would render it invisible.
+        // Neutral dust uses equal RGB channels; additive blending makes black invisible.
         const float greyChoice = ctx.dist(ctx.rng);
         float grey;
         if (greyChoice < 0.45f)
         {
-            grey = 0.92f + ctx.dist(ctx.rng) * 0.08f;  // Bright white
+            grey = 0.92f + ctx.dist(ctx.rng) * 0.08f;
         }
         else if (greyChoice < 0.80f)
         {
-            grey = 0.65f + ctx.dist(ctx.rng) * 0.15f;  // Light grey
+            grey = 0.65f + ctx.dist(ctx.rng) * 0.15f;
         }
         else
         {
-            grey = 0.40f + ctx.dist(ctx.rng) * 0.15f;  // Mid grey (dim mote)
+            grey = 0.40f + ctx.dist(ctx.rng) * 0.15f;
         }
         p.color = glm::vec4(grey, grey, grey, 0.0f);
         p.size = 3.0f + ctx.dist(ctx.rng) * 1.5f;
@@ -1402,8 +1216,6 @@ struct ParticleBehavior<ParticleType::DustMote>
     }
 };
 
-// Pollen - yellow drift during golden hour.
-
 template <>
 struct ParticleBehavior<ParticleType::Pollen>
 {
@@ -1411,10 +1223,7 @@ struct ParticleBehavior<ParticleType::Pollen>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Horizontal drift on the gusted wind, very gentle vertical sway,
-        // scaled continuously by strength (0.5 = today's 8 px/s baseline).
-        // velocity.x is a sign-flag set by SpawnWeatherParticle so weather
-        // pollen can drift in from either edge (see DriftingLeaf::Update).
+        // velocity.x selects the wind X sign for weather pollen entering from either edge.
         glm::vec2 wind = glm::normalize(ctx.windDir);
         if (p.velocity.x > 0.0f)
         {
@@ -1423,9 +1232,7 @@ struct ParticleBehavior<ParticleType::Pollen>
         p.position += wind * (8.0f * 2.0f * ctx.windStrength) * ctx.deltaTime;
         p.position.y += std::sin(ctx.time * 0.9f + p.phase) * 3.0f * ctx.deltaTime;
 
-        // Weather-spawned pollen slides off the player's hitbox like water
-        // on a moving surface. Ambient (zoneless) pollen drifts through
-        // without interaction.
+        // Ambient pollen skips player avoidance.
         if (p.zoneIndex == ParticleSystem::WEATHER_ZONE_INDEX)
         {
             ApplyPlayerHitboxRepulsion(p, ctx);
@@ -1447,57 +1254,42 @@ struct ParticleBehavior<ParticleType::Pollen>
         p.velocity = glm::vec2(0.0f);
         p.phase = ctx.dist(ctx.rng) * 6.28f;
         p.rotation = ctx.dist(ctx.rng) * 360.0f;
-        // Pollen is the chromatic ambient palette - the white/grey range is
-        // owned by DustMote, so dandelion white is intentionally absent here.
+        // Pollen supplies chromatic motes; DustMote supplies neutral ones.
         float speciesChoice = ctx.dist(ctx.rng);
         if (speciesChoice < 0.26f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.95f + ctx.dist(ctx.rng) * 0.05f,
-                                0.50f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Yellow
+            p.color = glm::vec4(
+                1.0f, 0.95f + ctx.dist(ctx.rng) * 0.05f, 0.50f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
         else if (speciesChoice < 0.48f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.70f + ctx.dist(ctx.rng) * 0.15f,
-                                0.80f + ctx.dist(ctx.rng) * 0.10f,
-                                0.0f);  // Pink (cherry blossom)
+            p.color = glm::vec4(
+                1.0f, 0.70f + ctx.dist(ctx.rng) * 0.15f, 0.80f + ctx.dist(ctx.rng) * 0.10f, 0.0f);
         }
         else if (speciesChoice < 0.62f)
         {
-            p.color = glm::vec4(0.80f + ctx.dist(ctx.rng) * 0.15f,
-                                1.0f,
-                                0.65f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Pale green
+            p.color = glm::vec4(
+                0.80f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.65f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
         else if (speciesChoice < 0.74f)
         {
-            p.color = glm::vec4(0.85f + ctx.dist(ctx.rng) * 0.10f,
-                                0.70f + ctx.dist(ctx.rng) * 0.15f,
-                                1.0f,
-                                0.0f);  // Lavender
+            p.color = glm::vec4(
+                0.85f + ctx.dist(ctx.rng) * 0.10f, 0.70f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.0f);
         }
         else if (speciesChoice < 0.86f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.65f + ctx.dist(ctx.rng) * 0.10f,
-                                0.30f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Orange (marigold)
+            p.color = glm::vec4(
+                1.0f, 0.65f + ctx.dist(ctx.rng) * 0.10f, 0.30f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
         else if (speciesChoice < 0.94f)
         {
-            p.color = glm::vec4(1.0f,
-                                0.55f + ctx.dist(ctx.rng) * 0.15f,
-                                0.55f + ctx.dist(ctx.rng) * 0.15f,
-                                0.0f);  // Coral
+            p.color = glm::vec4(
+                1.0f, 0.55f + ctx.dist(ctx.rng) * 0.15f, 0.55f + ctx.dist(ctx.rng) * 0.15f, 0.0f);
         }
         else
         {
-            p.color = glm::vec4(1.0f,
-                                0.35f + ctx.dist(ctx.rng) * 0.15f,
-                                0.85f + ctx.dist(ctx.rng) * 0.10f,
-                                0.0f);  // Magenta
+            p.color = glm::vec4(
+                1.0f, 0.35f + ctx.dist(ctx.rng) * 0.15f, 0.85f + ctx.dist(ctx.rng) * 0.10f, 0.0f);
         }
         p.size = 3.0f + ctx.dist(ctx.rng) * 1.5f;
         p.lifetime = 7.0f + ctx.dist(ctx.rng) * 5.0f;
@@ -1507,8 +1299,6 @@ struct ParticleBehavior<ParticleType::Pollen>
     }
 };
 
-// CherryBlossom - drifting pink petals, gentle spiral, additive blend.
-
 template <>
 struct ParticleBehavior<ParticleType::CherryBlossom>
 {
@@ -1516,8 +1306,8 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Per-particle drift amplitude/frequency derived from phase so each
-        // blossom flutters with its own personality.
+        // Derive flutter amplitude and frequency from phase to keep neighboring blossoms out of
+        // step.
         float ampX = 14.0f + 10.0f * std::abs(std::sin(p.phase * 0.7f));
         float ampY = 4.0f + 6.0f * std::abs(std::cos(p.phase * 0.9f));
         float freqX = 0.6f + 0.4f * std::sin(p.phase * 1.3f);
@@ -1526,7 +1316,7 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
         float driftX = std::sin(ctx.time * (0.7f + freqX) + p.phase) * ampX;
         float driftY = std::cos(ctx.time * (0.5f + freqY) + p.phase * 1.4f) * ampY;
         p.position.x += driftX * ctx.deltaTime;
-        // Net downward drift varies (some blossoms fall faster than others).
+
         float fallSpeed = 14.0f + 14.0f * std::abs(std::sin(p.phase * 2.1f));
         p.position.y += (fallSpeed + driftY) * ctx.deltaTime;
 
@@ -1535,10 +1325,7 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
                          (std::cos(p.phase * 0.9f) > 0.0f ? 1.0f : -1.0f);
         p.rotation += rotSpeed * ctx.deltaTime;
 
-        // Fade in/out for smooth lifetime endings. Peak alpha is encoded in
-        // the X velocity (re-purposed as a static per-particle scalar - the
-        // Update path never reads velocity for CherryBlossom). A subtle
-        // shimmer pulse layered on top adds life.
+        // velocity.x stores peak alpha; the generic position integration still reads it.
         float peak = std::clamp(p.velocity.x, 0.2f, 1.0f);
         float fade = std::min(p.lifetime / 1.2f, (p.maxLifetime - p.lifetime) / 0.7f);
         float shimmer = 0.85f + 0.15f * std::sin(ctx.time * 1.8f + p.phase * 2.3f);
@@ -1547,12 +1334,7 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
 
     static void Spawn(int zoneIndex, const ParticleZone& zone, ParticleSpawnContext& ctx)
     {
-        // Tiered spawning gives blossoms variety in size, hue, and presence.
-        // 55%: small background petals (subtle, pale)
-        // 33%: medium showcase petals (mid-pink) + a 1.7x shine halo
-        // 12%: large glow petals (hot pink) + a 2.2x shine halo
-        // Both halo tiers append a second particle, so ~45% of blossom spawns
-        // cost two particles against the weather cap.
+        // Medium and large blossom tiers add a halo, so about 45% of spawns consume two particles.
         float tierRoll = ctx.dist(ctx.rng);
 
         Particle p;
@@ -1561,8 +1343,7 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
         p.noProjection = zone.noProjection;
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
-        // velocity.x stores the per-particle peak alpha (read by Update);
-        // velocity.y stays 0 since Update applies its own fall speed.
+        // velocity.x stores peak alpha; velocity.y remains zero.
         p.velocity = glm::vec2(0.0f);
         p.lifetime = 8.0f + ctx.dist(ctx.rng) * 7.0f;
         p.maxLifetime = p.lifetime;
@@ -1570,43 +1351,36 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
         p.rotation = ctx.dist(ctx.rng) * 360.0f;
         p.additive = true;
 
-        // Pink-forward palette: the bulk of petals are saturated sakura pink
-        // and hot pink. Pale and white variants are deliberately rare so the
-        // overall flurry reads as a confident pink wash, not washed-out.
+        // Favor saturated pink petals; sparse pale variants preserve contrast without whitening
+        // the flurry.
         float hueRoll = ctx.dist(ctx.rng);
         if (hueRoll < 0.40f)
         {
-            // Saturated sakura pink - primary, vivid hue.
             p.color = glm::vec4(
                 1.00f, 0.55f + ctx.dist(ctx.rng) * 0.10f, 0.78f + ctx.dist(ctx.rng) * 0.06f, 0.0f);
         }
         else if (hueRoll < 0.65f)
         {
-            // Hot pink / deep magenta accent.
             p.color = glm::vec4(
                 1.00f, 0.40f + ctx.dist(ctx.rng) * 0.10f, 0.70f + ctx.dist(ctx.rng) * 0.08f, 0.0f);
         }
         else if (hueRoll < 0.80f)
         {
-            // Soft pale pink - supporting hue, less common than before.
             p.color = glm::vec4(
                 1.00f, 0.78f + ctx.dist(ctx.rng) * 0.08f, 0.86f + ctx.dist(ctx.rng) * 0.05f, 0.0f);
         }
         else if (hueRoll < 0.88f)
         {
-            // Peachy blush - warm coral accent.
             p.color = glm::vec4(
                 1.00f, 0.72f + ctx.dist(ctx.rng) * 0.05f, 0.66f + ctx.dist(ctx.rng) * 0.06f, 0.0f);
         }
         else if (hueRoll < 0.94f)
         {
-            // Deep crimson red - dramatic accent.
             p.color = glm::vec4(
                 1.00f, 0.28f + ctx.dist(ctx.rng) * 0.10f, 0.45f + ctx.dist(ctx.rng) * 0.10f, 0.0f);
         }
         else if (hueRoll < 0.98f)
         {
-            // Violet/purple - rare cool accent.
             p.color = glm::vec4(0.85f + ctx.dist(ctx.rng) * 0.08f,
                                 0.50f + ctx.dist(ctx.rng) * 0.08f,
                                 0.95f + ctx.dist(ctx.rng) * 0.05f,
@@ -1614,23 +1388,18 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
         }
         else
         {
-            // Almost-white highlight - very rare, used as visual punctuation.
             p.color = glm::vec4(
                 1.00f, 0.92f + ctx.dist(ctx.rng) * 0.05f, 0.94f + ctx.dist(ctx.rng) * 0.04f, 0.0f);
         }
 
-        // Halo defaults to a saturated pink so the bloom amplifies the petal's
-        // hue. For the crimson and violet variants the halo tilts toward those
-        // families so the bloom complements rather than fights the petal.
-        glm::vec4 haloColor = glm::vec4(1.00f, 0.55f, 0.78f, 0.0f);  // pink halo
+        // Match halo hue to the petal family so bloom preserves the selected color.
+        glm::vec4 haloColor = glm::vec4(1.00f, 0.55f, 0.78f, 0.0f);
         if (hueRoll >= 0.88f && hueRoll < 0.94f)
-            haloColor = glm::vec4(1.00f, 0.40f, 0.55f, 0.0f);  // pink-red halo
+            haloColor = glm::vec4(1.00f, 0.40f, 0.55f, 0.0f);
         else if (hueRoll >= 0.94f && hueRoll < 0.98f)
-            haloColor = glm::vec4(0.85f, 0.55f, 1.00f, 0.0f);  // violet halo
+            haloColor = glm::vec4(0.85f, 0.55f, 1.00f, 0.0f);
 
-        // Shared helper: append a halo particle behind `source` for the
-        // "shine glow" look. Halo is larger, dimmer, additive, with phase
-        // offset so its shimmer doesn't lockstep with the petal.
+        // Append a larger additive halo with a phase offset to separate its shimmer.
         auto appendHalo = [&](const Particle& source, float sizeMul, float peakAlpha)
         {
             Particle halo = source;
@@ -1643,31 +1412,26 @@ struct ParticleBehavior<ParticleType::CherryBlossom>
 
         if (tierRoll < 0.55f)
         {
-            // Background petal: small but bright enough to read.
             p.size = 1.6f + ctx.dist(ctx.rng) * 1.6f;
-            p.velocity.x = 0.65f + ctx.dist(ctx.rng) * 0.20f;  // Peak alpha 0.65-0.85.
+            p.velocity.x = 0.65f + ctx.dist(ctx.rng) * 0.20f;
             ctx.particles.push_back(p);
         }
         else if (tierRoll < 0.88f)
         {
-            // Mid-tier showcase petal: gets a soft shine glow.
             p.size = 2.8f + ctx.dist(ctx.rng) * 1.8f;
-            p.velocity.x = 0.85f + ctx.dist(ctx.rng) * 0.12f;  // Peak alpha 0.85-0.97.
+            p.velocity.x = 0.85f + ctx.dist(ctx.rng) * 0.12f;
             ctx.particles.push_back(p);
             appendHalo(p, 1.7f, 0.15f + ctx.dist(ctx.rng) * 0.08f);
         }
         else
         {
-            // Premium glow petal: brightest core + a stronger shine halo.
             p.size = 4.5f + ctx.dist(ctx.rng) * 2.5f;
-            p.velocity.x = 0.95f + ctx.dist(ctx.rng) * 0.05f;  // Peak alpha 0.95-1.00.
+            p.velocity.x = 0.95f + ctx.dist(ctx.rng) * 0.05f;
             ctx.particles.push_back(p);
             appendHalo(p, 2.2f, 0.25f + ctx.dist(ctx.rng) * 0.12f);
         }
     }
 };
-
-// Ash - gray particles, slow fall + horizontal flutter, alpha blend.
 
 template <>
 struct ParticleBehavior<ParticleType::Ash>
@@ -1678,10 +1442,8 @@ struct ParticleBehavior<ParticleType::Ash>
     {
         float flutter = std::sin(ctx.time * 1.2f + p.phase) * 8.0f;
         p.position.x += flutter * ctx.deltaTime;
-        // velocity.y is set at spawn for a slow constant fall.
 
-        // Downstream lean on the gusted wind (~10 px/s at the calm 0.5
-        // anchor, doubling in storms) so AshFall answers windIntensity.
+        // Wind strength scales ash drift; 0.5 gives about 10 px/s.
         p.position.x += ctx.windDir.x * 20.0f * ctx.windStrength * ctx.deltaTime;
 
         float fade = std::min(p.lifetime / 2.0f, (p.maxLifetime - p.lifetime) / 1.0f);
@@ -1697,7 +1459,7 @@ struct ParticleBehavior<ParticleType::Ash>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = 0.0f;
-        p.velocity.y = 12.0f + ctx.dist(ctx.rng) * 10.0f;  // Slow, steady fall.
+        p.velocity.y = 12.0f + ctx.dist(ctx.rng) * 10.0f;
         p.color = glm::vec4(0.70f, 0.70f, 0.72f + ctx.dist(ctx.rng) * 0.05f, 0.0f);
         p.size = 2.0f + ctx.dist(ctx.rng) * 2.0f;
         p.lifetime = 10.0f + ctx.dist(ctx.rng) * 10.0f;
@@ -1709,8 +1471,6 @@ struct ParticleBehavior<ParticleType::Ash>
     }
 };
 
-// Ember - orange particles rising upward, additive flicker.
-
 template <>
 struct ParticleBehavior<ParticleType::Ember>
 {
@@ -1718,11 +1478,9 @@ struct ParticleBehavior<ParticleType::Ember>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Slight horizontal wobble.
         float wobble = std::sin(ctx.time * 4.0f + p.phase) * 4.0f;
         p.position.x += wobble * ctx.deltaTime;
 
-        // Rapid alpha flicker simulating a glowing ember.
         float flicker = 0.6f + 0.4f * std::sin(ctx.time * 12.0f + p.phase * 2.0f);
         float life = std::min(p.lifetime / 0.6f, (p.maxLifetime - p.lifetime) / 0.3f);
         p.color.a = std::clamp(life, 0.0f, 1.0f) * flicker * 0.9f;
@@ -1737,7 +1495,7 @@ struct ParticleBehavior<ParticleType::Ember>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = (ctx.dist(ctx.rng) - 0.5f) * 8.0f;
-        p.velocity.y = -(30.0f + ctx.dist(ctx.rng) * 30.0f);  // Rises (Y- is up).
+        p.velocity.y = -(30.0f + ctx.dist(ctx.rng) * 30.0f);
         p.color = glm::vec4(
             0.95f, 0.45f + ctx.dist(ctx.rng) * 0.15f, 0.15f + ctx.dist(ctx.rng) * 0.10f, 0.0f);
         p.size = 4.0f + ctx.dist(ctx.rng) * 2.0f;
@@ -1750,8 +1508,6 @@ struct ParticleBehavior<ParticleType::Ember>
     }
 };
 
-// Sand - fast horizontal wind-driven streaks, alpha blend.
-
 template <>
 struct ParticleBehavior<ParticleType::Sand>
 {
@@ -1759,7 +1515,6 @@ struct ParticleBehavior<ParticleType::Sand>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // velocity is set at spawn; just fade.
         float fade = std::min(p.lifetime / 0.2f, (p.maxLifetime - p.lifetime) / 0.1f);
         p.color.a = std::clamp(fade, 0.0f, 1.0f) * 0.6f;
     }
@@ -1772,13 +1527,10 @@ struct ParticleBehavior<ParticleType::Sand>
         p.noProjection = zone.noProjection;
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
-        // Wind blows right (+X) by default; the gusted strength scales the
-        // streak speed (0.5 = today's 100-200 px/s anchor). Sand keeps its
-        // own +X axis this phase - the spawn-edge bias in SpawnWeatherParticle
-        // assumes rightward travel; direction unification is deferred.
+        // Sand always travels +X; weather spawn-edge selection assumes this direction.
         const float windScale = 2.0f * ctx.windStrength;
         p.velocity.x = (100.0f + ctx.dist(ctx.rng) * 100.0f) * windScale;
-        p.velocity.y = 10.0f + ctx.dist(ctx.rng) * 15.0f;  // Slight downward drift.
+        p.velocity.y = 10.0f + ctx.dist(ctx.rng) * 15.0f;
         p.color = glm::vec4(0.85f, 0.72f, 0.45f + ctx.dist(ctx.rng) * 0.10f, 0.0f);
         p.size = 3.0f + ctx.dist(ctx.rng) * 3.0f;
         p.lifetime = 0.3f + ctx.dist(ctx.rng) * 0.5f;
@@ -1790,9 +1542,7 @@ struct ParticleBehavior<ParticleType::Sand>
     }
 };
 
-// Smoke - rising, expanding puffs for chimneys and campfires. Distinct from
-// Fog: smoke climbs and bends downstream on the wind instead of hanging.
-
+// Rising smoke expands and bends with wind; it does not remain at a fixed ground point.
 template <>
 struct ParticleBehavior<ParticleType::Smoke>
 {
@@ -1800,16 +1550,13 @@ struct ParticleBehavior<ParticleType::Smoke>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Buoyant rise comes from the spawn velocity; flow noise billows the
-        // column and the prevailing wind bends it downstream. Sway widens
-        // with age so the plume opens up as it climbs.
+        // Spawn velocity provides rise; phase noise and wind widen the plume with age.
         const float age = 1.0f - p.lifetime / p.maxLifetime;
         const glm::vec2 flow = FlowNoise(p.position, ctx.time, p.phase);
         p.position.x += (flow.x * (4.0f + 14.0f * age) + ctx.windDir.x * 14.0f * ctx.windStrength) *
                         ctx.deltaTime;
         p.position.y += flow.y * 2.5f * ctx.deltaTime;
 
-        // Puffs expand as they rise and thin out toward the end.
         p.size += (3.0f + 2.0f * (0.5f + 0.5f * std::sin(p.phase))) * ctx.deltaTime;
 
         float fade = std::min(age / 0.12f, (1.0f - age) / 0.45f);
@@ -1826,10 +1573,9 @@ struct ParticleBehavior<ParticleType::Smoke>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = (ctx.dist(ctx.rng) - 0.5f) * 4.0f;
-        p.velocity.y = -(14.0f + ctx.dist(ctx.rng) * 10.0f);  // Buoyant rise.
-        // Near-white with a whisper of warmth so campfire smoke reads as light
-        // vapor - not a dark grey blob - and doesn't tint blue against warm
-        // scenes. The behavior's 0.5 alpha ceiling keeps it a bit see-through.
+        p.velocity.y = -(14.0f + ctx.dist(ctx.rng) * 10.0f);
+
+        // A warm near-white tint avoids blue smoke over warm scenes; alpha stays below 0.5.
         float grey = 0.82f + ctx.dist(ctx.rng) * 0.13f;
         p.color = glm::vec4(grey * 1.04f, grey, grey * 0.98f, 0.0f);
         p.size = 8.0f + ctx.dist(ctx.rng) * 6.0f;
@@ -1842,8 +1588,7 @@ struct ParticleBehavior<ParticleType::Smoke>
     }
 };
 
-// Steam - fast-rising, short-lived white vapor for vents and hot springs.
-
+// Steam rises faster and expires sooner than smoke.
 template <>
 struct ParticleBehavior<ParticleType::Steam>
 {
@@ -1855,7 +1600,6 @@ struct ParticleBehavior<ParticleType::Steam>
         const glm::vec2 flow = FlowNoise(p.position, ctx.time, p.phase);
         p.position.x += flow.x * (3.0f + 6.0f * age) * ctx.deltaTime;
 
-        // Vapor expands quickly and dissipates before it travels far.
         p.size += 5.0f * ctx.deltaTime;
 
         float fade = std::min(age / 0.10f, (1.0f - age) / 0.55f);
@@ -1884,9 +1628,7 @@ struct ParticleBehavior<ParticleType::Steam>
     }
 };
 
-// Aurora - soft hand-painted aurora motes riding slow sky ribbons. The three
-// sprite variants carry the hue spread and remain equally visible at every
-// time of day; the weather never changes the clock or forces a night factor.
+// Aurora artwork supplies hue variants; time of day does not alter their visibility.
 
 template <>
 struct ParticleBehavior<ParticleType::Aurora>
@@ -1895,7 +1637,6 @@ struct ParticleBehavior<ParticleType::Aurora>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Slow ribbon drift: long horizontal wave, gentle vertical bob.
         p.position.x += std::sin(ctx.time * 0.30f + p.phase) * 8.0f * ctx.deltaTime;
         p.position.y += std::cos(ctx.time * 0.22f + p.phase * 0.7f) * 4.0f * ctx.deltaTime;
 
@@ -1914,8 +1655,8 @@ struct ParticleBehavior<ParticleType::Aurora>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        // Muted cool casts over the painted sprite - emerald / cyan / violet.
-        // Normal alpha blending below lets the sky show through each mote.
+
+        // Use normal alpha blending so the sky remains visible through colored aurora motes.
         float cast = ctx.dist(ctx.rng);
         if (cast < 0.35f)
         {
@@ -1939,9 +1680,7 @@ struct ParticleBehavior<ParticleType::Aurora>
     }
 };
 
-// Spark - energetic darting crackle: random-walk impulses with velocity
-// damping, one bright life-mapped burst of the 4-frame strip.
-
+// Damp random impulses while the strip plays one lifetime-mapped burst.
 template <>
 struct ParticleBehavior<ParticleType::Spark>
 {
@@ -1949,10 +1688,7 @@ struct ParticleBehavior<ParticleType::Spark>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Jittery dart: per-frame random impulses (shared RNG stream) with damping so sparks
-        // skitter then settle before dying. Random-walk variance accumulates per step, so the
-        // impulse scales by sqrt(dt) - linear dt scaling would make the skitter energy
-        // framerate-dependent (76 * sqrt(1/60) matches the tuned 60 FPS look).
+        // Random impulse scales by sqrt(dt) so random-walk variance is frame-rate independent.
         if (ctx.rng && ctx.dist)
         {
             const float impulse = 76.0f * std::sqrt(ctx.deltaTime);
@@ -1977,7 +1713,7 @@ struct ParticleBehavior<ParticleType::Spark>
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = (ctx.dist(ctx.rng) - 0.5f) * 80.0f;
         p.velocity.y = (ctx.dist(ctx.rng) - 0.5f) * 80.0f;
-        // 50/50 white-gold forge spark vs electric blue.
+
         if (ctx.dist(ctx.rng) < 0.5f)
         {
             p.color = glm::vec4(1.0f, 0.92f + ctx.dist(ctx.rng) * 0.08f, 0.55f, 0.0f);
@@ -1996,9 +1732,7 @@ struct ParticleBehavior<ParticleType::Spark>
     }
 };
 
-// PixieDust - falling glitter-trail dust with a heavy twinkle. The three
-// sprite variants carry the color spread.
-
+// Sprite variants supply the glitter color; shared motion adds a falling trail and twinkle.
 template <>
 struct ParticleBehavior<ParticleType::PixieDust>
 {
@@ -2008,8 +1742,7 @@ struct ParticleBehavior<ParticleType::PixieDust>
     {
         p.position.x += std::sin(ctx.time * 2.2f + p.phase) * 6.0f * ctx.deltaTime;
 
-        // High-contrast twinkle at full peak alpha so the per-variant colors
-        // read saturated instead of washing out in the additive blend.
+        // Let the twinkle reach full alpha so additive blending retains the variant color.
         float twinkle = 0.5f + 0.5f * std::abs(std::sin(ctx.time * 6.0f + p.phase * 2.0f));
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.3f);
         float lifeFade = std::min(1.0f, p.lifetime / 0.8f);
@@ -2025,8 +1758,8 @@ struct ParticleBehavior<ParticleType::PixieDust>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = 0.0f;
-        p.velocity.y = 8.0f + ctx.dist(ctx.rng) * 8.0f;  // Gentle glitter-fall.
-        p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);     // Variants carry the color.
+        p.velocity.y = 8.0f + ctx.dist(ctx.rng) * 8.0f;
+        p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);  // Sprite variants supply color.
         p.size = 4.0f + ctx.dist(ctx.rng) * 2.0f;
         p.lifetime = 2.0f + ctx.dist(ctx.rng) * 2.0f;
         p.maxLifetime = p.lifetime;
@@ -2037,8 +1770,7 @@ struct ParticleBehavior<ParticleType::PixieDust>
     }
 };
 
-// Arcane - violet glyph motes orbiting their spawn point with a slow rise.
-
+// Orbit glyphs around the spawn point while moving the orbit upward.
 template <>
 struct ParticleBehavior<ParticleType::Arcane>
 {
@@ -2046,8 +1778,7 @@ struct ParticleBehavior<ParticleType::Arcane>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Circular orbit expressed as the derivative of a circle so no orbit
-        // center needs storing; radius/frequency personalized by phase.
+        // Integrate the circle derivative to orbit without storing a center.
         const float radius = 7.0f + 3.0f * std::sin(p.phase * 2.0f);
         const float omega = 1.6f + 0.3f * std::cos(p.phase);
         const float theta = ctx.time * omega + p.phase;
@@ -2069,10 +1800,8 @@ struct ParticleBehavior<ParticleType::Arcane>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        p.color = glm::vec4(0.82f + ctx.dist(ctx.rng) * 0.15f,
-                            0.72f + ctx.dist(ctx.rng) * 0.12f,
-                            1.0f,
-                            0.0f);  // Light violet cast over the glyph art.
+        p.color = glm::vec4(
+            0.82f + ctx.dist(ctx.rng) * 0.15f, 0.72f + ctx.dist(ctx.rng) * 0.12f, 1.0f, 0.0f);
         p.size = 5.0f + ctx.dist(ctx.rng) * 3.0f;
         p.lifetime = 4.0f + ctx.dist(ctx.rng) * 3.0f;
         p.maxLifetime = p.lifetime;
@@ -2083,9 +1812,7 @@ struct ParticleBehavior<ParticleType::Arcane>
     }
 };
 
-// Enchant - enchantment-table glyphs: launch upward, decelerate to a hover,
-// fade out while still climbing softly.
-
+// Decelerate the upward launch into a hover; continue a slow rise during fade-out.
 template <>
 struct ParticleBehavior<ParticleType::Enchant>
 {
@@ -2093,7 +1820,6 @@ struct ParticleBehavior<ParticleType::Enchant>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Ease the launch velocity toward a slow terminal climb.
         const float easeRate = std::min(1.0f, 1.4f * ctx.deltaTime);
         p.velocity.y += (-6.0f - p.velocity.y) * easeRate;
         p.position.x += std::sin(ctx.time * 2.4f + p.phase) * 4.0f * ctx.deltaTime;
@@ -2113,7 +1839,7 @@ struct ParticleBehavior<ParticleType::Enchant>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = 0.0f;
-        p.velocity.y = -(30.0f + ctx.dist(ctx.rng) * 16.0f);  // Launch, then ease.
+        p.velocity.y = -(30.0f + ctx.dist(ctx.rng) * 16.0f);
         p.color = glm::vec4(0.75f, 0.95f + ctx.dist(ctx.rng) * 0.05f, 1.0f, 0.0f);
         p.size = 5.0f + ctx.dist(ctx.rng) * 2.5f;
         p.lifetime = 3.0f + ctx.dist(ctx.rng) * 2.0f;
@@ -2124,8 +1850,6 @@ struct ParticleBehavior<ParticleType::Enchant>
         ctx.particles.push_back(p);
     }
 };
-
-// Runes - near-stationary sigils turning slowly with a deep glow pulse.
 
 template <>
 struct ParticleBehavior<ParticleType::Runes>
@@ -2153,7 +1877,7 @@ struct ParticleBehavior<ParticleType::Runes>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        p.color = glm::vec4(1.0f, 0.80f + ctx.dist(ctx.rng) * 0.10f, 0.45f, 0.0f);  // Warm gold.
+        p.color = glm::vec4(1.0f, 0.80f + ctx.dist(ctx.rng) * 0.10f, 0.45f, 0.0f);
         p.size = 6.0f + ctx.dist(ctx.rng) * 4.0f;
         p.lifetime = 5.0f + ctx.dist(ctx.rng) * 3.0f;
         p.maxLifetime = p.lifetime;
@@ -2164,8 +1888,6 @@ struct ParticleBehavior<ParticleType::Runes>
     }
 };
 
-// Hex - counter-orbiting witch-magic motes with an eerie double pulse.
-
 template <>
 struct ParticleBehavior<ParticleType::Hex>
 {
@@ -2173,8 +1895,7 @@ struct ParticleBehavior<ParticleType::Hex>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Counter-clockwise orbit (mirror of Arcane) - hex zones swirling the
-        // opposite way reads as opposing schools of magic side by side.
+        // Reverse the Arcane orbit direction so adjacent effects remain visually distinct.
         const float radius = 9.0f + 3.0f * std::cos(p.phase * 1.4f);
         const float omega = 1.1f + 0.2f * std::sin(p.phase);
         const float theta = -(ctx.time * omega + p.phase);
@@ -2197,7 +1918,7 @@ struct ParticleBehavior<ParticleType::Hex>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        // Sickly green / witch purple split.
+
         if (ctx.dist(ctx.rng) < 0.5f)
         {
             p.color = glm::vec4(0.60f + ctx.dist(ctx.rng) * 0.15f, 1.0f, 0.50f, 0.0f);
@@ -2216,8 +1937,7 @@ struct ParticleBehavior<ParticleType::Hex>
     }
 };
 
-// Curse - dark taint that wobbles upward with an irregular, unsettling
-// flicker. Alpha-blended dark tones (additive would wash the darkness out).
+// Dark curse tones require alpha blending; additive would remove the darkening.
 
 template <>
 struct ParticleBehavior<ParticleType::Curse>
@@ -2229,7 +1949,6 @@ struct ParticleBehavior<ParticleType::Curse>
         p.position.x += std::sin(ctx.time * 1.3f + p.phase) * 10.0f * ctx.deltaTime;
         p.position.y -= 8.0f * ctx.deltaTime;
 
-        // Two incommensurate flickers multiply into an uneasy stutter.
         float flicker = (0.70f + 0.30f * std::sin(ctx.time * 6.3f + p.phase * 3.0f)) *
                         (0.75f + 0.25f * std::sin(ctx.time * 1.7f + p.phase));
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.5f);
@@ -2246,10 +1965,8 @@ struct ParticleBehavior<ParticleType::Curse>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        p.color = glm::vec4(0.35f + ctx.dist(ctx.rng) * 0.10f,
-                            0.20f,
-                            0.45f + ctx.dist(ctx.rng) * 0.10f,
-                            0.0f);  // Bruised purple-black.
+        p.color = glm::vec4(
+            0.35f + ctx.dist(ctx.rng) * 0.10f, 0.20f, 0.45f + ctx.dist(ctx.rng) * 0.10f, 0.0f);
         p.size = 6.0f + ctx.dist(ctx.rng) * 3.0f;
         p.lifetime = 3.0f + ctx.dist(ctx.rng) * 3.0f;
         p.maxLifetime = p.lifetime;
@@ -2260,9 +1977,7 @@ struct ParticleBehavior<ParticleType::Curse>
     }
 };
 
-// Void - dark matter on a decaying spiral: the tangential spawn velocity is
-// rotated and damped every frame, so each mote curls inward and stalls.
-
+// Rotate and damp tangential velocity to produce an inward spiral that stalls near its center.
 template <>
 struct ParticleBehavior<ParticleType::Void>
 {
@@ -2270,8 +1985,7 @@ struct ParticleBehavior<ParticleType::Void>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Rotate the velocity vector while bleeding speed - an inward spiral
-        // without needing to store an orbit center.
+        // Rotate and damp velocity for an inward spiral without a stored center.
         const float turn = 2.4f * ctx.deltaTime;
         const float cs = std::cos(turn);
         const float sn = std::sin(turn);
@@ -2279,7 +1993,6 @@ struct ParticleBehavior<ParticleType::Void>
                                p.velocity.x * sn + p.velocity.y * cs) *
                      std::max(0.0f, 1.0f - 0.55f * ctx.deltaTime);
 
-        // Motes contract as they wind down.
         p.size = std::max(2.0f, p.size - 1.2f * ctx.deltaTime);
 
         float age = 1.0f - p.lifetime / p.maxLifetime;
@@ -2296,7 +2009,7 @@ struct ParticleBehavior<ParticleType::Void>
         p.noProjection = zone.noProjection;
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
-        // Tangential launch in a random direction; Update curls it inward.
+
         float angle = ctx.dist(ctx.rng) * 6.28f;
         float speed = 25.0f + ctx.dist(ctx.rng) * 20.0f;
         p.velocity = glm::vec2(std::cos(angle), std::sin(angle)) * speed;
@@ -2311,9 +2024,7 @@ struct ParticleBehavior<ParticleType::Void>
     }
 };
 
-// Vortex - fast bright swirl: same rotate-and-damp trick as Void but quicker,
-// lighter, and climbing.
-
+// Use a faster rising spiral with the same rotate-and-damp rule as Void.
 template <>
 struct ParticleBehavior<ParticleType::Vortex>
 {
@@ -2327,7 +2038,7 @@ struct ParticleBehavior<ParticleType::Vortex>
         p.velocity = glm::vec2(p.velocity.x * cs - p.velocity.y * sn,
                                p.velocity.x * sn + p.velocity.y * cs) *
                      std::max(0.0f, 1.0f - 0.25f * ctx.deltaTime);
-        p.position.y -= 8.0f * ctx.deltaTime;  // The swirl climbs.
+        p.position.y -= 8.0f * ctx.deltaTime;
 
         float age = 1.0f - p.lifetime / p.maxLifetime;
         float fade = std::min(age / 0.15f, (1.0f - age) / 0.25f);
@@ -2356,8 +2067,6 @@ struct ParticleBehavior<ParticleType::Vortex>
     }
 };
 
-// Soul - ghostly wisp climbing in a slow S-curve with breathing pauses.
-
 template <>
 struct ParticleBehavior<ParticleType::Soul>
 {
@@ -2365,8 +2074,7 @@ struct ParticleBehavior<ParticleType::Soul>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Two-octave wander plus a slow speed pulse - the soul hesitates,
-        // then presses on.
+        // Combine two wander frequencies and a slow speed pulse to vary the rising path.
         p.position.x += (std::sin(ctx.time * 0.8f + p.phase) * 14.0f +
                          std::sin(ctx.time * 2.1f + p.phase * 2.3f) * 4.0f) *
                         ctx.deltaTime;
@@ -2389,7 +2097,7 @@ struct ParticleBehavior<ParticleType::Soul>
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity.x = 0.0f;
         p.velocity.y = -(10.0f + ctx.dist(ctx.rng) * 8.0f);
-        // Pale spirit blue-green, occasionally warmer.
+
         if (ctx.dist(ctx.rng) < 0.75f)
         {
             p.color = glm::vec4(0.78f, 0.95f, 1.0f, 0.0f);
@@ -2408,9 +2116,7 @@ struct ParticleBehavior<ParticleType::Soul>
     }
 };
 
-// Fairy - hover-and-dash: mostly a tight hover, with an occasional darting
-// surge whose direction is fixed per particle.
-
+// Alternate tight hovering with short surges along a per-particle direction.
 template <>
 struct ParticleBehavior<ParticleType::Fairy>
 {
@@ -2418,8 +2124,7 @@ struct ParticleBehavior<ParticleType::Fairy>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Dash gate: cubed positive sine spends most of its time near zero,
-        // then surges - a quick darting burst every few seconds.
+        // Cubed positive sine produces short dash windows.
         float gate = std::max(0.0f, std::sin(ctx.time * 0.7f + p.phase));
         gate = gate * gate * gate;
         const float dashDir = (std::sin(p.phase * 3.0f) >= 0.0f) ? 1.0f : -1.0f;
@@ -2454,9 +2159,7 @@ struct ParticleBehavior<ParticleType::Fairy>
     }
 };
 
-// Butterfly - daylight meadow flier: slow cruise with wing-beat bob and a
-// lazy wander arc. Occasionally spawns as a pair.
-
+// Combine cruise motion, wing-beat bob and a slow wander; some spawns emit a pair.
 template <>
 struct ParticleBehavior<ParticleType::Butterfly>
 {
@@ -2464,12 +2167,10 @@ struct ParticleBehavior<ParticleType::Butterfly>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Wing-beat bob (fast, small) over a lazy wander arc (slow, wide).
         p.position.y += (std::sin(ctx.time * 5.5f + p.phase) * 10.0f +
                          std::cos(ctx.time * 0.6f + p.phase * 0.8f) * 8.0f) *
                         ctx.deltaTime;
 
-        // Butterflies dim (but stay readable) at night.
         float dayFactor = 1.0f - ctx.nightFactor * 0.4f;
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.6f);
         float lifeFade = std::min(1.0f, p.lifetime / 1.2f);
@@ -2489,7 +2190,7 @@ struct ParticleBehavior<ParticleType::Butterfly>
             float dir = (ctx.dist(ctx.rng) < 0.5f) ? -1.0f : 1.0f;
             p.velocity.x = dir * (12.0f + ctx.dist(ctx.rng) * 10.0f);
             p.velocity.y = 0.0f;
-            p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);  // The sprite carries its own colors.
+            p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);
             p.size = 8.0f + ctx.dist(ctx.rng) * 4.0f;
             p.lifetime = 8.0f + ctx.dist(ctx.rng) * 6.0f;
             p.maxLifetime = p.lifetime;
@@ -2499,7 +2200,7 @@ struct ParticleBehavior<ParticleType::Butterfly>
             ctx.particles.push_back(p);
         };
         spawnOne(glm::vec2(0.0f));
-        // Butterflies often travel in pairs - 25% chance of a companion.
+
         if (ctx.dist(ctx.rng) < 0.25f)
         {
             spawnOne(
@@ -2508,8 +2209,6 @@ struct ParticleBehavior<ParticleType::Butterfly>
     }
 };
 
-// Bat - dusk flier: fast cruise, deep swoops, quick jinks.
-
 template <>
 struct ParticleBehavior<ParticleType::Bat>
 {
@@ -2517,11 +2216,9 @@ struct ParticleBehavior<ParticleType::Bat>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        p.position.y += std::sin(ctx.time * 2.3f + p.phase) * 38.0f * ctx.deltaTime;  // Swoop.
-        p.position.x +=
-            std::sin(ctx.time * 7.0f + p.phase * 2.0f) * 10.0f * ctx.deltaTime;  // Jink.
+        p.position.y += std::sin(ctx.time * 2.3f + p.phase) * 38.0f * ctx.deltaTime;
+        p.position.x += std::sin(ctx.time * 7.0f + p.phase * 2.0f) * 10.0f * ctx.deltaTime;
 
-        // Dusk/night fliers; faint in daylight.
         float duskFactor = 0.30f + 0.70f * ctx.nightFactor;
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.5f);
         float lifeFade = std::min(1.0f, p.lifetime / 1.0f);
@@ -2550,10 +2247,7 @@ struct ParticleBehavior<ParticleType::Bat>
     }
 };
 
-// Bubble - buoyant wobbling bubble that accelerates gently upward, then
-// converts itself into its pop: spawns pin variant 0 (the looping bubble
-// sheen), and the final 0.28s switches to variant 1 (the bubblepop strip),
-// which the draw pass plays life-mapped.
+// Variant 0 loops while rising; the final 0.28 seconds use the life-mapped variant 1 pop strip.
 
 template <>
 struct ParticleBehavior<ParticleType::Bubble>
@@ -2562,7 +2256,6 @@ struct ParticleBehavior<ParticleType::Bubble>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Pop phase: hold position and collapse alpha while the strip plays.
         if (p.variant == 1)
         {
             p.color.a = (p.lifetime / p.maxLifetime) * 0.9f;
@@ -2570,15 +2263,12 @@ struct ParticleBehavior<ParticleType::Bubble>
         }
 
         p.position.x += std::sin(ctx.time * 3.0f + p.phase) * 7.0f * ctx.deltaTime;
-        p.velocity.y -= 3.0f * ctx.deltaTime;  // Buoyancy: rise speeds up.
+        p.velocity.y -= 3.0f * ctx.deltaTime;
 
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.3f);
         p.color.a = fadeIn * 0.55f;
 
-        // Expiring: convert in place to the pop. The update loop decrements lifetime before
-        // dispatching and skips dead particles, so gating on this frame's dt alone would drop
-        // the pop when a larger next dt crosses zero in the skip branch. Converting once life is
-        // within the frame clamp (MAX_DELTA_TIME 0.1s) closes it; the <=0.1s early pop is unseen.
+        // Convert within the 0.1 s frame clamp so next-frame aging cannot skip the pop phase.
         const float popWindow = std::max(ctx.deltaTime, 0.1f);
         if (p.lifetime <= popWindow)
         {
@@ -2603,7 +2293,7 @@ struct ParticleBehavior<ParticleType::Bubble>
         p.velocity.y = -(15.0f + ctx.dist(ctx.rng) * 13.0f);
         p.color = glm::vec4(0.85f, 0.95f, 1.0f, 0.0f);
         p.size = 5.0f + ctx.dist(ctx.rng) * 4.0f;
-        // Short-ish lives keep pops frequent enough to read as fizz.
+
         p.lifetime = 3.0f + ctx.dist(ctx.rng) * 3.0f;
         p.maxLifetime = p.lifetime;
         p.phase = ctx.dist(ctx.rng) * 6.28f;
@@ -2613,8 +2303,7 @@ struct ParticleBehavior<ParticleType::Bubble>
     }
 };
 
-// Coin - treasure glint: the strip carries the spin; motion is a soft bob.
-
+// The strip supplies the coin spin; position only adds a small vertical bob.
 template <>
 struct ParticleBehavior<ParticleType::Coin>
 {
@@ -2639,7 +2328,7 @@ struct ParticleBehavior<ParticleType::Coin>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);  // Gold lives in the sprite.
+        p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);
         p.size = 6.0f + ctx.dist(ctx.rng) * 3.0f;
         p.lifetime = 3.0f + ctx.dist(ctx.rng) * 3.0f;
         p.maxLifetime = p.lifetime;
@@ -2649,8 +2338,6 @@ struct ParticleBehavior<ParticleType::Coin>
         ctx.particles.push_back(p);
     }
 };
-
-// Gem - floating jewel with a slow bob and periodic sparkle pulse.
 
 template <>
 struct ParticleBehavior<ParticleType::Gem>
@@ -2687,25 +2374,19 @@ struct ParticleBehavior<ParticleType::Gem>
     }
 };
 
-// Confetti - celebration popper: rare spawn ticks, each firing a whole fan
-// of scraps from one point. The scraps launch up and outward, gravity reins
-// them in, then they flutter down with growing zigzag and fast tumble.
-
+// One spawn tick emits a fan of scraps. gravity ends the upward launch before flutter dominates.
 template <>
 struct ParticleBehavior<ParticleType::Confetti>
 {
-    // Deliberately sparse: each tick is a full burst, so the rate is the
-    // poppers-per-second cadence, not a scraps-per-second trickle.
+    // Rate counts whole bursts per second, not individual scraps.
     static constexpr float SpawnRate = 0.4f;
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Gravity pulls the launch into a gentle terminal flutter-fall.
         p.velocity.y = std::min(p.velocity.y + 220.0f * ctx.deltaTime, 40.0f);
-        p.velocity.x *= std::max(0.0f, 1.0f - 1.8f * ctx.deltaTime);  // Air drag.
+        p.velocity.x *= std::max(0.0f, 1.0f - 1.8f * ctx.deltaTime);
 
-        // Zigzag grows as the launch energy is spent, so scraps fly clean
-        // out of the pop and only start swaying once they flutter.
+        // Delay the wide zigzag until the launch loses speed.
         const float age = 1.0f - p.lifetime / p.maxLifetime;
         const float flutter = std::min(1.0f, age * 2.5f);
         p.position.x += std::sin(ctx.time * 3.3f + p.phase) * 26.0f * flutter * ctx.deltaTime;
@@ -2724,8 +2405,7 @@ struct ParticleBehavior<ParticleType::Confetti>
 
     static void Spawn(int zoneIndex, const ParticleZone& zone, ParticleSpawnContext& ctx)
     {
-        // One popper: a fan of scraps ejected from a single point, angled
-        // mostly upward with a wide spread.
+        // Use one origin for the burst so the pieces read as a single popper.
         const glm::vec2 origin(zone.position.x + ctx.dist(ctx.rng) * zone.size.x,
                                zone.position.y + ctx.dist(ctx.rng) * zone.size.y);
         const int burst = 14 + static_cast<int>(ctx.dist(ctx.rng) * 7.0f);  // 14-20
@@ -2736,18 +2416,18 @@ struct ParticleBehavior<ParticleType::Confetti>
             p.type = ParticleType::Confetti;
             p.noProjection = zone.noProjection;
             p.position = origin;
-            // Launch cone: straight up +/- ~55 degrees, speed 90-190 px/s.
+            // Upward launch cone spans about +/-55 degrees at 90-190 px/s.
             const float spread = (ctx.dist(ctx.rng) - 0.5f) * 1.92f;
             const float speed = 90.0f + ctx.dist(ctx.rng) * 100.0f;
             p.velocity.x = std::sin(spread) * speed;
             p.velocity.y = -std::cos(spread) * speed;
             static constexpr glm::vec3 kTints[6] = {
-                {1.00f, 0.35f, 0.40f},  // Red
-                {0.35f, 0.60f, 1.00f},  // Blue
-                {1.00f, 0.85f, 0.30f},  // Yellow
-                {0.40f, 0.90f, 0.50f},  // Green
-                {1.00f, 0.50f, 0.90f},  // Pink
-                {0.60f, 0.45f, 1.00f},  // Purple
+                {1.00f, 0.35f, 0.40f},
+                {0.35f, 0.60f, 1.00f},
+                {1.00f, 0.85f, 0.30f},
+                {0.40f, 0.90f, 0.50f},
+                {1.00f, 0.50f, 0.90f},
+                {0.60f, 0.45f, 1.00f},
             };
             const int tint = std::min(5, static_cast<int>(ctx.dist(ctx.rng) * 6.0f));
             p.color = glm::vec4(kTints[tint], 0.0f);
@@ -2762,8 +2442,7 @@ struct ParticleBehavior<ParticleType::Confetti>
     }
 };
 
-// Heart - affection emote: eases from a launch into a slow float, swaying.
-
+// Ease the upward launch into a slow, swaying float.
 template <>
 struct ParticleBehavior<ParticleType::Heart>
 {
@@ -2774,7 +2453,7 @@ struct ParticleBehavior<ParticleType::Heart>
         const float easeRate = std::min(1.0f, 2.0f * ctx.deltaTime);
         p.velocity.y += (-8.0f - p.velocity.y) * easeRate;
         p.position.x += std::sin(ctx.time * 2.8f + p.phase) * 6.0f * ctx.deltaTime;
-        p.size += 2.0f * ctx.deltaTime;  // Swells gently as it floats away.
+        p.size += 2.0f * ctx.deltaTime;
 
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.15f);
         float lifeFade = std::min(1.0f, p.lifetime / 0.6f);
@@ -2802,8 +2481,7 @@ struct ParticleBehavior<ParticleType::Heart>
     }
 };
 
-// Zap - electric arc: hard strobe alpha plus positional jitter, very brief.
-
+// A short lifetime, hard alpha strobe and position jitter produce the arc flash.
 template <>
 struct ParticleBehavior<ParticleType::Zap>
 {
@@ -2811,8 +2489,7 @@ struct ParticleBehavior<ParticleType::Zap>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Arcs teleport in tiny hops rather than glide. sqrt(dt) scaling
-        // keeps the random-walk wander framerate-independent (see Spark).
+        // sqrt(dt) keeps random-walk jitter independent of frame rate.
         if (ctx.rng && ctx.dist)
         {
             const float hop = 20.0f * std::sqrt(ctx.deltaTime);
@@ -2845,9 +2522,7 @@ struct ParticleBehavior<ParticleType::Zap>
     }
 };
 
-// Wind - fast gust streaks. Same +X travel convention as Sand (the weather
-// spawn edge assumes rightward travel); the draw pass stretches the sprite
-// along the travel axis.
+// Wind travels +X to match the weather spawn edge; rendering stretches the travel axis.
 
 template <>
 struct ParticleBehavior<ParticleType::Wind>
@@ -2884,8 +2559,7 @@ struct ParticleBehavior<ParticleType::Wind>
     }
 };
 
-// Zzz - sleep emote: eases upward while drifting aside, swelling slightly.
-
+// Ease upward and sideways while growing the sleep glyph.
 template <>
 struct ParticleBehavior<ParticleType::Zzz>
 {
@@ -2911,7 +2585,7 @@ struct ParticleBehavior<ParticleType::Zzz>
         p.noProjection = zone.noProjection;
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
-        p.velocity.x = 6.0f + ctx.dist(ctx.rng) * 6.0f;  // Classic up-and-right drift.
+        p.velocity.x = 6.0f + ctx.dist(ctx.rng) * 6.0f;
         p.velocity.y = -(20.0f + ctx.dist(ctx.rng) * 8.0f);
         p.color = glm::vec4(0.90f, 0.88f, 1.0f, 0.0f);
         p.size = 5.0f + ctx.dist(ctx.rng) * 2.0f;
@@ -2924,9 +2598,7 @@ struct ParticleBehavior<ParticleType::Zzz>
     }
 };
 
-// Constellation - near-stationary star twinkle for night events; brightest
-// after dark, whisper-faint by day.
-
+// Keep the constellation nearly stationary; night visibility controls the twinkle strength.
 template <>
 struct ParticleBehavior<ParticleType::Constellation>
 {
@@ -2962,8 +2634,6 @@ struct ParticleBehavior<ParticleType::Constellation>
         ctx.particles.push_back(p);
     }
 };
-
-// Planet - very slow celestial accent, night-leaning steady glow.
 
 template <>
 struct ParticleBehavior<ParticleType::Planet>
@@ -3002,8 +2672,6 @@ struct ParticleBehavior<ParticleType::Planet>
     }
 };
 
-// Moon - stationary crescent accent with a soft night-gated glow pulse.
-
 template <>
 struct ParticleBehavior<ParticleType::Moon>
 {
@@ -3029,28 +2697,28 @@ struct ParticleBehavior<ParticleType::Moon>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        // Lunar palette roulette: pale gold, silver-blue, harvest orange,
-        // blood moon, and a rare lavender.
+
+        // Choose among warm, cool and rare lavender moon tints at spawn.
         float lunarRoll = ctx.dist(ctx.rng);
         if (lunarRoll < 0.35f)
         {
-            p.color = glm::vec4(1.0f, 0.97f, 0.88f, 0.0f);  // Pale gold.
+            p.color = glm::vec4(1.0f, 0.97f, 0.88f, 0.0f);
         }
         else if (lunarRoll < 0.60f)
         {
-            p.color = glm::vec4(0.80f, 0.88f, 1.0f, 0.0f);  // Silver-blue.
+            p.color = glm::vec4(0.80f, 0.88f, 1.0f, 0.0f);
         }
         else if (lunarRoll < 0.80f)
         {
-            p.color = glm::vec4(1.0f, 0.75f, 0.50f, 0.0f);  // Harvest orange.
+            p.color = glm::vec4(1.0f, 0.75f, 0.50f, 0.0f);
         }
         else if (lunarRoll < 0.92f)
         {
-            p.color = glm::vec4(1.0f, 0.50f, 0.42f, 0.0f);  // Blood moon.
+            p.color = glm::vec4(1.0f, 0.50f, 0.42f, 0.0f);
         }
         else
         {
-            p.color = glm::vec4(0.88f, 0.78f, 1.0f, 0.0f);  // Lavender (rare).
+            p.color = glm::vec4(0.88f, 0.78f, 1.0f, 0.0f);
         }
         p.size = 8.0f + ctx.dist(ctx.rng) * 4.0f;
         p.lifetime = 10.0f + ctx.dist(ctx.rng) * 6.0f;
@@ -3062,9 +2730,7 @@ struct ParticleBehavior<ParticleType::Moon>
     }
 };
 
-// Ink - dark blot hovering in place like a rune sigil, billowing softly on
-// the flow field with a slow climb and a gentle pulse.
-
+// Move the ink blot slowly through the flow field while its size and alpha pulse.
 template <>
 struct ParticleBehavior<ParticleType::Ink>
 {
@@ -3074,7 +2740,7 @@ struct ParticleBehavior<ParticleType::Ink>
     {
         const glm::vec2 flow = FlowNoise(p.position, ctx.time, p.phase);
         p.position += flow * 3.0f * ctx.deltaTime;
-        p.position.y -= 3.0f * ctx.deltaTime;  // Floats up slowly, like Runes.
+        p.position.y -= 3.0f * ctx.deltaTime;
 
         float pulse = 0.75f + 0.25f * std::sin(ctx.time * 0.9f + p.phase);
         float fadeIn = std::min(1.0f, (p.maxLifetime - p.lifetime) / 0.8f);
@@ -3102,11 +2768,7 @@ struct ParticleBehavior<ParticleType::Ink>
     }
 };
 
-// RainSplash - one-shot water splash at a rain impact point. Not a primary
-// emitter: SpawnRainSplash pushes these into m_PendingSpawns from Rain::Update
-// (throttled). The 4-frame strip is life-mapped, so it plays once across the
-// splash's short lifetime. Spawn is provided so `particle.spawn RainSplash` and
-// a hand-placed zone still behave sanely.
+// Rain updates defer splash emission; Spawn also supports zones and console one-shots.
 
 template <>
 struct ParticleBehavior<ParticleType::RainSplash>
@@ -3115,13 +2777,12 @@ struct ParticleBehavior<ParticleType::RainSplash>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Static at the impact point (zero velocity); the strip carries the
-        // spread. Hold at a soft alpha, then ease out over the last third so
-        // the final frame does not pop off.
+        // The strip supplies splash motion; fade the final third of life to hide the last-frame
+        // removal.
         const float lifeRatio = 1.0f - (p.lifetime / p.maxLifetime);  // 0 -> 1
         const float fade = (lifeRatio < 0.66f) ? 1.0f : std::max(0.0f, (1.0f - lifeRatio) / 0.34f);
-        // A white splash glares against the dark night scene, so dim it further
-        // as night falls (also covers nighttime rain under an Aurora overlay).
+
+        // Dim the impact against night backgrounds even when another weather overlay is active.
         p.color.a = ImpactSplashAlpha(fade, ctx.sceneNightFactor);
     }
 
@@ -3134,8 +2795,8 @@ struct ParticleBehavior<ParticleType::RainSplash>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        p.color =
-            glm::vec4(0.82f, 0.88f, 1.0f, 0.0f);  // Update fills scene-night alpha next frame.
+        p.color = glm::vec4(
+            0.82f, 0.88f, 1.0f, 0.0f);  // The next Update replaces this alpha using scene darkness.
         p.size = 12.0f + ctx.dist(ctx.rng) * 4.0f;
         p.lifetime = 0.30f + ctx.dist(ctx.rng) * 0.10f;
         p.maxLifetime = p.lifetime;
@@ -3146,11 +2807,7 @@ struct ParticleBehavior<ParticleType::RainSplash>
     }
 };
 
-// SnowSplash - one-shot snow-impact puff at a snow landing point. Mirror of
-// RainSplash: SpawnSnowPuff pushes these into m_PendingSpawns from Snow::Update
-// (throttled). The 4-frame strip is life-mapped, so it plays once across the
-// puff's short lifetime. Spawn is provided so `particle.spawn SnowSplash` and a
-// hand-placed zone still behave sanely.
+// Snow updates defer puff emission; Spawn also supports zones and console one-shots.
 
 template <>
 struct ParticleBehavior<ParticleType::SnowSplash>
@@ -3159,12 +2816,12 @@ struct ParticleBehavior<ParticleType::SnowSplash>
 
     static void Update(Particle& p, const ParticleUpdateContext& ctx)
     {
-        // Static at the landing point (zero velocity); the strip carries the
-        // spread. Hold at a soft alpha, then ease out over the last third.
+        // The strip supplies puff motion; fade the final third of life to hide the last-frame
+        // removal.
         const float lifeRatio = 1.0f - (p.lifetime / p.maxLifetime);  // 0 -> 1
         const float fade = (lifeRatio < 0.66f) ? 1.0f : std::max(0.0f, (1.0f - lifeRatio) / 0.34f);
-        // A white puff glares against the dark night scene, so dim it further as
-        // night falls (also covers nighttime snow under an Aurora overlay).
+
+        // Use scene night visibility so overlays cannot brighten a nighttime snow impact.
         p.color.a = ImpactSplashAlpha(fade, ctx.sceneNightFactor);
     }
 
@@ -3177,9 +2834,10 @@ struct ParticleBehavior<ParticleType::SnowSplash>
         p.position.x = zone.position.x + ctx.dist(ctx.rng) * zone.size.x;
         p.position.y = zone.position.y + ctx.dist(ctx.rng) * zone.size.y;
         p.velocity = glm::vec2(0.0f);
-        p.color = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);  // Update fills scene-night alpha next frame.
+        p.color = glm::vec4(
+            1.0f, 1.0f, 1.0f, 0.0f);  // The next Update replaces this alpha using scene darkness.
         p.size = 10.0f + ctx.dist(ctx.rng) * 4.0f;
-        p.lifetime = 0.40f + ctx.dist(ctx.rng) * 0.15f;  // A touch longer/gentler than rain.
+        p.lifetime = 0.40f + ctx.dist(ctx.rng) * 0.15f;
         p.maxLifetime = p.lifetime;
         p.phase = 0.0f;
         p.rotation = 0.0f;
@@ -3188,8 +2846,7 @@ struct ParticleBehavior<ParticleType::SnowSplash>
     }
 };
 
-// Dispatch tables - auto-generated from ParticleBehavior specializations.
-
+// One table entry per ParticleType dispatches its specialized update and spawn functions.
 using UpdateFn = void (*)(Particle&, const ParticleUpdateContext&);
 using SpawnFn = void (*)(int, const ParticleZone&, ParticleSpawnContext&);
 
@@ -3225,29 +2882,22 @@ const auto kSpawnDispatch = MakeSpawnTable(Indices{});
 
 }  // namespace
 
-// ParticleSystem implementation.
-
 ParticleSystem::ParticleSystem()
-    : m_Zones(nullptr),    // Particle zones from tilemap
-      m_Tilemap(nullptr),  // Reference to tilemap for structure queries
-      m_TileWidth(32),     // Tile dimensions for coordinate conversion
+    : m_Zones(nullptr),
+      m_Tilemap(nullptr),
+      m_TileWidth(32),
       m_TileHeight(32),
-      m_MaxParticlesPerZone(25),      // Particle density cap per zone
-      m_Time(0.0f),                   // Accumulated time for animation cycles
-      m_NightFactor(0.0f),            // Day & night blend (0 = day, 1 = night)
-      m_Rng(std::random_device{}()),  // Seeded Mersenne Twister RNG
-      m_Dist01(0.0f, 1.0f),           // Uniform distribution for random values
-      m_TexturesLoaded(false)         // Lazy-load flag for particle sprites
+      m_MaxParticlesPerZone(25),
+      m_Time(0.0f),
+      m_NightFactor(0.0f),
+      m_Rng(std::random_device{}()),
+      m_Dist01(0.0f, 1.0f),
+      m_TexturesLoaded(false)
 {
-    // Reserve covers the title screen and calm weather plus ambient and zone
-    // particles. Heavy weather caps far above it (Thunderstorm: 10000 rain
-    // particles), so the pool grows a few times on the way into a storm and
-    // then stays warm.
+    // Reserve for calm scenes; heavy weather can grow the pool.
     m_Particles.reserve(1000);
 
-    // One valid variant per type until BuildAtlas fills the real counts, so
-    // spawn-time variant rolls stay in range in texture-less contexts
-    // (unit tests never call LoadTextures).
+    // At least one variant keeps headless spawn rolls valid before textures load.
     std::fill(std::begin(m_VariantCounts), std::end(m_VariantCounts), uint8_t{1});
 }
 
@@ -3261,12 +2911,8 @@ bool ParticleSystem::LoadTextures(TextureStore& store, const ProjectManifest& ma
 
 void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
 {
-    // Every ParticleType contributes one or more variant sprites (see kParticleVisuals):
-    // "<base>_strip.png" frame strips are preferred over single-frame "<base>.png", and the two
-    // types with an empty variant list (Lantern, Sunshine) generate procedurally; any other
-    // type whose asset is missing falls back to a soft circle. All variants pack
-    // into one 512-wide row-layout atlas so the particle pass stays a single texture bind.
-
+    // Pack all variants into one 512-pixel-wide atlas to keep the particle pass on one texture.
+    // Prefer horizontal strips, then static images, then a procedural fallback.
     struct TextureSource
     {
         std::vector<unsigned char> pixels;
@@ -3277,10 +2923,7 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
         int variantIndex = 0;
     };
 
-    // Load file-based textures temporarily to get their pixel data. All sources are
-    // normalized to RGBA (4 channels) so the atlas copy loop can safely read 4 bytes per
-    // pixel regardless of the original format. Returns false when the file is missing/
-    // unsupported so the caller can chain fallbacks (strip -> static -> procedural).
+    // Normalize loaded pixels to RGBA before atlas copies; failure selects the next fallback.
     auto loadPng = [](const char* path, TextureSource& src) -> bool
     {
         Texture temp;
@@ -3294,7 +2937,6 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
 
             if (channels == 4)
             {
-                // Already RGBA, straight copy.
                 size_t dataSize = pixelCount * 4;
                 src.pixels.resize(dataSize);
                 if (!temp.GetImageData().empty())
@@ -3305,7 +2947,6 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
             }
             if (channels == 3 && !temp.GetImageData().empty())
             {
-                // RGB -> RGBA: expand each pixel, setting alpha to 255.
                 src.pixels.resize(pixelCount * 4);
                 const unsigned char* srcPx = temp.GetImageData().data();
                 unsigned char* dst = src.pixels.data();
@@ -3322,8 +2963,7 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
         return false;
     };
 
-    // Generic soft circle: a smooth radial alpha falloff. Fallback sprite for
-    // any missing asset, so a bad path never renders as an opaque square.
+    // A radial alpha fallback avoids opaque squares when assets are missing.
     auto generateSoftCircle = [](TextureSource& src, int size, float falloffPow)
     {
         src.width = size;
@@ -3344,10 +2984,7 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
                        });
     };
 
-    // Normalize authored-faint sprites: some assets (fog peaks at alpha ~0.28) sit below the
-    // shader's 0.1 texture-alpha discard and render invisible once the behavior's vertex alpha
-    // multiplies on top. Behaviors own the intended faintness, so lift low-peak sources to a
-    // ~0.9 peak; properly-authored sprites (peak >= 0.5) pass untouched.
+    // Raise source alpha peaks below 0.5 to about 0.9; behavior alpha controls final faintness.
     auto normalizeFaintAlpha = [](TextureSource& src)
     {
         uint8_t peak = 0;
@@ -3367,9 +3004,8 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
         }
     };
 
-    // Build the source list: one entry per declared variant of every type
-    // (strip preferred, then static, then soft-circle fallback); types with
-    // an empty variant list generate their sprite procedurally.
+    // Collect one source per declared variant; procedural-only types still receive a valid atlas
+    // slot.
     std::vector<TextureSource> sources;
     sources.reserve(EnumTraits<ParticleType>::Count * 2);
     for (size_t t = 0; t < EnumTraits<ParticleType>::Count; ++t)
@@ -3385,10 +3021,7 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
             src.typeIndex = static_cast<int>(t);
             src.variantIndex = variantCount;
 
-            // Resolve the sprite through the manifest's "particles" links - asset file names
-            // are opaque GUIDs, so the manifest is the only name-to-path mapping. The linked
-            // file may be the static frame or the "_strip" sheet; derive both candidates from
-            // it so strips stay preferred regardless of which one is linked.
+            // Derive static and _strip candidates from either manifest-linked filename.
             std::string stripPath;
             std::string staticPath;
             if (const auto link = manifest.particleSprites.find(base);
@@ -3414,16 +3047,12 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
                                base);
             }
 
-            // Existence-check before loading: many variants ship only a
-            // static frame, and probing for the strip via LoadFromFile would
-            // log a scary (but expected) texture error on every boot.
+            // Check optional strips before loading to avoid expected missing-file error logs.
             const bool stripLoaded = !stripPath.empty() && std::filesystem::exists(stripPath) &&
                                      loadPng(stripPath.c_str(), src);
             if (stripLoaded)
             {
-                // Horizontal strip: frame count from the width/height ratio
-                // (64x16 -> 4 frames). Unexpected dimensions degrade to a
-                // single stretched frame rather than corrupt slicing.
+                // 64x16 yields four horizontal frames; invalid ratios use one stretched frame.
                 if (src.height > 0 && src.width > src.height && src.width % src.height == 0)
                 {
                     src.frameCount = src.width / src.height;
@@ -3443,9 +3072,7 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
                 }
                 generateSoftCircle(src, 16, 1.5f);
             }
-            // The packer's rows are kParticleAtlasWidth wide; a wider source
-            // would place with out-of-range UVs and silently clip its right
-            // side, so degrade to the fallback sprite loudly instead.
+            // Reject sources wider than the atlas; otherwise uvs would clip silently.
             if (src.width > kParticleAtlasWidth)
             {
                 Logger::ErrorF(LOG_SUBSYSTEM,
@@ -3464,7 +3091,6 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
         }
         if (variantCount == 0)
         {
-            // Procedural sprite types (no asset list in kParticleVisuals).
             TextureSource src;
             src.typeIndex = static_cast<int>(t);
             src.variantIndex = 0;
@@ -3487,9 +3113,7 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
             std::min<int>(variantCount, static_cast<int>(MAX_PARTICLE_VARIANTS)));
     }
 
-    // Calculate atlas layout - simple horizontal packing with rows.
-    // Pre-scan texture sizes to compute required atlas height so the
-    // atlas is always tall enough for all particle textures.
+    // Premeasure row packing so the atlas height fits every source.
     const int atlasWidth = kParticleAtlasWidth;
     int requiredHeight = 0;
     {
@@ -3525,7 +3149,6 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
         AtlasSlot& slot = m_AtlasSlots[source.typeIndex][source.variantIndex];
         slot.frameCount = source.frameCount;
 
-        // Move to next row if needed
         if (currentX + w > atlasWidth)
         {
             currentX = 0;
@@ -3533,7 +3156,6 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
             rowHeight = 0;
         }
 
-        // Guard against atlas overflow, skip textures that don't fit.
         if (currentY + h > atlasHeight)
         {
             Logger::ErrorF(LOG_SUBSYSTEM,
@@ -3545,23 +3167,20 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
                            h,
                            currentY,
                            atlasHeight);
-            // Store degenerate UV region so this sprite renders as a small corner pixel.
+            // Degenerate uvs sample a corner pixel for a source that does not fit.
             slot.region.uvMin = glm::vec2(0.0f);
             slot.region.uvMax = glm::vec2(1.0f / atlasWidth, 1.0f / atlasHeight);
             slot.frameCount = 1;
             continue;
         }
 
-        // Store UV coordinates (normalized)
         slot.region.uvMin = glm::vec2(static_cast<float>(currentX) / atlasWidth,
                                       static_cast<float>(currentY) / atlasHeight);
         slot.region.uvMax = glm::vec2(static_cast<float>(currentX + w) / atlasWidth,
                                       static_cast<float>(currentY + h) / atlasHeight);
 
-        // Copy pixels to atlas. File-loaded sources arrive stbi-flipped (bottom-up);
-        // procedural sources (soft circle, lantern, sunshine) are top-down and the atlas
-        // uploads unflipped, so a procedural sprite is mirrored vertically against a
-        // file-loaded one.
+        // File pixels are bottom-up; procedural pixels are top-down. The unflipped atlas retains
+        // both conventions.
         for (int y = 0; y < h; y++)
         {
             int srcY = y;
@@ -3592,7 +3211,6 @@ void ParticleSystem::BuildAtlas(const ProjectManifest& manifest)
         rowHeight = std::max(rowHeight, h);
     }
 
-    // Create the atlas texture
     Texture atlas;
     atlas.LoadFromData(atlasPixels.data(), atlasWidth, atlasHeight, 4, false);
     m_AtlasHandle = m_Store->Adopt(std::move(atlas));
@@ -3685,23 +3303,19 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
     m_Time += deltaTime;
     const bool hasZones = (m_Zones && !m_Zones->empty());
 
-    // Ensure there are enough spawn timers.
     if (hasZones && m_ZoneSpawnTimers.size() < m_Zones->size())
     {
         m_ZoneSpawnTimers.resize(m_Zones->size(), 0.0f);
     }
 
-    // Smoothed camera velocity. The first frame seeds m_PrevCameraPos so it does not
-    // emit a huge spike from (0,0) -> cameraPos. The 0.25 lerp gives ~4-frame
-    // smoothing - enough to ride out single-frame stalls without lag.
+    // Seed camera position on the first update to avoid a velocity spike from the origin.
     if (!m_HasPrevCameraPos)
     {
         m_PrevCameraPos = cameraPos;
         m_HasPrevCameraPos = true;
     }
     glm::vec2 rawCamDelta = cameraPos - m_PrevCameraPos;
-    // Teleports / world loads produce a jump larger than the viewport; treat
-    // those as a scene cut (no band re-base - stale particles cull anyway).
+    // Jumps beyond the viewport are scene cuts; do not rebase existing impact bands.
     if (std::abs(rawCamDelta.x) > viewSize.x || std::abs(rawCamDelta.y) > viewSize.y)
     {
         rawCamDelta = glm::vec2(0.0f);
@@ -3730,33 +3344,25 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
                                           m_WindStrength,
                                           rawCamDelta};
 
-    // Update existing particles (mark dead ones, remove in bulk afterward)
     for (auto& p : m_Particles)
     {
-        // Decrease lifetime
         p.lifetime -= deltaTime;
         if (p.lifetime <= 0.0f)
         {
             continue;
         }
 
-        // Kill particles whose zone has gone away (e.g., map reloaded, zone
-        // deleted). zoneIndex == -1 means "deliberately zoneless" - ambient
-        // cozy spawns and the console's particle.spawn - and must be left
-        // alone so it lives out its natural lifetime.
+        // Nonnegative indices require a live zone; -1 deliberately has no zone.
         if (p.zoneIndex >= 0 && (!hasZones || p.zoneIndex >= static_cast<int>(m_Zones->size())))
         {
             p.lifetime = 0.0f;
             continue;
         }
 
-        // Update position
         p.position += p.velocity * deltaTime;
 
-        // Cull weather particles that drifted far outside the spawn rect.
-        // Without this, fast camera moves leave a "wake" of stale particles
-        // that reappear all at once when the player backtracks. Bounds are the
-        // spawn overspray edge plus a half-viewport margin, leaving drift room.
+        // Cull weather beyond overspray plus half a viewport to avoid stale particles after camera
+        // motion.
         if (p.zoneIndex == WEATHER_ZONE_INDEX)
         {
             constexpr float kSpawnOverspray = 0.20f;
@@ -3774,7 +3380,6 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
             }
         }
 
-        // Dispatch to type-specific update via table (bounds-checked)
         int typeIndex = static_cast<int>(p.type);
         if (typeIndex >= 0 && typeIndex < static_cast<int>(kUpdateDispatch.size()))
         {
@@ -3782,14 +3387,11 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
         }
         else
         {
-            p.lifetime = 0.0f;  // Kill particle with invalid type
+            p.lifetime = 0.0f;
         }
     }
 
-    // Merge any deferred spawns (e.g., Rain splashes, Bubble pops). Done
-    // before the cull so newly-spawned-but-dead particles would still be
-    // removed cleanly. Deferred spawns roll their sprite variants here since
-    // they bypass the SpawnParticleInZone path.
+    // Merge deferred spawns and assign variants before removing dead particles.
     if (!m_PendingSpawns.empty())
     {
         const size_t firstMerged = m_Particles.size();
@@ -3798,12 +3400,10 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
         m_PendingSpawns.clear();
     }
 
-    // Remove dead and orphaned particles in one pass
     std::erase_if(m_Particles, [](const Particle& p) { return p.lifetime <= 0.0f; });
 
     if (hasZones)
     {
-        // Build per-zone particle counts in a single O(n) pass
         m_ZoneParticleCounts.assign(m_Zones->size(), 0);
         for (const auto& p : m_Particles)
         {
@@ -3814,10 +3414,8 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
         }
     }
 
-    // Maintain global ambient population (independent of zones).
     UpdateAmbientSpawning(deltaTime, cameraPos, viewSize);
 
-    // Maintain weather-driven particle population (rain, snow, ash, etc.).
     UpdateWeatherSpawning(deltaTime, cameraPos, viewSize);
 
     if (!hasZones)
@@ -3825,7 +3423,6 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
         return;
     }
 
-    // Spawn new particles for each zone
     for (size_t i = 0; i < m_Zones->size(); ++i)
     {
         const ParticleZone& zone = (*m_Zones)[i];
@@ -3834,8 +3431,7 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
             continue;
         }
 
-        // Check if zone is visible in current view
-        float margin = 80.0f;  // 5 tiles of margin to spawn offscreen
+        float margin = 80.0f;  // 80 world pixels of offscreen spawn margin.
         bool visible = !(zone.position.x + zone.size.x < cameraPos.x - margin ||
                          zone.position.x > cameraPos.x + viewSize.x + margin ||
                          zone.position.y + zone.size.y < cameraPos.y - margin ||
@@ -3846,7 +3442,7 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
             continue;
         }
 
-        // Skip spawning lantern glows during daytime to avoid flicker
+        // Skip day lanterns to avoid flicker.
         if (zone.type == ParticleType::Lantern && m_NightFactor < 0.05f)
         {
             continue;
@@ -3854,7 +3450,6 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
 
         size_t zoneParticleCount = m_ZoneParticleCounts[i];
 
-        // Spawn rate from dispatch table (bounds-checked)
         int zoneTypeIndex = static_cast<int>(zone.type);
         if (zoneTypeIndex < 0 || zoneTypeIndex >= static_cast<int>(kSpawnRates.size()))
         {
@@ -3862,7 +3457,6 @@ void ParticleSystem::Update(float deltaTime, glm::vec2 cameraPos, glm::vec2 view
         }
         float spawnRate = kSpawnRates[zoneTypeIndex];
 
-        // Scale spawn rate by zone size
         float areaFactor = (zone.size.x * zone.size.y) / (64.0f * 64.0f);
         spawnRate *= std::max(0.5f, std::min(3.0f, areaFactor));
 
@@ -3883,7 +3477,7 @@ void ParticleSystem::SpawnParticleInZone(int zoneIndex, const ParticleZone& zone
     int typeIndex = static_cast<int>(zone.type);
     if (typeIndex < 0 || typeIndex >= static_cast<int>(kSpawnDispatch.size()))
     {
-        return;  // Invalid particle type, skip silently.
+        return;
     }
     ParticleSpawnContext ctx{m_Rng, m_Dist01, m_Particles, m_WindDir, m_WindStrength};
     const size_t before = m_Particles.size();
@@ -3901,8 +3495,7 @@ void ParticleSystem::AssignSpawnVariants(size_t firstIndex)
         {
             continue;
         }
-        // Types with a spawnVariantCount pin the roll to their leading
-        // variants and switch to the later ones at runtime (Bubble's pop).
+        // Restrict spawn rolls to leading variants reserved for initial behavior states.
         int count = std::max<int>(1, m_VariantCounts[typeIndex]);
         const uint8_t spawnCount = kParticleVisuals[typeIndex].spawnVariantCount;
         if (spawnCount > 0)
@@ -3917,8 +3510,7 @@ void ParticleSystem::AssignSpawnVariants(size_t firstIndex)
 
 namespace
 {
-// Returns a smoothstep ramp peaking near `center` (in 0-24h time).
-// Width controls the half-width of the bump.
+// Periodic 24-hour bump; width is its half-width in hours.
 float TimeOfDayBump(float timeOfDay, float center, float width)
 {
     // Wrap-aware shortest distance on a 24h circle.
@@ -3932,13 +3524,12 @@ float TimeOfDayBump(float timeOfDay, float center, float width)
         return 0.0f;
     }
     float t = 1.0f - diff / width;
-    return t * t * (3.0f - 2.0f * t);  // smoothstep
+    return t * t * (3.0f - 2.0f * t);
 }
 }  // namespace
 
 void ParticleSystem::UpdateAmbientSpawning(float deltaTime, glm::vec2 cameraPos, glm::vec2 viewSize)
 {
-    // Count current ambient particles (per type and total).
     int totalAmbient = 0;
     int countLeaf = 0, countDust = 0, countPollen = 0;
     for (const auto& p : m_Particles)
@@ -4003,10 +3594,8 @@ void ParticleSystem::SpawnAmbientParticle(ParticleType type,
                                           glm::vec2 cameraPos,
                                           glm::vec2 viewSize)
 {
-    // Build a fake camera-rect zone so the per-type Spawn function (single
-    // source of truth) handles all the type-specific initialization.
-    // zoneIndex = -1 marks the particle as ambient (exempt from zone-orphan
-    // cleanup and uncounted by per-zone caps).
+    // Reuse the zone initializer over a viewport rectangle. zoneIndex -1 exempts ambient particles
+    // from zone removal and per-zone caps.
     const float margin = ambience::AMBIENT_PARTICLE_SPAWN_MARGIN;
     ParticleZone fakeZone;
     fakeZone.position = cameraPos - glm::vec2(margin);
@@ -4019,10 +3608,7 @@ void ParticleSystem::SpawnAmbientParticle(ParticleType type,
 
 void ParticleSystem::SpawnOne(ParticleType type, glm::vec2 worldPos)
 {
-    // 1x1 ad-hoc zone at the requested world position; the per-type spawn
-    // initialiser samples a position inside the zone so the particle lands
-    // (within sub-pixel jitter) on `worldPos`. zoneIndex = -1 keeps it out
-    // of the orphan-cleanup pass when zones get added or removed later.
+    // A 1x1 temporary zone preserves the type initializer and adds only sub-pixel position jitter.
     ParticleZone fakeZone;
     fakeZone.position = worldPos;
     fakeZone.size = glm::vec2(1.0f, 1.0f);
@@ -4064,7 +3650,7 @@ void ParticleSystem::SetWind(glm::vec2 direction, float strength)
 
 namespace
 {
-// Map WeatherParticleType -> concrete ParticleType. Returns nullopt for None.
+// Map WeatherParticleType -> concrete ParticleType. returns nullopt for None.
 std::optional<ParticleType> ResolveWeatherParticle(WeatherParticleType wpt)
 {
     switch (wpt)
@@ -4112,10 +3698,7 @@ std::optional<ParticleType> ResolveWeatherParticle(WeatherParticleType wpt)
 
 void ParticleSystem::UpdateWeatherSpawning(float deltaTime, glm::vec2 cameraPos, glm::vec2 viewSize)
 {
-    // Hoisted per-type live census: one O(n) pass per frame instead of one
-    // per spawned particle (Thunderstorm spawns ~1000/s into a 10k pool).
-    // SpawnWeatherType increments its slot locally as it spawns. Sized from
-    // EnumTraits so new ParticleTypes are covered automatically.
+    // Count each weather type once per frame, then increment its count for every spawn.
     std::array<int, EnumTraits<ParticleType>::Count> liveByType{};
     for (const auto& p : m_Particles)
     {
@@ -4130,15 +3713,11 @@ void ParticleSystem::UpdateWeatherSpawning(float deltaTime, glm::vec2 cameraPos,
     {
         if (m_TransitionOut != nullptr && m_TransitionIn != nullptr)
         {
-            // Transition: four streams (outgoing fades out, incoming fades in).
-            // Each spawns with its own definition so per-weather size tuning stays
-            // correct on both sides of the cross-fade; the blended effective def
-            // (SetWeatherState) still feeds live-read channels.
+            // Transition streams use endpoint sizes and caps; the blended definition supplies
+            // live-read effects.
 
-            // Cap rule (spec 4.3): for a type both endpoints spawn, the stream cap
-            // is the min of the two endpoints' caps (0 = uncapped). Otherwise the
-            // larger-capped stream fills the shared live count past the smaller
-            // endpoint's ceiling - the bug the blend-side floor exists to prevent.
+            // Shared endpoint types use the smaller nonzero cap so neither stream overfills the
+            // common population.
             const auto streamCap =
                 [](const WeatherDefinition& other, WeatherParticleType type, int ownSlotCap)
             {
@@ -4197,9 +3776,8 @@ void ParticleSystem::UpdateWeatherSpawning(float deltaTime, glm::vec2 cameraPos,
         }
         else
         {
-            // Idle: the two-stream path (Task 3), passing m_CurrentWeatherDef as the
-            // stream def.
-            // Scale base rate by intensity and visible-area ratio (see EffectiveRate).
+            // Without a transition, the base definition supplies both stream sizes and spawn
+            // rates.
             SpawnWeatherType(m_CurrentWeatherDef->particleType,
                              EffectiveRate(m_CurrentWeatherDef->baseSpawnRate, viewSize),
                              m_CurrentWeatherDef->maxWeatherParticles,
@@ -4221,9 +3799,7 @@ void ParticleSystem::UpdateWeatherSpawning(float deltaTime, glm::vec2 cameraPos,
         }
     }
 
-    // Overlay: two independent streams at full rate, scaled by the overlay factor.
-    // Runs regardless of m_CurrentWeatherDef so a manual overlay can play with no
-    // base weather active.
+    // Overlay streams also run without base weather.
     if (m_OverlayWeatherDef != nullptr && m_OverlayFactor > 0.0f)
     {
         SpawnWeatherType(
@@ -4251,11 +3827,7 @@ void ParticleSystem::UpdateWeatherSpawning(float deltaTime, glm::vec2 cameraPos,
 
 float ParticleSystem::EffectiveRate(float baseSpawnRate, glm::vec2 viewSize) const
 {
-    // Scale base rate by visible-area ratio so density per visible pixel stays
-    // roughly constant across zoom. Reference is the 320x180 world-px window at
-    // zoom=1: zooming in shrinks viewSize and drops the rate; zooming out
-    // raises it so a downpour still feels like a downpour. The ratio is clamped
-    // to [0.25, 4], so density saturates past those bounds.
+    // Scale density by visible area relative to 320x180, clamped to 0.25 through 4.
     constexpr float kReferenceArea = 320.0f * 180.0f;
     const float visibleArea = std::max(1.0f, viewSize.x * viewSize.y);
     const float zoomScale = std::clamp(visibleArea / kReferenceArea, 0.25f, 4.0f);
@@ -4282,13 +3854,11 @@ void ParticleSystem::SpawnWeatherType(WeatherParticleType wpt,
         return;
     }
 
-    // Hard cap counts only this slot's own particles (matched by ParticleType)
-    // so primary and secondary streams don't fight each other for the cap.
-    // The census is hoisted to the caller; spawns increment the slot locally.
+    // Each type uses its own shared live count; primary and secondary types do not compete.
     int& live = liveByType[static_cast<size_t>(*particleTypeOpt)];
     if (maxWeatherParticles > 0 && live >= maxWeatherParticles)
     {
-        spawnTimer = 0.0f;  // Throttle until population drops.
+        spawnTimer = 0.0f;
         return;
     }
 
@@ -4312,38 +3882,34 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
                                           glm::vec2 viewSize,
                                           const WeatherDefinition* streamDef)
 {
-    // Spawn rect: viewport with 20% overspray. Bias by particle type.
+    // Spawn rect: viewport with 20% overspray. bias by particle type.
     const float overspray = 0.20f;
     glm::vec2 rectPos = cameraPos - viewSize * overspray;
     glm::vec2 rectSize = viewSize * (1.0f + 2.0f * overspray);
 
-    // Type-specific spawn-edge bias.
     bool leafOrPollenFromLeft = false;
     switch (type)
     {
         case ParticleType::Rain:
         case ParticleType::Snow:
         case ParticleType::Ash:
-            // Spawn in the top 10% of the rect so particles fall into view.
+
             rectSize.y *= 0.10f;
             break;
         case ParticleType::Sand:
         case ParticleType::Wind:
-            // Wind blows right by default; spawn at the upwind (left) edge.
-            // Wind gust streaks share Sand's +X travel convention.
+
+            // Sand and Wind move toward +X, so spawn them in the upwind left band.
             rectSize.x *= 0.10f;
             break;
         case ParticleType::Ember:
-            // Embers rise from the bottom 20% so they enter from below.
+
             rectPos.y += rectSize.y * 0.80f;
             rectSize.y *= 0.20f;
             break;
         case ParticleType::DriftingLeaf:
         case ParticleType::Pollen:
-            // FallingLeaves / PollenStorm approach from both sides: pick the
-            // left or right 10% strip (50/50). Left-edge spawns get velocity.x
-            // = 1 so their Update flips the wind X and they drift inward;
-            // right-edge spawns ride the default leftward wind into view.
+            // Left-edge leaf/pollen spawns reverse wind X; right-edge spawns use normal wind.
             leafOrPollenFromLeft = m_Dist01(m_Rng) < 0.5f;
             if (leafOrPollenFromLeft)
             {
@@ -4359,7 +3925,7 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
         case ParticleType::CherryBlossom:
         case ParticleType::Firefly:
         default:
-            // Spawn anywhere in the visible rect.
+
             break;
     }
 
@@ -4378,10 +3944,8 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
     kSpawnDispatch[typeIndex](WEATHER_ZONE_INDEX, fakeZone, ctx);
     AssignSpawnVariants(before);
 
-    // Apply weather size scale to anything the type's Spawn just appended.
-    // Allows per-weather "make it bigger" tuning without modifying per-type
-    // spawn defaults (used for atmosphere weathers that need denser/larger
-    // fog blobs and swarm weathers that benefit from chunkier sprites).
+    // Apply endpoint size scaling to every particle the spawn routine appended, including
+    // companions.
     const float sizeScale = streamDef ? streamDef->particleSizeScale : 1.0f;
     if (sizeScale != 1.0f)
     {
@@ -4391,10 +3955,8 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
         }
     }
 
-    // Wind-driven velocity boost for Snow. Base spawn velocity reads as calm
-    // flurries; this ramps it (smoothstep 0.3-0.9) up to the Blizzard look at
-    // full strength (7x horizontal along wind, 3.5x fall). The continuous ramp
-    // reaches mid-strength states, and all flakes share one drift direction.
+    // Ramp Snow from calm motion to shared wind-driven flurries over wind strength 0.3 to 0.9. The
+    // strongest wind scales horizontal speed 7x and fall speed 3.5x.
     if (type == ParticleType::Snow)
     {
         const float ramp = glm::smoothstep(0.3f, 0.9f, m_WindStrength);
@@ -4408,10 +3970,7 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
         }
     }
 
-    // FallingLeaves / PollenStorm: tag left-edge spawns so their Update flips
-    // the wind X component (drifting into view from the left), and stretch
-    // per-particle lifetime relative to ambient so a leaf or mote can cross
-    // a larger fraction of the screen before fading.
+    // Tag left-edge wind reversal and extend weather lifetimes to cross the view.
     if (type == ParticleType::DriftingLeaf || type == ParticleType::Pollen)
     {
         constexpr float kWeatherLifetimeBoost = 1.5f;
@@ -4424,10 +3983,7 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
         }
     }
 
-    // Weather-rain splash impact: spread bakedGroundY uniformly across the
-    // full visible viewport (camera-relative) so splashes aren't one line and
-    // the player can't outrun them vertically. Per-particle lifetime is sized
-    // to the travel distance so the splash always fires (re-based each frame).
+    // Spread rain impacts across the visible Y range and size lifetime to reach the target.
     if (type == ParticleType::Rain)
     {
         const float minSplash = cameraPos.y + viewSize.y * 0.10f;
@@ -4443,10 +3999,7 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
         }
     }
 
-    // Weather-snow puff impact: same camera-relative wide-Y spread as rain so
-    // flakes "land" across the screen instead of on one line. Snow's 15s
-    // lifetime covers the travel at Blizzard fall speed (42-77 px/s), so no
-    // per-particle lifetime sizing is needed (re-based each frame in Update).
+    // Spread snow impacts across visible Y; the existing lifetime covers the travel distance.
     if (type == ParticleType::Snow)
     {
         const float minImpact = cameraPos.y + viewSize.y * 0.10f;
@@ -4457,14 +4010,9 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
         }
     }
 
-    // Pre-warm streaming weathers (falling Rain/Snow/Ash, rising Ember):
-    // pre-advance each particle along its velocity by ageFraction * maxLifetime
-    // and cut remaining lifetime by the same fraction, so spawns fill the whole
-    // travel column at once instead of only the entry strip.
+    // Pre-age streaming particles along velocity so their travel columns populate immediately.
 
-    // drifting weathers (Fog / Leaf / Pollen) are intentionally not pre-aged:
-    // they already spawn anywhere in the rect, and full lifetime lets their
-    // alpha fade in smoothly instead of popping in at full strength.
+    // Drifting types retain full lifetime for a smooth alpha fade-in.
     const bool isStreaming = (type == ParticleType::Rain || type == ParticleType::Snow ||
                               type == ParticleType::Ash || type == ParticleType::Ember);
     if (isStreaming)
@@ -4480,70 +4028,141 @@ void ParticleSystem::SpawnWeatherParticle(ParticleType type,
     }
 }
 
+ParticleSystem::ParticleRenderData ParticleSystem::MakeRenderData(const Particle& p) const
+{
+    ParticleRenderData data{};
+    data.size = glm::vec2(p.size, p.size);
+    data.color = p.color;
+    data.rotation = p.rotation;
+    data.phase = p.phase;
+    data.lifeT =
+        (p.maxLifetime > 1e-4f) ? std::clamp(1.0f - p.lifetime / p.maxLifetime, 0.0f, 1.0f) : 0.0f;
+    data.additive = p.additive;
+    data.type = p.type;
+    data.variant = p.variant;
+    return data;
+}
+
+bool ParticleSystem::ResolveNoProjection(const Particle& p) const
+{
+    // Live zones override noProjection; zoneless secondary particles retain the parent flag.
+    if (m_Zones && p.zoneIndex >= 0 && p.zoneIndex < static_cast<int>(m_Zones->size()))
+    {
+        return (*m_Zones)[p.zoneIndex].noProjection;
+    }
+    return p.noProjection;
+}
+
+std::optional<ParticleSystem::ParticleSprite> ParticleSystem::ResolveSprite(
+    const ParticleRenderData& data) const
+{
+    const int typeIndex = static_cast<int>(data.type);
+    if (typeIndex < 0 || typeIndex >= static_cast<int>(EnumTraits<ParticleType>::Count))
+    {
+        return std::nullopt;
+    }
+    const uint8_t variantCount = std::max<uint8_t>(uint8_t{1}, m_VariantCounts[typeIndex]);
+    const uint8_t variant = (data.variant < variantCount) ? data.variant : uint8_t{0};
+    const AtlasSlot& slot = m_AtlasSlots[typeIndex][variant];
+
+    // Loop strips use global time with phase jitter; one-shots map frames across lifetime.
+    ParticleSprite sprite;
+    sprite.uvMin = slot.region.uvMin;
+    sprite.uvMax = slot.region.uvMax;
+    if (slot.frameCount > 1)
+    {
+        const ParticleVisuals& vis = kParticleVisuals[typeIndex];
+        // Bubble pop variant remaps its final lifetime onto one strip playback.
+        const ParticleAnimMode animMode = (data.type == ParticleType::Bubble && variant == 1)
+                                              ? ParticleAnimMode::LifeMapped
+                                              : vis.animMode;
+        int frame = 0;
+        if (animMode == ParticleAnimMode::LifeMapped)
+        {
+            frame = std::min(slot.frameCount - 1,
+                             static_cast<int>(data.lifeT * static_cast<float>(slot.frameCount)));
+        }
+        else
+        {
+            const float rate = vis.animFps * (0.85f + 0.30f * (data.phase / 6.2832f));
+            const float cursor = m_Time * rate + data.phase * 2.0f;
+            frame = static_cast<int>(cursor) % slot.frameCount;
+        }
+        const float frameWidth =
+            (slot.region.uvMax.x - slot.region.uvMin.x) / static_cast<float>(slot.frameCount);
+        // Quarter-texel inset avoids neighboring strip frames under rotation and scaling.
+        const float inset = 0.25f / static_cast<float>(kParticleAtlasWidth);
+        sprite.uvMin.x = slot.region.uvMin.x + frameWidth * static_cast<float>(frame) + inset;
+        sprite.uvMax.x = slot.region.uvMin.x + frameWidth * static_cast<float>(frame + 1) - inset;
+    }
+
+    sprite.renderSize = data.size;
+
+    if (data.type == ParticleType::Sunshine)
+    {
+        sprite.renderSize = glm::vec2(data.size.x, data.size.x * 4.0f);
+    }
+
+    else if (data.type == ParticleType::Rain)
+    {
+        const float stretch = 1.0f + 0.4f * (std::sin(data.phase) * 0.5f + 0.5f);
+        sprite.renderSize = glm::vec2(data.size.x, data.size.x * stretch);
+    }
+
+    else if (data.type == ParticleType::Snow)
+    {
+        const float flipScale = std::cos(m_Time * 3.0f + data.phase);
+        sprite.renderSize.x *= flipScale;
+    }
+
+    else if (data.type == ParticleType::Wind)
+    {
+        sprite.renderSize = glm::vec2(data.size.x * 2.2f, data.size.x * 0.75f);
+    }
+    return sprite;
+}
+
 void ParticleSystem::Render(IRenderer& renderer,
                             glm::vec2 cameraPos,
                             bool noProjectionOnly,
                             bool renderAll)
 {
-    // Console toggle: simulation keeps running while rendering is disabled
-    // so toggling back on doesn't show a populate-in delay. The debug
-    // overlay reports zero drawn while disabled.
     if (!m_RenderEnabled)
     {
         m_LastDrawnCount = 0;
         return;
     }
 
-    // Two classes with different culling rules: noProjection particles ride an
-    // upright structure's mesh and are deliberately never viewport-culled, while
-    // regular particles are culled against the view rect with a size-based pad.
+    // noProjection particles skip viewport culling; regular particles use the padded view
+    // rectangle.
     m_NoProjectionBatch.clear();
     m_RegularBatch.clear();
 
     const glm::vec2 viewSize = renderer.GetViewSize();
 
-    // First pass: classify and compute every particle's screen position.
     for (const Particle& p : m_Particles)
     {
-        // Live zone particles follow their zone's (editable) flag; zoneless
-        // carriers - splash droplets, snow puffs, bubble pops - keep the
-        // flag their parent baked into the particle, so a pop from a
-        // noProjection bubble doesn't jump projection for its last frames.
-        bool isNoProjection = p.noProjection;
-        if (m_Zones && p.zoneIndex >= 0 && p.zoneIndex < static_cast<int>(m_Zones->size()))
-        {
-            isNoProjection = (*m_Zones)[p.zoneIndex].noProjection;
-        }
+        const bool isNoProjection = ResolveNoProjection(p);
 
-        // Filter particles based on noProjection flag
         if (!renderAll)
         {
             if (noProjectionOnly && !isNoProjection)
+            {
                 continue;
+            }
             if (!noProjectionOnly && isNoProjection)
+            {
                 continue;
+            }
         }
 
-        ParticleRenderData data;
-        data.size = glm::vec2(p.size, p.size);
-        data.color = p.color;
-        data.rotation = p.rotation;
-        data.phase = p.phase;
-        data.lifeT = (p.maxLifetime > 1e-4f)
-                         ? std::clamp(1.0f - p.lifetime / p.maxLifetime, 0.0f, 1.0f)
-                         : 0.0f;
-        data.additive = p.additive;
-        data.type = p.type;
-        data.variant = p.variant;
+        ParticleRenderData data = MakeRenderData(p);
 
-        // Convert world position to screen position
         data.screenPos = p.position - cameraPos;
 
         if (isNoProjection)
         {
-            // Ride the upright structure's own mesh when one is underneath, so a
-            // particle stays locked to the face it was spawned against. Otherwise
-            // the plain screen position stands. Deliberately not viewport-culled.
+            // Follow the structure mesh when covered; otherwise retain plain screen position.
             if (m_Tilemap)
             {
                 glm::vec2 structureScreenPos;
@@ -4558,102 +4177,37 @@ void ParticleSystem::Render(IRenderer& renderer,
         }
         else
         {
-            // Cull regular particles that are outside viewport or behind sphere
-            // Use generous padding to account for particle size and partial visibility
-            float padding = std::max(data.size.x, data.size.y) * 2.0f + 50.0f;
+            // Pad by sprite size so partially visible cards are not culled at the viewport edge.
+            const float padding = std::max(data.size.x, data.size.y) * 2.0f + 50.0f;
 
-            bool outsideViewport =
+            const bool outsideViewport =
                 data.screenPos.x < -padding || data.screenPos.x > viewSize.x + padding ||
                 data.screenPos.y < -padding || data.screenPos.y > viewSize.y + padding;
 
             if (outsideViewport)
+            {
                 continue;
+            }
 
             m_RegularBatch.push_back(data);
         }
     }
 
-    // Lambda to draw a particle using the texture atlas
     auto drawParticle = [&](const ParticleRenderData& data)
     {
         if (m_TexturesLoaded)
         {
-            int typeIndex = static_cast<int>(data.type);
-            if (typeIndex < 0 || typeIndex >= static_cast<int>(EnumTraits<ParticleType>::Count))
+            const std::optional<ParticleSprite> sprite = ResolveSprite(data);
+            if (!sprite)
+            {
                 return;
-            const uint8_t variantCount = std::max<uint8_t>(uint8_t{1}, m_VariantCounts[typeIndex]);
-            const uint8_t variant = (data.variant < variantCount) ? data.variant : uint8_t{0};
-            const AtlasSlot& slot = m_AtlasSlots[typeIndex][variant];
-
-            // Strip-backed sprites select one horizontal frame as a UV sub-rect. Loop mode runs
-            // on global time with per-particle rate jitter + start offset (phase) so same-type
-            // particles don't animate in lockstep; LifeMapped plays the strip exactly once
-            // across the particle's lifetime (pops, twinkles).
-            glm::vec2 uvMin = slot.region.uvMin;
-            glm::vec2 uvMax = slot.region.uvMax;
-            if (slot.frameCount > 1)
-            {
-                const ParticleVisuals& vis = kParticleVisuals[typeIndex];
-                // Bubble's variant 1 is its pop strip: the behavior remaps
-                // the particle's remaining life onto the pop window, so the
-                // strip plays once even though the type loops while afloat.
-                const ParticleAnimMode animMode =
-                    (data.type == ParticleType::Bubble && variant == 1)
-                        ? ParticleAnimMode::LifeMapped
-                        : vis.animMode;
-                int frame = 0;
-                if (animMode == ParticleAnimMode::LifeMapped)
-                {
-                    frame = std::min(
-                        slot.frameCount - 1,
-                        static_cast<int>(data.lifeT * static_cast<float>(slot.frameCount)));
-                }
-                else
-                {
-                    const float rate = vis.animFps * (0.85f + 0.30f * (data.phase / 6.2832f));
-                    const float cursor = m_Time * rate + data.phase * 2.0f;
-                    frame = static_cast<int>(cursor) % slot.frameCount;
-                }
-                const float frameWidth = (slot.region.uvMax.x - slot.region.uvMin.x) /
-                                         static_cast<float>(slot.frameCount);
-                // Quarter-texel inset: frames inside a strip pack with no
-                // padding, so exact-boundary UVs could sample the neighbor
-                // frame's edge texels under rotation/scaling.
-                const float inset = 0.25f / static_cast<float>(kParticleAtlasWidth);
-                uvMin.x = slot.region.uvMin.x + frameWidth * static_cast<float>(frame) + inset;
-                uvMax.x = slot.region.uvMin.x + frameWidth * static_cast<float>(frame + 1) - inset;
             }
-
-            glm::vec2 renderSize = data.size;
-            // Sunshine uses elongated beam texture (48x192 aspect ratio = 1:4)
-            if (data.type == ParticleType::Sunshine)
-            {
-                renderSize = glm::vec2(data.size.x, data.size.x * 4.0f);
-            }
-            // Rain uses stretched vertical texture with per-droplet variation
-            else if (data.type == ParticleType::Rain)
-            {
-                // Vary stretch between 1.0x and 1.4x based on particle phase
-                float stretch = 1.0f + 0.4f * (std::sin(data.phase) * 0.5f + 0.5f);
-                renderSize = glm::vec2(data.size.x, data.size.x * stretch);
-            }
-            // Snow flips like a coin
-            else if (data.type == ParticleType::Snow)
-            {
-                float flipScale = std::cos(m_Time * 3.0f + data.phase);
-                renderSize.x *= flipScale;
-            }
-            // Wind gust streaks stretch along their travel axis to sell speed
-            else if (data.type == ParticleType::Wind)
-            {
-                renderSize = glm::vec2(data.size.x * 2.2f, data.size.x * 0.75f);
-            }
-            glm::vec2 centeredPos = data.screenPos - renderSize * 0.5f;
+            const glm::vec2 centeredPos = data.screenPos - sprite->renderSize * 0.5f;
             renderer.DrawSpriteAtlas(m_Store->Get(m_AtlasHandle),
                                      centeredPos,
-                                     renderSize,
-                                     uvMin,
-                                     uvMax,
+                                     sprite->renderSize,
+                                     sprite->uvMin,
+                                     sprite->uvMax,
                                      data.rotation,
                                      data.color,
                                      data.additive);
@@ -4662,18 +4216,18 @@ void ParticleSystem::Render(IRenderer& renderer,
         {
             glm::vec2 size = data.size;
             if (data.type == ParticleType::Rain)
+            {
                 size = glm::vec2(1.0f, 8.0f);
+            }
             renderer.DrawColoredRect(data.screenPos, size, data.color, data.additive);
         }
     };
 
-    // Dead leftover: the batches are partitioned by blend mode below, not sorted.
-    // Do not restore a sort here - the partition is the intended algorithm.
+    // Blend partitioning below is intentional; this unused comparator does not define render order.
     auto sortByBlendMode = [](const ParticleRenderData& a, const ParticleRenderData& b)
     { return a.additive < b.additive; };
 
-    // Partition by blend mode (O(n)) instead of sorting (O(n log n)).
-    // Non-additive particles come first, then additive ones.
+    // Partition alpha before additive in O(n), without depth sorting.
     std::partition(m_NoProjectionBatch.begin(),
                    m_NoProjectionBatch.end(),
                    [](const ParticleRenderData& d) { return !d.additive; });
@@ -4686,13 +4240,177 @@ void ParticleSystem::Render(IRenderer& renderer,
         drawParticle(data);
     }
 
-    // Draw regular particles normally
     for (const auto& data : m_RegularBatch)
     {
         drawParticle(data);
     }
 
     m_LastDrawnCount = m_NoProjectionBatch.size() + m_RegularBatch.size();
+}
+
+// Classify scene cards; sprite appearance remains shared with the flat path.
+//
+// B0 ignores depth to match flat particles over all tile layers. facade decals alone
+// test depth, with eye-ward wall bias. sheets use flat-viewport culling; ground props
+// and zone cards use the frustum. noProjection particles bypass culling.
+//
+//   card         who                                    anchor A
+//   -----------  -------------------------------------  ------------------------
+//   sheet        weather, ambient and console spawns     the rig's ground focus
+//   ground prop  zone types with no net vertical motion  the particle itself
+//   zone card    zone types that fall or rise on screen  ClampToRect(focus, zone)
+//   facade       noProjection over a Structure body      the body's run foot
+void ParticleSystem::Render3D(IRenderer& renderer, const cameraRig::RigParams& rig)
+{
+    if (!m_RenderEnabled)
+    {
+        m_LastDrawnCount = 0;
+        return;
+    }
+
+    m_FacadeBatch3D.clear();
+    m_CardBatch3D.clear();
+
+    const particleCards::Frame frame = particleCards::MakeFrame(rig);
+
+    for (const Particle& p : m_Particles)
+    {
+        const bool isNoProjection = ResolveNoProjection(p);
+        const ParticleRenderData data = MakeRenderData(p);
+
+        if (isNoProjection && m_Tilemap)
+        {
+            const std::optional<Tilemap::StructureFacade> facade =
+                m_Tilemap->FindStructureFacade(p.position);
+            if (facade)
+            {
+                const billboard::Orientation& axes =
+                    particleCards::FacadeAxes(frame, facade->widthTiles);
+                m_FacadeBatch3D.push_back({data,
+                                           particleCards::FacadePoint(frame,
+                                                                      axes,
+                                                                      facade->foot,
+                                                                      facade->runCentreX,
+                                                                      facade->baseSouthEdgeY,
+                                                                      p.position),
+                                           axes});
+                continue;
+            }
+        }
+
+        const int zone = (p.zoneIndex >= 0) ? p.zoneIndex : p.anchorZone;
+        const bool hasZone = m_Zones && zone >= 0 && zone < static_cast<int>(m_Zones->size());
+
+        glm::vec2 anchorWorld = frame.focusWorld;
+        float anchorHeight = frame.focusHeight;
+        if (hasZone)
+        {
+            const ParticleZone& zoneRect = (*m_Zones)[static_cast<size_t>(zone)];
+            const bool ground =
+                kParticleVisuals[static_cast<size_t>(p.type)].anchor == ParticleAnchor::Ground;
+            anchorWorld = ground ? p.position
+                                 : particleCards::ClampToRect(
+                                       frame.focusWorld, zoneRect.position, zoneRect.size);
+            anchorHeight = m_Tilemap ? m_Tilemap->SurfaceHeightAtWorldPos(anchorWorld) : 0.0f;
+        }
+
+        const glm::vec3 centre =
+            particleCards::CardPoint(frame, anchorWorld, anchorHeight, p.position);
+
+        if (!isNoProjection)
+        {
+            if (hasZone)
+            {
+                // Use a radius large enough for Sunshine, which renders at four times base size.
+                const float radius = std::max(data.size.x, data.size.y) * 2.0f;
+                if (!frustum::IntersectsSphere(frame.view, centre, radius))
+                {
+                    continue;
+                }
+            }
+            else if (!particleCards::InsideSheetView(frame, p.position, data.size))
+            {
+                continue;
+            }
+        }
+
+        m_CardBatch3D.push_back({data, centre, frame.sheet});
+    }
+
+    // Partition by blend mode within each pass; particle cards have no per-particle depth sort.
+    const auto nonAdditiveFirst = [](const Particle3DQuad& q) { return !q.data.additive; };
+    std::partition(m_FacadeBatch3D.begin(), m_FacadeBatch3D.end(), nonAdditiveFirst);
+    std::partition(m_CardBatch3D.begin(), m_CardBatch3D.end(), nonAdditiveFirst);
+
+    const Texture headlessTexture;
+    size_t submitted = 0;
+
+    const auto submit = [&](const Particle3DQuad& q, renderModes::DepthMode depth)
+    {
+        if (submitted >= MAX_PARTICLE_QUADS_3D)
+        {
+            return;
+        }
+        const renderModes::BlendMode blend =
+            q.data.additive ? renderModes::BlendMode::Additive : renderModes::BlendMode::Alpha;
+        glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
+
+        if (m_TexturesLoaded)
+        {
+            const std::optional<ParticleSprite> sprite = ResolveSprite(q.data);
+            if (!sprite)
+            {
+                return;
+            }
+            const Texture& atlas = m_Store->Get(m_AtlasHandle);
+            const glm::vec2 dims(static_cast<float>(atlas.GetWidth()),
+                                 static_cast<float>(atlas.GetHeight()));
+            particleCards::MakeSpriteQuad(
+                q.centre, sprite->renderSize, q.axes, q.data.rotation, corners);
+            // flipY = false reproduces atlas V assignment for both file and procedural sprite
+            // sources.
+            renderer.DrawQuad3D(atlas,
+                                corners,
+                                sprite->uvMin * dims,
+                                (sprite->uvMax - sprite->uvMin) * dims,
+                                q.data.color,
+                                blend,
+                                depth,
+                                false,
+                                false,
+                                false,
+                                renderModes::LightMode::SelfLit);
+        }
+        else
+        {
+            // Retain headless geometry submission; backends discard the empty texture.
+            particleCards::MakeSpriteQuad(q.centre, q.data.size, q.axes, q.data.rotation, corners);
+            renderer.DrawQuad3D(headlessTexture,
+                                corners,
+                                glm::vec2(0.0f),
+                                glm::vec2(1.0f),
+                                q.data.color,
+                                blend,
+                                depth,
+                                false,
+                                false,
+                                false,
+                                renderModes::LightMode::SelfLit);
+        }
+        ++submitted;
+    };
+
+    // Draw depth-tested facade decals before cards that ignore depth.
+    for (const Particle3DQuad& q : m_FacadeBatch3D)
+    {
+        submit(q, renderModes::DepthMode::TestOnly);
+    }
+    for (const Particle3DQuad& q : m_CardBatch3D)
+    {
+        submit(q, renderModes::DepthMode::None);
+    }
+
+    m_LastDrawnCount = submitted;
 }
 
 void ParticleSystem::OnZoneRemoved(int zoneIndex)
@@ -4702,15 +4420,20 @@ void ParticleSystem::OnZoneRemoved(int zoneIndex)
         return;
     }
 
-    // Remove particles from the deleted zone in one pass
-    std::erase_if(m_Particles, [zoneIndex](const Particle& p) { return p.zoneIndex == zoneIndex; });
+    // Splash anchorZone ties deletion to the parent zone.
+    std::erase_if(m_Particles,
+                  [zoneIndex](const Particle& p)
+                  { return p.zoneIndex == zoneIndex || p.anchorZone == zoneIndex; });
 
-    // Adjust indices for particles from higher-indexed zones
     for (auto& p : m_Particles)
     {
         if (p.zoneIndex > zoneIndex)
         {
             p.zoneIndex--;
+        }
+        if (p.anchorZone > zoneIndex)
+        {
+            p.anchorZone--;
         }
     }
 
