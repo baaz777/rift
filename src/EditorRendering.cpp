@@ -15,10 +15,7 @@
 namespace
 {
 
-// Overlay tint per tile stance. Structure keeps the orange the no-projection flag
-// used, so existing muscle memory still reads. Wall and Prop take blue and yellow,
-// which are clear of the y-sort teal/magenta and the collision/navigation colors.
-// Alpha is set by the caller; only the hue carries meaning here.
+// Stance overlay hues; the caller supplies alpha.
 glm::vec4 StanceOverlayColor(TileStance stance)
 {
     switch (stance)
@@ -35,9 +32,7 @@ glm::vec4 StanceOverlayColor(TileStance stance)
     }
 }
 
-// Overlay tint per elevation role. Ground is untinted; Raised keeps the magenta
-// the elevation overlay has always used, and Ramp takes cyan so a slope reads
-// apart from a level deck at a glance. Alpha is set by the caller.
+// Elevation-role overlay hues; the caller supplies alpha.
 glm::vec4 ElevationRoleOverlayColor(ElevationRole role)
 {
     switch (role)
@@ -52,8 +47,7 @@ glm::vec4 ElevationRoleOverlayColor(ElevationRole role)
     }
 }
 
-// Tile-space culling window shared by every overlay pass. startX/startY are inclusive and
-// endX/endY EXCLUSIVE, so the loops below are all `for (x = startX; x < endX; ++x)`.
+// Tile bounds include startX/startY and exclude endX/endY.
 struct VisibleTileRange
 {
     int tileWidth, tileHeight;
@@ -61,11 +55,7 @@ struct VisibleTileRange
     int startX, endX, startY, endY;
 };
 
-// Which tiles the overlays have to visit this frame: the camera rect scaled by
-// zoom, plus a one-tile margin on each side for tiles only partially visible at
-// the edge.
-//
-// Returns a zeroed range for a degenerate tile size, which makes every caller's loop empty.
+// Visible tile bounds include a one-tile margin; invalid tile dimensions return empty.
 VisibleTileRange CalcVisibleTileRange(const EditorContext& ctx)
 {
     VisibleTileRange r{};
@@ -93,8 +83,6 @@ VisibleTileRange CalcVisibleTileRange(const EditorContext& ctx)
     return r;
 }
 
-// Draw a colored rect at every visible tile where predicate is true.
-// Extracts the common CalcVisibleTileRange + loop + DrawColoredRect pattern.
 template <typename Predicate>
 void ForVisibleFlaggedTiles(const EditorContext& ctx, Predicate predicate, const glm::vec4& color)
 {
@@ -116,69 +104,6 @@ void ForVisibleFlaggedTiles(const EditorContext& ctx, Predicate predicate, const
     }
 }
 
-// Inclusive tile-space bounding box of one connected structure-stance group.
-struct StructureBounds
-{
-    int minX, maxX, minY, maxY;
-};
-
-// 4-connected flood fill over "this cell has stance TileStance::Structure on any layer",
-// accumulating the group's bounding box. There is no per-layer no-projection flag; the
-// predicate is GetLayerStance. The `processed` grid is shared across calls by
-// EnsureNoProjBoundsCache so each cell joins exactly one group and the whole map costs one
-// pass. Iterative with an explicit stack rather than recursion, because a group can span
-// the entire map.
-StructureBounds FloodFillNoProjBounds(const Tilemap& tilemap,
-                                      int startX,
-                                      int startY,
-                                      int mapWidth,
-                                      int mapHeight,
-                                      size_t layerCount,
-                                      std::vector<char>& processed)
-{
-    StructureBounds bounds{startX, startX, startY, startY};
-    std::vector<std::pair<int, int>> stack;
-    stack.push_back({startX, startY});
-
-    while (!stack.empty())
-    {
-        auto [cx, cy] = stack.back();
-        stack.pop_back();
-
-        if (cx < 0 || cx >= mapWidth || cy < 0 || cy >= mapHeight)
-            continue;
-
-        int cIdx = cy * mapWidth + cx;
-        if (processed[cIdx])
-            continue;
-
-        bool isStructure = false;
-        for (size_t li = 0; li < layerCount; ++li)
-        {
-            if (tilemap.GetLayerStance(cx, cy, li) == TileStance::Structure)
-            {
-                isStructure = true;
-                break;
-            }
-        }
-        if (!isStructure)
-            continue;
-
-        processed[cIdx] = 1;
-        bounds.minX = std::min(bounds.minX, cx);
-        bounds.maxX = std::max(bounds.maxX, cx);
-        bounds.minY = std::min(bounds.minY, cy);
-        bounds.maxY = std::max(bounds.maxY, cy);
-
-        stack.push_back({cx - 1, cy});
-        stack.push_back({cx + 1, cy});
-        stack.push_back({cx, cy - 1});
-        stack.push_back({cx, cy + 1});
-    }
-
-    return bounds;
-}
-
 void DrawCrossMarker(IRenderer& renderer, const glm::vec2& pos, float size, const glm::vec4& color)
 {
     renderer.DrawColoredRect(
@@ -187,13 +112,8 @@ void DrawCrossMarker(IRenderer& renderer, const glm::vec2& pos, float size, cons
         glm::vec2(pos.x - 1.0f, pos.y - size), glm::vec2(2.0f, size * 2.0f), color);
 }
 
-// Editor-only swatch for particle zone overlays and the zone HUD - unrelated to the colors
-// the particles actually render with. This switch is the single place editor colors are
-// defined. It has no default label, but the build enables no unhandled-enumerator warning
-// (no /W4, no /w14062, and no switch-coverage clang-tidy check), so a missing case fails
-// silently: the type falls through to the white return below and renders white in the
-// editor. Adding a ParticleType means adding a row here as well as to EnumTraits and
-// kParticleVisuals.
+// Editor swatches are separate from particle colors. Add new ParticleType cases here;
+// unhandled values fall back to white.
 glm::vec4 GetParticleTypeColor(ParticleType type, float alpha)
 {
     switch (type)
@@ -292,10 +212,7 @@ glm::vec4 GetParticleTypeColor(ParticleType type, float alpha)
     return glm::vec4(1.0f, 1.0f, 1.0f, alpha);
 }
 
-// Truncate text with an ellipsis so it fits maxWidth at the given scale. Measurement goes
-// through the renderer because glyph widths depend on the loaded font, so this cannot be a
-// character count. Returns the text untouched when it already fits, and an empty string
-// when even "..." does not - callers must handle an empty result.
+// Measure glyph widths through the renderer. Returns empty if even the ellipsis cannot fit.
 std::string FitText(IRenderer& renderer, const std::string& text, float scale, float maxWidth)
 {
     if (maxWidth <= 0.0f)
@@ -329,9 +246,7 @@ std::string BasenameWithoutExtension(const std::string& path)
     return filename.empty() ? path : filename;
 }
 
-// HUD label for a tile id, annotated with the id's (column, row) in the tileset - the
-// inverse of the tileID = row * tilesPerRow + column packing. Degrades to the bare id when
-// the tileset geometry is not known yet (no tileset loaded), and to "None" for -1.
+// Tile label includes tileset coordinates when geometry is known; -1 displays None.
 std::string TileLabel(const Tilemap& tilemap, int tileID)
 {
     if (tileID < 0)
@@ -347,9 +262,7 @@ std::string TileLabel(const Tilemap& tilemap, int tileID)
            std::to_string(tileID / tilesPerRow) + ")";
 }
 
-// HUD label for the active layer. Displays 1-based ("3/10 Objects") because the layer
-// hotkeys are 1-9 and 0, while m_CurrentLayer is the 0-based index - hence the +1 on every
-// branch. The count comes from the tilemap, so it tracks a map with a non-default stack.
+// Display one-based layer numbers; the stored index is zero-based.
 std::string LayerLabel(const Tilemap& tilemap, int currentLayer)
 {
     size_t layerCount = tilemap.GetLayerCount();
@@ -364,52 +277,22 @@ std::string LayerLabel(const Tilemap& tilemap, int currentLayer)
     return label;
 }
 
-}  // anonymous namespace
+}  // Anonymous namespace
 
-// One full-map pass per frame that groups every cell carrying the Structure stance on any
-// layer into connected regions, one cache entry per region, and caches each region's
-// inclusive bounds. Guarded by m_NoProjBoundsCached, which Editor::Render clears at
-// the top of each frame, so the several overlay passes that need the groups share one scan.
-// The `processed` grid is local and rebuilt per scan; it is what keeps each cell in exactly
-// one group.
 void Editor::EnsureNoProjBoundsCache(const EditorContext& ctx)
 {
     if (m_NoProjBoundsCached)
+    {
         return;
+    }
     m_NoProjBoundsCached = true;
     m_CachedNoProjBounds.clear();
 
-    int mapWidth = ctx.tilemap.GetMapWidth();
-    int mapHeight = ctx.tilemap.GetMapHeight();
-    size_t layerCount = ctx.tilemap.GetLayerCount();
-
-    std::vector<char> processed(static_cast<size_t>(mapWidth) * static_cast<size_t>(mapHeight), 0);
-
-    for (int y = 0; y < mapHeight; ++y)
+    const size_t layerCount = ctx.tilemap.GetLayerCount();
+    for (size_t layer = 0; layer < layerCount; ++layer)
     {
-        for (int x = 0; x < mapWidth; ++x)
-        {
-            int idx = y * mapWidth + x;
-            if (processed[idx])
-                continue;
-
-            bool isStructure = false;
-            for (size_t li = 0; li < layerCount; ++li)
-            {
-                if (ctx.tilemap.GetLayerStance(x, y, li) == TileStance::Structure)
-                {
-                    isStructure = true;
-                    break;
-                }
-            }
-            if (!isStructure)
-                continue;
-
-            auto [minX, maxX, minY, maxY] = FloodFillNoProjBounds(
-                ctx.tilemap, x, y, mapWidth, mapHeight, layerCount, processed);
-
-            m_CachedNoProjBounds.push_back({minX, maxX, minY, maxY});
-        }
+        const std::vector<Tilemap::StructureBounds> groups = ctx.tilemap.FindStructureGroups(layer);
+        m_CachedNoProjBounds.insert(m_CachedNoProjBounds.end(), groups.begin(), groups.end());
     }
 }
 
@@ -417,13 +300,11 @@ void Editor::RenderCollisionOverlays(const EditorContext& ctx)
 {
     auto vr = CalcVisibleTileRange(ctx);
 
-    // Render red overlay for each collision tile
     ForVisibleFlaggedTiles(
         ctx,
         [](const Tilemap& tm, int x, int y) { return tm.GetTileCollision(x, y); },
         glm::vec4(1.0f, 0.0f, 0.0f, 0.5f));
 
-    // Render player hitbox
     glm::vec2 playerPos = ctx.npcs.get<Transform>(ctx.playerEntity).position;
 
     glm::vec2 playerHitboxPos(
@@ -438,15 +319,14 @@ void Editor::RenderCollisionOverlays(const EditorContext& ctx)
             playerHitboxPos, playerHitboxSize, glm::vec4(1.0f, 1.0f, 0.0f, 0.6f));
     }
 
-    // Render NPC hitboxes in editor mode
     const float NPC_HITBOX_SIZE = CharacterConstants::HITBOX_HEIGHT;
-    ctx.npcs.each<const Transform, const NpcTag>(
-        [&](const Transform& xf)
+    ctx.npcs.view<const Transform, const NpcTag>().each(
+        [&](const Transform& transform)
         {
-            glm::vec2 npcFeet = xf.position;
-            glm::vec2 npcHitboxPos(npcFeet.x - NPC_HITBOX_SIZE * 0.5f - ctx.camera.position.x,
-                                   npcFeet.y - NPC_HITBOX_SIZE - ctx.camera.position.y);
-            glm::vec2 npcHitboxSize(NPC_HITBOX_SIZE, NPC_HITBOX_SIZE);
+            const glm::vec2 npcFeet = transform.position;
+            const glm::vec2 npcHitboxPos(npcFeet.x - NPC_HITBOX_SIZE * 0.5f - ctx.camera.position.x,
+                                         npcFeet.y - NPC_HITBOX_SIZE - ctx.camera.position.y);
+            const glm::vec2 npcHitboxSize(NPC_HITBOX_SIZE, NPC_HITBOX_SIZE);
 
             if (npcHitboxPos.x + npcHitboxSize.x >= 0 && npcHitboxPos.x <= vr.screenSize.x &&
                 npcHitboxPos.y + npcHitboxSize.y >= 0 && npcHitboxPos.y <= vr.screenSize.y)
@@ -476,9 +356,7 @@ void Editor::RenderElevationOverlays(const EditorContext& ctx)
             const int elevation = ctx.tilemap.GetElevation(x, y);
             const ElevationRole role = ctx.tilemap.GetLayerElevationRole(x, y, m_CurrentLayer);
 
-            // Worth showing if it has a height or a role. The old `elevation <= 0`
-            // skip hid pits entirely, which was survivable while elevation had no
-            // visual effect; lifted quads give a negative cell a real one.
+            // Include negative elevations so pits remain visible.
             if (elevation == 0 && role == ElevationRole::Ground)
                 continue;
 
@@ -572,7 +450,6 @@ void Editor::RenderStanceOverlays(const EditorContext& ctx)
         }
     }
 
-    // Anchor markers for detected upright structures.
     EnsureNoProjBoundsCache(ctx);
 
     float markerSize = 6.0f;
@@ -614,7 +491,6 @@ void Editor::RenderNoProjectionAnchorsImpl(const EditorContext& ctx)
         int rightPixelX = (bounds.maxX + 1) * tileWidth;
         int bottomPixelY = (bounds.maxY + 1) * tileHeight;
 
-        // Screen-space positions
         glm::vec2 screenLeft(static_cast<float>(leftPixelX) - ctx.camera.position.x,
                              static_cast<float>(bottomPixelY) - ctx.camera.position.y);
         glm::vec2 screenRight(static_cast<float>(rightPixelX) - ctx.camera.position.x,
@@ -624,13 +500,11 @@ void Editor::RenderNoProjectionAnchorsImpl(const EditorContext& ctx)
         DrawCrossMarker(ctx.renderer, screenRight, markerSize, anchorColor);
     }
 
-    // Draw manually defined structure anchors (cyan to distinguish from auto-detected green)
     const auto& structures = ctx.tilemap.GetNoProjectionStructures();
     float defMarkerSize = 6.0f;
-    glm::vec4 definedAnchorColor(0.0f, 1.0f, 1.0f, 1.0f);  // Cyan
+    glm::vec4 definedAnchorColor(0.0f, 1.0f, 1.0f, 1.0f);
     for (const auto& s : structures)
     {
-        // Screen-space positions from world coordinates
         glm::vec2 screenLeft(s.leftAnchor.x - ctx.camera.position.x,
                              s.leftAnchor.y - ctx.camera.position.y);
         glm::vec2 screenRight(s.rightAnchor.x - ctx.camera.position.x,
@@ -639,7 +513,6 @@ void Editor::RenderNoProjectionAnchorsImpl(const EditorContext& ctx)
         DrawCrossMarker(ctx.renderer, screenLeft, defMarkerSize, definedAnchorColor);
         DrawCrossMarker(ctx.renderer, screenRight, defMarkerSize, definedAnchorColor);
 
-        // Straight base line between anchors
         {
             glm::vec4 lineColor(0.0f, 1.0f, 1.0f, 0.5f);
             float baseY = std::max(screenLeft.y, screenRight.y);
@@ -658,7 +531,6 @@ void Editor::RenderStructureOverlays(const EditorContext& ctx)
 
     auto vr = CalcVisibleTileRange(ctx);
 
-    // Draw tiles assigned to structures with purple overlay
     for (int y = vr.startY; y < vr.endY; ++y)
     {
         for (int x = vr.startX; x < vr.endX; ++x)
@@ -678,8 +550,6 @@ void Editor::RenderStructureOverlays(const EditorContext& ctx)
         }
     }
 
-    // Draw defined structure anchors (same style as debug overlay)
-    // Anchors are stored in world coordinates
     float markerSize = 6.0f;
     const auto& structures = ctx.tilemap.GetNoProjectionStructures();
     for (const auto& s : structures)
@@ -689,17 +559,13 @@ void Editor::RenderStructureOverlays(const EditorContext& ctx)
         glm::vec2 rightPos(s.rightAnchor.x - ctx.camera.position.x,
                            s.rightAnchor.y - ctx.camera.position.y);
 
-        // Green for normal, cyan for selected structure
         glm::vec4 anchorColor = (s.id == m_CurrentStructureId) ? glm::vec4(0.0f, 1.0f, 1.0f, 1.0f)
                                                                : glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
 
-        // Left anchor cross
         DrawCrossMarker(ctx.renderer, leftPos, markerSize, anchorColor);
 
-        // Right anchor cross
         DrawCrossMarker(ctx.renderer, rightPos, markerSize, anchorColor);
 
-        // Straight base line between anchors
         {
             glm::vec4 lineColor(anchorColor.r, anchorColor.g, anchorColor.b, 0.5f);
             float baseY = std::max(leftPos.y, rightPos.y);
@@ -710,12 +576,11 @@ void Editor::RenderStructureOverlays(const EditorContext& ctx)
         }
     }
 
-    // Draw temporary anchors being placed (yellow, same style)
     if (m_TempLeftAnchor.x >= 0)
     {
         glm::vec2 pos(m_TempLeftAnchor.x - ctx.camera.position.x,
                       m_TempLeftAnchor.y - ctx.camera.position.y);
-        glm::vec4 color(1.0f, 1.0f, 0.0f, 1.0f);  // Yellow
+        glm::vec4 color(1.0f, 1.0f, 0.0f, 1.0f);
         DrawCrossMarker(ctx.renderer, pos, markerSize, color);
     }
 
@@ -723,7 +588,7 @@ void Editor::RenderStructureOverlays(const EditorContext& ctx)
     {
         glm::vec2 pos(m_TempRightAnchor.x - ctx.camera.position.x,
                       m_TempRightAnchor.y - ctx.camera.position.y);
-        glm::vec4 color(1.0f, 0.8f, 0.0f, 1.0f);  // Orange-yellow
+        glm::vec4 color(1.0f, 0.8f, 0.0f, 1.0f);
         DrawCrossMarker(ctx.renderer, pos, markerSize, color);
     }
 }
@@ -808,47 +673,40 @@ void Editor::RenderParticleZoneOverlays(const EditorContext& ctx)
 
     for (const auto& zone : *zones)
     {
-        // Calculate screen position
         glm::vec2 screenPos = zone.position - ctx.camera.position;
 
-        // Cull zones outside view
         if (screenPos.x + zone.size.x < 0 || screenPos.x > worldWidth ||
             screenPos.y + zone.size.y < 0 || screenPos.y > worldHeight)
             continue;
 
-        // Color based on particle type
         glm::vec4 color = GetParticleTypeColor(zone.type, 0.3f);
 
         if (!zone.enabled)
-            color.a *= 0.3f;  // Dimmer if disabled
+            color.a *= 0.3f;
 
         ctx.renderer.DrawColoredRect(screenPos, zone.size, color);
 
-        // Draw border for clarity
         float borderWidth = 2.0f;
         glm::vec4 borderColor = color;
         borderColor.a = 0.6f;
 
-        // Top border
         ctx.renderer.DrawColoredRect(screenPos, glm::vec2(zone.size.x, borderWidth), borderColor);
-        // Bottom border
+
         ctx.renderer.DrawColoredRect(
             glm::vec2(screenPos.x, screenPos.y + zone.size.y - borderWidth),
             glm::vec2(zone.size.x, borderWidth),
             borderColor);
-        // Left border
+
         ctx.renderer.DrawColoredRect(screenPos, glm::vec2(borderWidth, zone.size.y), borderColor);
-        // Right border
+
         ctx.renderer.DrawColoredRect(
             glm::vec2(screenPos.x + zone.size.x - borderWidth, screenPos.y),
             glm::vec2(borderWidth, zone.size.y),
             borderColor);
     }
 
-    // Draw preview of zone being placed
     if (m_PlacingParticleZone)
     {
-        // Get current mouse position in world coordinates
         double mouseX, mouseY;
         glfwGetCursorPos(ctx.window, &mouseX, &mouseY);
 
@@ -862,7 +720,6 @@ void Editor::RenderParticleZoneOverlays(const EditorContext& ctx)
         auto zr = CalculateParticleZoneRect(
             worldX, worldY, ctx.tilemap.GetTileWidth(), ctx.tilemap.GetTileHeight());
 
-        // Preview color based on type
         glm::vec4 previewColor = GetParticleTypeColor(m_CurrentParticleType, 0.5f);
 
         glm::vec2 previewPos(zr.x - ctx.camera.position.x, zr.y - ctx.camera.position.y);
@@ -877,14 +734,14 @@ void Editor::RenderNPCDebugInfo(const EditorContext& ctx)
 
     const float NPC_HITBOX_SIZE = CharacterConstants::HITBOX_HEIGHT;
 
-    ctx.npcs.each<const Transform, const Patrol, const NpcTag>(
-        [&](const Transform& xf, const Patrol& patrol)
+    ctx.npcs.view<const Transform, const Patrol, const NpcTag>().each(
+        [&](const Transform& transform, const Patrol& patrol)
         {
-            glm::vec2 npcAnchor = xf.position;
-
-            glm::vec2 npcHitboxPos(npcAnchor.x - NPC_HITBOX_SIZE * 0.5f - ctx.camera.position.x,
-                                   npcAnchor.y - NPC_HITBOX_SIZE - ctx.camera.position.y);
-            glm::vec2 npcHitboxSize(NPC_HITBOX_SIZE, NPC_HITBOX_SIZE);
+            const glm::vec2 npcAnchor = transform.position;
+            const glm::vec2 npcHitboxPos(
+                npcAnchor.x - NPC_HITBOX_SIZE * 0.5f - ctx.camera.position.x,
+                npcAnchor.y - NPC_HITBOX_SIZE - ctx.camera.position.y);
+            const glm::vec2 npcHitboxSize(NPC_HITBOX_SIZE, NPC_HITBOX_SIZE);
 
             if (npcHitboxPos.x + npcHitboxSize.x >= 0 && npcHitboxPos.x <= vr.screenSize.x &&
                 npcHitboxPos.y + npcHitboxSize.y >= 0 && npcHitboxPos.y <= vr.screenSize.y)
@@ -893,19 +750,18 @@ void Editor::RenderNPCDebugInfo(const EditorContext& ctx)
                     npcHitboxPos, npcHitboxSize, glm::vec4(1.0f, 0.0f, 1.0f, 0.3f));
             }
 
-            int targetX = patrol.targetTileX;
-            int targetY = patrol.targetTileY;
-
-            glm::vec2 targetPos(
+            const int targetX = patrol.targetTileX;
+            const int targetY = patrol.targetTileY;
+            const glm::vec2 targetPos(
                 targetX * vr.tileWidth - ctx.camera.position.x + vr.tileWidth * 0.5f,
                 targetY * vr.tileHeight - ctx.camera.position.y + vr.tileHeight * 0.5f);
 
             if (targetPos.x >= -vr.tileWidth && targetPos.x <= vr.screenSize.x + vr.tileWidth &&
                 targetPos.y >= -vr.tileHeight && targetPos.y <= vr.screenSize.y + vr.tileHeight)
             {
-                float dotSize = 6.0f;
-                ctx.renderer.DrawColoredRect(targetPos - glm::vec2(dotSize * 0.5f),
-                                             glm::vec2(dotSize),
+                constexpr float DOT_SIZE = 6.0f;
+                ctx.renderer.DrawColoredRect(targetPos - glm::vec2(DOT_SIZE * 0.5f),
+                                             glm::vec2(DOT_SIZE),
                                              glm::vec4(0.0f, 1.0f, 0.0f, 0.8f));
             }
         });
@@ -920,16 +776,14 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
     const float HITBOX_HALF = HITBOX_SIZE * 0.5f;  // 8 pixels from center
     const float TILE_SIZE = static_cast<float>(ctx.tilemap.GetTileWidth());
 
-    // Walking allows 20% overlap threshold on diagonal corners only
     const float CORNER_OVERLAP_THRESHOLD = 0.20f;
     const float HITBOX_AREA = HITBOX_SIZE * HITBOX_SIZE;                    // 256 sq pixels
     const float MAX_OVERLAP_AREA = HITBOX_AREA * CORNER_OVERLAP_THRESHOLD;  // 51.2 sq pixels
     float walkingCornerPenetration = std::sqrt(MAX_OVERLAP_AREA);           // ~7.155 pixels
 
-    // Running allows center-point collision penetration up to hitbox edge
+    // The overlay uses a center-point running tolerance; gameplay uses the full hitbox.
     float runningEdgePenetration = HITBOX_HALF;  // 8 pixels
 
-    // Render collision tolerance zones for all collision tiles
     for (int y = vr.startY; y < vr.endY; ++y)
     {
         for (int x = vr.startX; x < vr.endX; ++x)
@@ -940,7 +794,6 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
             glm::vec2 tilePos(x * vr.tileWidth - ctx.camera.position.x,
                               y * vr.tileHeight - ctx.camera.position.y);
 
-            // Check adjacency for this tile to determine valid exposed corners and edges
             bool freeLeft = (x > 0) && !ctx.tilemap.GetTileCollision(x - 1, y);
             bool freeRight =
                 (x < ctx.tilemap.GetMapWidth() - 1) && !ctx.tilemap.GetTileCollision(x + 1, y);
@@ -948,14 +801,13 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
             bool freeBottom =
                 (y < ctx.tilemap.GetMapHeight() - 1) && !ctx.tilemap.GetTileCollision(x, y + 1);
 
-            // Left Edge
             if (freeLeft)
             {
                 ctx.renderer.DrawColoredRect(glm::vec2(tilePos.x, tilePos.y),
                                              glm::vec2(runningEdgePenetration, TILE_SIZE),
                                              glm::vec4(1.0f, 0.6f, 0.2f, 0.5f));
             }
-            // Right Edge
+
             if (freeRight)
             {
                 ctx.renderer.DrawColoredRect(
@@ -963,14 +815,14 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
                     glm::vec2(runningEdgePenetration, TILE_SIZE),
                     glm::vec4(1.0f, 0.6f, 0.2f, 0.5f));
             }
-            // Top Edge
+
             if (freeTop)
             {
                 ctx.renderer.DrawColoredRect(glm::vec2(tilePos.x, tilePos.y),
                                              glm::vec2(TILE_SIZE, runningEdgePenetration),
                                              glm::vec4(1.0f, 0.6f, 0.2f, 0.5f));
             }
-            // Bottom Edge
+
             if (freeBottom)
             {
                 ctx.renderer.DrawColoredRect(
@@ -981,31 +833,30 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
 
             struct CornerInfo
             {
-                int dx, dy;                  // Diagonal direction to check
-                float x, y;                  // Screen position of overlap zone
-                bool isValid;                // Is this a valid exposed corner?
-                Tilemap::Corner cornerEnum;  // Which corner this is
+                int dx, dy;
+                float x, y;
+                bool isValid;
+                Tilemap::Corner cornerEnum;
             };
 
-            // Check which corners have cutting blocked
             bool tlBlocked = ctx.tilemap.IsCornerCutBlocked(x, y, Tilemap::CORNER_TL);
             bool trBlocked = ctx.tilemap.IsCornerCutBlocked(x, y, Tilemap::CORNER_TR);
             bool blBlocked = ctx.tilemap.IsCornerCutBlocked(x, y, Tilemap::CORNER_BL);
             bool brBlocked = ctx.tilemap.IsCornerCutBlocked(x, y, Tilemap::CORNER_BR);
 
             CornerInfo corners[4] = {
-                // Top-Left: Valid if Left & Top are free
+
                 {-1, -1, tilePos.x, tilePos.y, freeLeft && freeTop, Tilemap::CORNER_TL},
-                // Top-Right: Valid if Right & Top are free
+
                 {1, -1, tilePos.x + TILE_SIZE, tilePos.y, freeRight && freeTop, Tilemap::CORNER_TR},
-                // Bottom-Left: Valid if Left & Bottom are free
+
                 {-1,
                  1,
                  tilePos.x,
                  tilePos.y + TILE_SIZE,
                  freeLeft && freeBottom,
                  Tilemap::CORNER_BL},
-                // Bottom-Right: Valid if Right & Bottom are free
+
                 {1,
                  1,
                  tilePos.x + TILE_SIZE,
@@ -1019,18 +870,15 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
             {
                 const auto& corner = corners[i];
 
-                // Straight walls and internal corners have strictly no penetration
                 if (!corner.isValid)
                     continue;
 
                 int nx = x + corner.dx;
                 int ny = y + corner.dy;
 
-                // Only render if diagonal neighbor is walkable otherwise no escape path
                 if (nx >= 0 && ny >= 0 && nx < ctx.tilemap.GetMapWidth() &&
                     ny < ctx.tilemap.GetMapHeight() && !ctx.tilemap.GetTileCollision(nx, ny))
                 {
-                    // Calculate positions based on corner direction
                     float walkX =
                         (corner.dx == -1) ? corner.x : corner.x - walkingCornerPenetration;
                     float walkY =
@@ -1038,7 +886,6 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
 
                     if (cornerBlocked[i])
                     {
-                        // Draw red indicator for blocked corner cutting
                         ctx.renderer.DrawColoredRect(
                             glm::vec2(walkX, walkY),
                             glm::vec2(walkingCornerPenetration, walkingCornerPenetration),
@@ -1046,7 +893,6 @@ void Editor::RenderCornerCuttingOverlays(const EditorContext& ctx)
                     }
                     else
                     {
-                        // Draw green walking corner penetration zone (normal)
                         ctx.renderer.DrawColoredRect(
                             glm::vec2(walkX, walkY),
                             glm::vec2(walkingCornerPenetration, walkingCornerPenetration),
@@ -1079,7 +925,7 @@ void Editor::RenderLayerOverlay(const EditorContext& ctx, int layerIndex, const 
 // rescales window pixels into the picker's ortho units - that is what the unlabelled
 // (x / screenWidth) * worldWidth expressions are doing.
 //
-//   window px  --(- offset, / tileSizePixels, floor)-->  picker cell (col, row)
+//   Window px  --(- offset, / tileSizePixels, floor)-->  picker cell (col, row)
 //   picker cell  --(row * tilesPerRow + col)-->          tileID
 //   window px  --(* worldWidth / screenWidth)-->         picker ortho units (draw space)
 //
@@ -1092,7 +938,6 @@ void Editor::RenderLayerOverlay(const EditorContext& ctx, int layerIndex, const 
 // RenderEditorHUD, so a change to tileSizePixels here has to be made in all four places.
 void Editor::RenderEditorUI(const EditorContext& ctx)
 {
-    // Set tile picker projection and use base world dimensions without camera zoom
     float tilePickerWorldWidth =
         static_cast<float>(ctx.tilesVisibleWidth * ctx.tilemap.GetTileWidth());
     float tilePickerWorldHeight =
@@ -1123,12 +968,10 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
     float worldPickerWidth = (tilePickerWidth / ctx.screenWidth) * worldWidth;
     float worldPickerHeight = (tilePickerHeight / ctx.screenHeight) * worldHeight;
 
-    // Background
     ctx.renderer.DrawColoredRect(glm::vec2(0.0f, 0.0f),
                                  glm::vec2(worldPickerWidth, worldPickerHeight),
                                  glm::vec4(1.0f, 0.0f, 0.0f, 1.0f));
 
-    // Render only visible tiles, cull off-screen tiles
     int startCol =
         std::max(0, static_cast<int>(std::floor((-m_TilePicker.offsetX) / tileSizePixels)));
     int endCol = std::min(
@@ -1167,7 +1010,6 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
             glm::vec3 color =
                 (tileID == m_SelectedTileID) ? glm::vec3(1.5f, 1.5f, 1.0f) : glm::vec3(1.0f);
 
-            // Query renderer at runtime for Y-flip (OpenGL=true, Vulkan=false)
             bool flipY = ctx.renderer.RequiresYFlip();
 
             ctx.renderer.DrawSpriteRegion(ctx.tilemap.GetTilesetTexture(),
@@ -1181,7 +1023,6 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
         }
     }
 
-    // Selection rectangle
     if (m_MultiTile.isSelecting && m_MultiTile.selectionStartTileID >= 0)
     {
         int startTileID = m_MultiTile.selectionStartTileID;
@@ -1208,28 +1049,26 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
         float worldSelHeight = (selHeight / ctx.screenHeight) * worldHeight;
 
         float outlineThickness = 2.0f;
-        // TODO: consider drawing selection overlay in screen space to avoid scaling thickness with
-        // DPI/zoom. Top
+        // TODO: Draw selection borders in screen space to keep their width constant across zoom.
         ctx.renderer.DrawColoredRect(glm::vec2(worldSelX, worldSelY),
                                      glm::vec2(worldSelWidth, outlineThickness),
                                      glm::vec4(0.0f, 1.0f, 1.0f, 1.0f));
-        // Bottom
+
         ctx.renderer.DrawColoredRect(
             glm::vec2(worldSelX, worldSelY + worldSelHeight - outlineThickness),
             glm::vec2(worldSelWidth, outlineThickness),
             glm::vec4(0.0f, 1.0f, 1.0f, 1.0f));
-        // Left
+
         ctx.renderer.DrawColoredRect(glm::vec2(worldSelX, worldSelY),
                                      glm::vec2(outlineThickness, worldSelHeight),
                                      glm::vec4(0.0f, 1.0f, 1.0f, 1.0f));
-        // Right
+
         ctx.renderer.DrawColoredRect(
             glm::vec2(worldSelX + worldSelWidth - outlineThickness, worldSelY),
             glm::vec2(outlineThickness, worldSelHeight),
             glm::vec4(0.0f, 1.0f, 1.0f, 1.0f));
     }
 
-    // Draw animation frame highlights in animation edit mode
     if ((m_EditMode == EditMode::Animation) && !m_AnimationFrames.empty())
     {
         for (size_t i = 0; i < m_AnimationFrames.size(); ++i)
@@ -1245,7 +1084,6 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
             float worldFrameY = (frameScreenY / ctx.screenHeight) * worldHeight;
             float worldTileSize = (tileSizePixels / ctx.screenWidth) * worldWidth;
 
-            // Draw numbered highlight
             float outlineThickness = 2.0f;
             glm::vec4 highlightColor(0.0f, 1.0f, 0.0f, 1.0f);
             ctx.renderer.DrawColoredRect(glm::vec2(worldFrameX, worldFrameY),
@@ -1263,7 +1101,6 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
                 glm::vec2(outlineThickness, worldTileSize),
                 highlightColor);
 
-            // Draw frame number
             std::string frameNum = std::to_string(i + 1);
             ctx.renderer.DrawText(frameNum,
                                   glm::vec2(worldFrameX + 2.0f, worldFrameY + 2.0f),
@@ -1272,7 +1109,6 @@ void Editor::RenderEditorUI(const EditorContext& ctx)
         }
     }
 
-    // Draw animation mode status
     if (m_EditMode == EditMode::Animation)
     {
         std::string animStatus;
@@ -1685,7 +1521,6 @@ void Editor::RenderEditorTopBar(const EditorContext& ctx)
 
 void Editor::RenderMapSelectionOverlay(const EditorContext& ctx)
 {
-    // Translucent yellow for an active selection rectangle.
     if (m_MapSelection.active)
     {
         int tw = ctx.tilemap.GetTileWidth();
@@ -1736,7 +1571,6 @@ void Editor::RenderMapSelectionOverlay(const EditorContext& ctx)
 
 void Editor::RenderPlacementPreview(const EditorContext& ctx)
 {
-    // Draw animation mode status when not in tile picker
     if ((m_EditMode == EditMode::Animation) && !m_ShowTilePicker && m_SelectedAnimationId >= 0)
     {
         std::string animStatus = "Animation tile: Click map to apply #" +
@@ -1746,7 +1580,6 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
             animStatus, glm::vec2(20.0f, 20.0f), 0.4f, glm::vec3(0.0f, 1.0f, 0.0f));
     }
 
-    // Show the preview only when a selection exists and the tile picker is closed.
     if (m_ShowTilePicker)
         return;
     if (m_MultiTile.selectedStartID < 0)
@@ -1755,7 +1588,6 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
     double mouseX, mouseY;
     glfwGetCursorPos(ctx.window, &mouseX, &mouseY);
 
-    // Convert screen coordinates to world coordinates
     float baseWorldWidth = static_cast<float>(ctx.tilesVisibleWidth * ctx.tilemap.GetTileWidth());
     float baseWorldHeight =
         static_cast<float>(ctx.tilesVisibleHeight * ctx.tilemap.GetTileHeight());
@@ -1763,14 +1595,12 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
     float worldWidth = baseWorldWidth / zoom;
     float worldHeight = baseWorldHeight / zoom;
 
-    // Convert mouse position to world coordinates
     float worldX = (static_cast<float>(mouseX) / static_cast<float>(ctx.screenWidth)) * worldWidth +
                    ctx.camera.position.x;
     float worldY =
         (static_cast<float>(mouseY) / static_cast<float>(ctx.screenHeight)) * worldHeight +
         ctx.camera.position.y;
 
-    // Convert world coordinates to tile coordinates
     if (ctx.tilemap.GetTileWidth() == 0 || ctx.tilemap.GetTileHeight() == 0)
         return;
 
@@ -1791,7 +1621,6 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
                                 : m_MultiTile.height;
         float tileRotation = GetCompensatedTileRotation();
 
-        // Render preview of multi-tile selection with rotation
         for (int dy = 0; dy < rotatedHeight; ++dy)
         {
             for (int dx = 0; dx < rotatedWidth; ++dx)
@@ -1804,11 +1633,9 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
                 int sourceTileID =
                     m_MultiTile.selectedStartID + sourceDy * dataTilesPerRow + sourceDx;
 
-                // Calculate tile position in camera-relative coordinates
                 glm::vec2 tilePos((previewX * tileWidth) - ctx.camera.position.x,
                                   (previewY * tileHeight) - ctx.camera.position.y);
 
-                // Render semi-transparent preview
                 int tilesetX = (sourceTileID % dataTilesPerRow) * tileWidth;
                 int tilesetY = (sourceTileID / dataTilesPerRow) * tileHeight;
 
@@ -1829,27 +1656,25 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
                     m_MultiTile.flipX,
                     m_MultiTile.flipY);
 
-                // Render outline
                 ctx.renderer.DrawColoredRect(tilePos,
                                              glm::vec2(static_cast<float>(tileWidth), 1.0f),
-                                             glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Top
+                                             glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
                 ctx.renderer.DrawColoredRect(
                     glm::vec2(tilePos.x, tilePos.y + static_cast<float>(tileHeight) - 1.0f),
                     glm::vec2(static_cast<float>(tileWidth), 1.0f),
-                    glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Bottom
+                    glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
                 ctx.renderer.DrawColoredRect(tilePos,
                                              glm::vec2(1.0f, static_cast<float>(tileHeight)),
-                                             glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Left
+                                             glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
                 ctx.renderer.DrawColoredRect(
                     glm::vec2(tilePos.x + static_cast<float>(tileWidth) - 1.0f, tilePos.y),
                     glm::vec2(1.0f, static_cast<float>(tileHeight)),
-                    glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Right
+                    glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
             }
         }
     }
     else
     {
-        // Render preview of single tile
         if (tileX >= 0 && tileX < ctx.tilemap.GetMapWidth() && tileY >= 0 &&
             tileY < ctx.tilemap.GetMapHeight())
         {
@@ -1862,7 +1687,6 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
             glm::vec2 texCoord(static_cast<float>(tilesetX), static_cast<float>(tilesetY));
             glm::vec2 texSize(ctx.tilemap.GetTileWidth(), ctx.tilemap.GetTileHeight());
 
-            // Query renderer at runtime for Y-flip (OpenGL=true, Vulkan=false)
             bool flipY = ctx.renderer.RequiresYFlip();
 
             float tileRotation = GetCompensatedTileRotation();
@@ -1879,21 +1703,20 @@ void Editor::RenderPlacementPreview(const EditorContext& ctx)
                 m_MultiTile.flipX,
                 m_MultiTile.flipY);
 
-            // Render outline
             ctx.renderer.DrawColoredRect(tilePos,
                                          glm::vec2(static_cast<float>(tileWidth), 1.0f),
-                                         glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Top
+                                         glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
             ctx.renderer.DrawColoredRect(
                 glm::vec2(tilePos.x, tilePos.y + static_cast<float>(tileHeight) - 1.0f),
                 glm::vec2(static_cast<float>(tileWidth), 1.0f),
-                glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Bottom
+                glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
             ctx.renderer.DrawColoredRect(tilePos,
                                          glm::vec2(1.0f, static_cast<float>(tileHeight)),
-                                         glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Left
+                                         glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
             ctx.renderer.DrawColoredRect(
                 glm::vec2(tilePos.x + static_cast<float>(tileWidth) - 1.0f, tilePos.y),
                 glm::vec2(1.0f, static_cast<float>(tileHeight)),
-                glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));  // Right
+                glm::vec4(1.0f, 1.0f, 0.0f, 0.8f));
         }
     }
 }
