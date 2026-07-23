@@ -9,37 +9,33 @@
 
 /**
  * @class MockRenderer
- * @brief Context-free IRenderer used by tests that must not touch the GPU.
+ * @brief records selected draw calls without a graphics context.
  * @author Alex (https://github.com/lextpf)
  * @ingroup Rendering
  *
- * The test binary links GL and Vulkan but never creates a context, so any test
- * that reaches a render path needs a renderer that only accepts calls. Every
- * override here discards its arguments except two:
- * - DrawQuad3D appends a @ref Quad3D record to `quads3D`.
- * - SetViewProjection overwrites `viewProjection`.
+ * records quads, alpha/atlas sprites, and colored rectangles. DrawSprite and
+ * DrawSpriteRegion discard calls. merge sprites2D and rects by sequence to recover
+ * their shared submission order. viewProjection and ambient retain their last values.
  *
- * The remaining observable results are fixed, not recorded: RequiresYFlip is
- * always true, GetDrawCallCount is always 0, and GetBackendInfo returns a
- * default-constructed RendererInfo. Asserting on those three proves nothing.
+ * RequiresYFlip, GetDrawCallCount, and GetBackendInfo return fixed placeholders.
  */
 class MockRenderer : public IRenderer
 {
 public:
     RIFT_DECLARE_COMMON_RENDERER_METHODS;
 
-    void SetFontCandidates(const std::vector<std::string>& /*fontCandidates*/) override {}
+    void SetFontCandidates(const std::vector<std::string>&) override {}
     bool RequiresYFlip() const override { return true; }
-    void SetAmbientColor(const glm::vec3& /*color*/) override {}
+    void SetAmbientColor(const glm::vec3& color) override { ambient = color; }
     int GetDrawCallCount() const override { return 0; }
 
-    /**
-     * @brief One recorded @ref IRenderer::DrawQuad3D submission.
-     *
-     * World geometry is built entirely on the CPU as scene-space corners, so
-     * recording the submissions is what makes tile placement, billboard
-     * orientation and pass assignment testable without a graphics context.
-     */
+    /// exposes the protected flat rotation for geometry comparisons.
+    static void FlatRotate(glm::vec2 corners[4], glm::vec2 size, float rotation)
+    {
+        RotateCorners(corners, size, rotation);
+    }
+
+    /// scene-space corners and state from one DrawQuad3D call.
     struct Quad3D
     {
         std::array<glm::vec3, 4> corners{};
@@ -48,18 +44,51 @@ public:
         glm::vec4 color{1.0f};
         renderModes::BlendMode blend = renderModes::BlendMode::Alpha;
         renderModes::DepthMode depth = renderModes::DepthMode::TestAndWrite;
+        bool flipY = true;
+        renderModes::LightMode light = renderModes::LightMode::Ambient;
     };
 
-    std::vector<Quad3D> quads3D;     ///< Every DrawQuad3D call, in submission order.
-    glm::mat4 viewProjection{1.0f};  ///< Last matrix given to SetViewProjection.
+    /// one DrawColoredRect call.
+    struct Rect
+    {
+        glm::vec2 position{0.0f};
+        glm::vec2 size{0.0f};
+        glm::vec4 color{1.0f};
+        bool additive = false;
+        std::size_t sequence = 0;
+    };
 
-    /**
-     * @brief Drop the recorded DrawQuad3D submissions (call between assertions).
-     *
-     * `viewProjection` is deliberately left at its last value, so a test that
-     * needs a fresh matrix must set one itself.
-     */
-    void ClearRecorded() { quads3D.clear(); }
+    /// one DrawSpriteAlpha or DrawSpriteAtlas call; alpha calls use the full UV region.
+    struct Sprite2D
+    {
+        glm::vec2 position{0.0f};  ///< top-left, in the caller's projection units.
+        glm::vec2 size{0.0f};
+        glm::vec2 uvMin{0.0f};
+        glm::vec2 uvMax{1.0f};
+        float rotation = 0.0f;  ///< degrees about the quad center.
+        glm::vec4 color{1.0f};
+        bool additive = false;
+        bool fromAtlas = false;
+        std::size_t sequence = 0;
+    };
+
+    std::vector<Quad3D> quads3D;
+    std::vector<Rect> rects;
+    std::vector<Sprite2D> sprites2D;
+    glm::mat4 viewProjection{1.0f};
+    glm::vec3 ambient{1.0f};
+
+    /// clears submissions and sequence numbers; retains viewProjection and ambient.
+    void ClearRecorded()
+    {
+        quads3D.clear();
+        rects.clear();
+        sprites2D.clear();
+        m_Sequence = 0;
+    }
+
+private:
+    std::size_t m_Sequence = 0;
 };
 
 inline bool MockRenderer::Init()
@@ -70,66 +99,82 @@ inline void MockRenderer::Shutdown() {}
 inline void MockRenderer::BeginFrame() {}
 inline void MockRenderer::EndFrame() {}
 inline void MockRenderer::BeginScene() {}
-inline void MockRenderer::EndSceneApplyPostFX(const PostFXParams& /*params*/) {}
+inline void MockRenderer::EndSceneApplyPostFX(const PostFXParams&) {}
 
-inline void MockRenderer::DrawSprite(const Texture& /*texture*/,
-                                     glm::vec2 /*position*/,
-                                     glm::vec2 /*size*/,
-                                     float /*rotation*/,
-                                     glm::vec3 /*color*/)
+inline void MockRenderer::DrawSprite(const Texture&, glm::vec2, glm::vec2, float, glm::vec3) {}
+
+inline void MockRenderer::DrawSpriteRegion(
+    const Texture&, glm::vec2, glm::vec2, glm::vec2, glm::vec2, float, glm::vec3, bool, bool, bool)
 {
 }
 
-inline void MockRenderer::DrawSpriteRegion(const Texture& /*texture*/,
-                                           glm::vec2 /*position*/,
-                                           glm::vec2 /*size*/,
-                                           glm::vec2 /*texCoord*/,
-                                           glm::vec2 /*texSize*/,
-                                           float /*rotation*/,
-                                           glm::vec3 /*color*/,
-                                           bool /*flipY*/,
-                                           bool /*tileFlipX*/,
-                                           bool /*tileFlipY*/)
+inline void MockRenderer::DrawSpriteAlpha(const Texture&,
+                                          glm::vec2 position,
+                                          glm::vec2 size,
+                                          float rotation,
+                                          glm::vec4 color,
+                                          bool additive)
 {
+    Sprite2D record;
+    record.position = position;
+    record.size = size;
+    record.uvMin = glm::vec2(0.0f);
+    record.uvMax = glm::vec2(1.0f);
+    record.rotation = rotation;
+    record.color = color;
+    record.additive = additive;
+    record.fromAtlas = false;
+    record.sequence = m_Sequence++;
+    sprites2D.push_back(record);
 }
 
-inline void MockRenderer::DrawSpriteAlpha(const Texture& /*texture*/,
-                                          glm::vec2 /*position*/,
-                                          glm::vec2 /*size*/,
-                                          float /*rotation*/,
-                                          glm::vec4 /*color*/,
-                                          bool /*additive*/)
+inline void MockRenderer::DrawSpriteAtlas(const Texture&,
+                                          glm::vec2 position,
+                                          glm::vec2 size,
+                                          glm::vec2 uvMin,
+                                          glm::vec2 uvMax,
+                                          float rotation,
+                                          glm::vec4 color,
+                                          bool additive)
 {
+    Sprite2D record;
+    record.position = position;
+    record.size = size;
+    record.uvMin = uvMin;
+    record.uvMax = uvMax;
+    record.rotation = rotation;
+    record.color = color;
+    record.additive = additive;
+    record.fromAtlas = true;
+    record.sequence = m_Sequence++;
+    sprites2D.push_back(record);
 }
 
-inline void MockRenderer::DrawSpriteAtlas(const Texture& /*texture*/,
-                                          glm::vec2 /*position*/,
-                                          glm::vec2 /*size*/,
-                                          glm::vec2 /*uvMin*/,
-                                          glm::vec2 /*uvMax*/,
-                                          float /*rotation*/,
-                                          glm::vec4 /*color*/,
-                                          bool /*additive*/)
+inline void MockRenderer::DrawColoredRect(glm::vec2 position,
+                                          glm::vec2 size,
+                                          glm::vec4 color,
+                                          bool additive)
 {
+    Rect record;
+    record.position = position;
+    record.size = size;
+    record.color = color;
+    record.additive = additive;
+    record.sequence = m_Sequence++;
+    rects.push_back(record);
 }
 
-inline void MockRenderer::DrawColoredRect(glm::vec2 /*position*/,
-                                          glm::vec2 /*size*/,
-                                          glm::vec4 /*color*/,
-                                          bool /*additive*/)
-{
-}
-
-inline void MockRenderer::DrawQuad3D(const Texture& /*texture*/,
+inline void MockRenderer::DrawQuad3D(const Texture&,
                                      const glm::vec3 corners[4],
                                      glm::vec2 texCoord,
                                      glm::vec2 texSize,
                                      glm::vec4 color,
                                      renderModes::BlendMode blend,
                                      renderModes::DepthMode depth,
-                                     bool /*flipY*/,
-                                     bool /*tileFlipX*/,
-                                     bool /*tileFlipY*/)
+                                     bool flipY,
+                                     bool,
+                                     bool,
+                                     renderModes::LightMode light)
 {
     Quad3D record;
     record.corners = {corners[0], corners[1], corners[2], corners[3]};
@@ -138,6 +183,8 @@ inline void MockRenderer::DrawQuad3D(const Texture& /*texture*/,
     record.color = color;
     record.blend = blend;
     record.depth = depth;
+    record.flipY = flipY;
+    record.light = light;
     quads3D.push_back(record);
 }
 
@@ -146,26 +193,19 @@ inline void MockRenderer::SetViewProjection(const glm::mat4& matrix)
     viewProjection = matrix;
 }
 
-inline void MockRenderer::SetProjection(const glm::mat4& /*projection*/) {}
-inline void MockRenderer::SetViewport(int /*x*/, int /*y*/, int /*width*/, int /*height*/) {}
-inline void MockRenderer::Clear(float /*r*/, float /*g*/, float /*b*/, float /*a*/) {}
-inline void MockRenderer::UploadTexture(const Texture& /*texture*/) {}
+inline void MockRenderer::SetProjection(const glm::mat4&) {}
+inline void MockRenderer::SetViewport(int, int, int, int) {}
+inline void MockRenderer::Clear(float, float, float, float) {}
+inline void MockRenderer::UploadTexture(const Texture&) {}
 
-inline void MockRenderer::DrawText(const std::string& /*text*/,
-                                   glm::vec2 /*position*/,
-                                   float /*scale*/,
-                                   glm::vec3 /*color*/,
-                                   float /*outlineSize*/,
-                                   float /*alpha*/)
-{
-}
+inline void MockRenderer::DrawText(const std::string&, glm::vec2, float, glm::vec3, float, float) {}
 
-inline float MockRenderer::GetTextAscent(float /*scale*/) const
+inline float MockRenderer::GetTextAscent(float) const
 {
     return 0.0f;
 }
 
-inline float MockRenderer::GetTextWidth(const std::string& /*text*/, float /*scale*/) const
+inline float MockRenderer::GetTextWidth(const std::string&, float) const
 {
     return 0.0f;
 }
