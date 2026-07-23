@@ -11,7 +11,6 @@
 #include "Identity.hpp"
 #include "KeyToggle.hpp"
 #include "Logger.hpp"
-#include "NpcTag.hpp"
 #include "PlayerModes.hpp"
 #include "PlayerMovementSystem.hpp"
 #include "PlayerSystem.hpp"
@@ -31,35 +30,31 @@ constexpr const char* LOG_SUBSYSTEM = "Game";
 
 // NPC interaction range in world pixels (2 tiles at 16px).
 constexpr float INTERACTION_RANGE = 32.0f;
-// Below this center-to-center distance the NPC counts as "very close", which
-// relaxes the facing test to DIRECTION_LENIENCY instead of exact tile alignment.
+// below this world-pixel distance, allow DIRECTION_LENIENCY in the facing test.
 constexpr float COLLISION_DISTANCE = 20.0f;
-// Pixels of directional slack allowed by that relaxed facing test.
+// pixels of directional slack allowed by that relaxed facing test.
 constexpr float DIRECTION_LENIENCY = 8.0f;
 }  // namespace
 
 void Game::ProcessInput(float deltaTime)
 {
-    // Console toggle is checked unconditionally so F12 both opens and closes
-    // it. When open, the console consumes all subsequent input.
+    // check F12 before input capture so it also closes the console.
     if (m_KeyConsole.JustPressed(m_Window))
     {
         m_Console.Toggle();
     }
     if (m_Console.IsOpen())
     {
-        // Input capture skips ProcessPlayerMovement below. Explicitly clear the
-        // latched motor and animation state; otherwise Update() keeps advancing
-        // the walk cycle from the last non-zero velocity while position is frozen.
+        // Clear motor state during input capture so frozen movement does not keep animating.
         if (m_GameMode == GameMode::Playing)
         {
             PlayerSystem::Stop(m_World, m_PlayerEntity);
         }
         PumpConsoleKeys();
-        return;  // Suppress player movement, editor toggles, F-keys, etc.
+        return;
     }
 
-    // Title and Pause have their own input handlers and consume all non-console input.
+    // Title and pause consume all remaining input before editor and movement handling.
     if (m_GameMode == GameMode::Title)
     {
         ProcessTitleInput();
@@ -71,9 +66,7 @@ void Game::ProcessInput(float deltaTime)
         return;
     }
 
-    // Esc enters Pause from Playing, but yields to dialogue's own Esc handler
-    // so a single press can't both close the dialogue and pause the game.
-    // Always call JustPressed to keep the toggle's edge state advancing.
+    // always advance the esc latch; dialogue consumes its press before pause handling.
     {
         bool inAnyDialogue =
             m_DialogueUi.inDialogue || m_DialogueManager.IsActive() || m_DialogueUi.snap.active;
@@ -83,8 +76,7 @@ void Game::ProcessInput(float deltaTime)
             m_GameMode = GameMode::Paused;
             m_PauseMenu.enabled.assign(2, true);
             m_PauseMenu.selected = 0;
-            // Reset menu-mouse state so the first pause frame ignores a stale
-            // cursor parked over a menu item, and a held click doesn't fire confirm.
+            // ignore stale hover and held clicks on the first pause frame.
             m_MenuLastMouseX = -1.0;
             m_MenuLastMouseY = -1.0;
             m_MenuMouseLeftPrev = true;
@@ -92,11 +84,7 @@ void Game::ProcessInput(float deltaTime)
         }
     }
 
-    // Mouse-drag camera orbit. Gameplay only, and only on the 3D path: nothing
-    // else in gameplay uses the left button (the editor's own bindings land when
-    // its overlays move off the flat pipeline), and the flat renderer would
-    // ignore the angles anyway, leaving movement rotated against a view that
-    // never turned.
+    // orbit only in 3D gameplay; flat rendering does not use these angles.
     if (m_World3DEnabled && !m_Editor.IsActive())
     {
         const bool orbiting = (glfwGetMouseButton(m_Window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
@@ -120,11 +108,11 @@ void Game::ProcessInput(float deltaTime)
                                                    glm::vec2(static_cast<float>(m_ScreenWidth),
                                                              static_cast<float>(m_ScreenHeight)));
 
-                // ApplyOrbitDrag already wrapped and clamped, so assign directly
-                // rather than going through SetCameraYaw/SetCameraPitch.
+                // The drag helper already wraps yaw and clamps pitch; assign both without changing
+                // preset semantics.
                 m_CameraYaw = angles.yawRadians;
                 m_CameraPitch = angles.pitchRadians;
-                // Classic and DS pin their angles; dragging means a free orbit.
+                // dragging selects Free because fixed presets override angles.
                 m_CameraPreset = cameraRig::Preset::Free;
             }
             m_CameraDragActive = true;
@@ -138,11 +126,9 @@ void Game::ProcessInput(float deltaTime)
 
     glm::vec2 moveDirection(0.0f);
 
-    // Shift runs (1.75x base speed; see CharacterConstants::RUN_SPEED_MULTIPLIER).
     bool isRunning = (glfwGetKey(m_Window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
                       glfwGetKey(m_Window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
 
-    // Drop any copied NPC appearance when starting to run.
     if (isRunning && m_World.get<Appearance>(m_PlayerEntity).usingCopiedAppearance)
     {
         PlayerSystem::RestoreOriginalAppearance(m_World, m_PlayerEntity);
@@ -151,22 +137,22 @@ void Game::ProcessInput(float deltaTime)
 
     m_World.get<PlayerModes>(m_PlayerEntity).isRunning = isRunning;
 
-    // WASD 8-directional. Y increases downward (top-left origin), so W = -Y, S = +Y.
+    // WASD follows world axes; positive Y points down.
     if (glfwGetKey(m_Window, GLFW_KEY_W) == GLFW_PRESS)
     {
-        moveDirection.y -= 1.0f;  // Up
+        moveDirection.y -= 1.0f;
     }
     if (glfwGetKey(m_Window, GLFW_KEY_A) == GLFW_PRESS)
     {
-        moveDirection.x -= 1.0f;  // Left
+        moveDirection.x -= 1.0f;
     }
     if (glfwGetKey(m_Window, GLFW_KEY_S) == GLFW_PRESS)
     {
-        moveDirection.y += 1.0f;  // Down
+        moveDirection.y += 1.0f;
     }
     if (glfwGetKey(m_Window, GLFW_KEY_D) == GLFW_PRESS)
     {
-        moveDirection.x += 1.0f;  // Right
+        moveDirection.x += 1.0f;
     }
 
     if (m_Editor.IsActive())
@@ -174,8 +160,7 @@ void Game::ProcessInput(float deltaTime)
         m_Editor.ProcessInput(deltaTime, MakeEditorContext());
     }
 
-    // Z resets camera zoom to 1.0x and recenters on player; in editor mode
-    // also resets tile picker zoom/pan.
+    // Reset view zoom and recenter on the player; editor mode also resets tile-picker navigation.
     if (m_KeyZ.JustPressed(m_Window))
     {
         if (!m_Editor.IsActive())
@@ -211,8 +196,8 @@ void Game::ProcessInput(float deltaTime)
         }
     }
 
-    // Space toggles free camera (camera stops following player; WASD/Arrows
-    // pan the camera while player still moves with WASD).
+    // free camera stops following the player; movement input can still move the player while
+    // panning.
     if (!m_DialogueUi.inDialogue && !m_DialogueManager.IsActive() && !m_DialogueUi.snap.active &&
         !m_Editor.IsActive())
     {
@@ -224,16 +209,12 @@ void Game::ProcessInput(float deltaTime)
         }
     }
 
-    // B toggles bicycle mode (2.25x base speed; see CharacterConstants::BICYCLE_SPEED_MULTIPLIER)
-    // and swaps to the bicycle sprite sheet. It does not change collision: the feet
-    // hitbox is identical in every movement mode, and CollisionSystem never reads
-    // `isBicycling`.
+    // bicycle changes speed and sheets but retains the same collision hitbox.
     if (!m_Editor.IsActive() && m_KeyB.JustPressed(m_Window))
     {
         bool currentBicycling = m_World.get<PlayerModes>(m_PlayerEntity).isBicycling;
         bool newBicycling = !currentBicycling;
 
-        // Drop any copied NPC appearance when starting to bicycle.
         if (newBicycling && m_World.get<Appearance>(m_PlayerEntity).usingCopiedAppearance)
         {
             PlayerSystem::RestoreOriginalAppearance(m_World, m_PlayerEntity);
@@ -244,8 +225,7 @@ void Game::ProcessInput(float deltaTime)
         Logger::InfoF(LOG_SUBSYSTEM, "Bicycle: {}", newBicycling ? "ON" : "OFF");
     }
 
-    // Debug mode: X toggles corner cutting on the collision tile under the
-    // cursor (the corner nearest the cursor within the tile).
+    // toggle the collision corner nearest the cursor within the hovered tile.
     if (m_Editor.IsDebugMode() && m_KeyX.JustPressed(m_Window))
     {
         double mouseX, mouseY;
@@ -274,7 +254,6 @@ void Game::ProcessInput(float deltaTime)
         {
             if (m_Tilemap.GetTileCollision(tileX, tileY))
             {
-                // Pick the corner nearest the cursor inside this tile.
                 float localX = worldX - (tileX * tileWidth);
                 float localY = worldY - (tileY * tileHeight);
                 float halfTile = tileWidth * 0.5f;
@@ -336,7 +315,6 @@ void Game::ProcessInput(float deltaTime)
         int playerTileY =
             TileMath::StandingTileRow(playerPos.y, static_cast<float>(TILE_PIXEL_SIZE));
 
-        // Tile directly in front of the player.
         int frontTileX = playerTileX;
         int frontTileY = playerTileY;
 
@@ -356,258 +334,235 @@ void Game::ProcessInput(float deltaTime)
                 break;
         }
 
-        // First NPC in range + roughly in front triggers the dialogue snap. each<>
-        // can't break, so a flag short-circuits the rest once one is chosen
-        // (iteration follows registry dense order, the same order EntityStore::Entities gives).
-        bool dialogueStarted = false;
-        m_World.each<const Transform, const Elevation, const NpcTag>(
-            [&](ecs::entity npcE, const Transform& npcTransform, const Elevation& npcElevation)
+        // Choose the first eligible NPC in stable instance-id order.
+        for (const entt::entity npcE : EntityStore::Entities(m_World))
+        {
+            const Transform& npcTransform = m_World.get<Transform>(npcE);
+            const Elevation& npcElevation = m_World.get<Elevation>(npcE);
+            if (npcElevation.surface != playerSurface)
             {
-                if (dialogueStarted || npcElevation.surface != playerSurface)
-                    return;
-                glm::vec2 npcPos = npcTransform.position;
-                float distance = glm::length(npcPos - playerPos);
+                continue;
+            }
+            glm::vec2 npcPos = npcTransform.position;
+            float distance = glm::length(npcPos - playerPos);
 
-                if (distance <= INTERACTION_RANGE)
+            if (distance <= INTERACTION_RANGE)
+            {
+                int npcTileX = TileMath::TileIndex(npcPos.x, static_cast<float>(TILE_PIXEL_SIZE));
+                int npcTileY =
+                    TileMath::StandingTileRow(npcPos.y, static_cast<float>(TILE_PIXEL_SIZE));
+
+                bool isColliding =
+                    CollisionGeometry::FeetBoxesOverlap(playerPos,
+                                                        npcPos,
+                                                        CharacterConstants::HALF_HITBOX_WIDTH,
+                                                        CharacterConstants::HITBOX_HEIGHT,
+                                                        CharacterConstants::COLLISION_EPS);
+
+                bool isOnFrontTile = (npcTileX == frontTileX && npcTileY == frontTileY);
+
+                int tileDistX = std::abs(playerTileX - npcTileX);
+                int tileDistY = std::abs(playerTileY - npcTileY);
+                bool isCardinalAdjacent =
+                    (tileDistX == 1 && tileDistY == 0) || (tileDistX == 0 && tileDistY == 1);
+                bool isSameTile = (tileDistX == 0 && tileDistY == 0);
+
+                // cardinal adjacency starts conversation only on the player's facing side.
+                bool isInCorrectDirection = false;
+                if (isCardinalAdjacent)
                 {
-                    int npcTileX =
-                        TileMath::TileIndex(npcPos.x, static_cast<float>(TILE_PIXEL_SIZE));
-                    int npcTileY =
-                        TileMath::StandingTileRow(npcPos.y, static_cast<float>(TILE_PIXEL_SIZE));
-
-                    bool isColliding =
-                        CollisionGeometry::FeetBoxesOverlap(playerPos,
-                                                            npcPos,
-                                                            CharacterConstants::HALF_HITBOX_WIDTH,
-                                                            CharacterConstants::HITBOX_HEIGHT,
-                                                            CharacterConstants::COLLISION_EPS);
-
-                    bool isOnFrontTile = (npcTileX == frontTileX && npcTileY == frontTileY);
-
-                    // Cardinal-adjacent fallback (NPC one tile away, axis-aligned).
-                    int tileDistX = std::abs(playerTileX - npcTileX);
-                    int tileDistY = std::abs(playerTileY - npcTileY);
-                    bool isCardinalAdjacent =
-                        (tileDistX == 1 && tileDistY == 0) || (tileDistX == 0 && tileDistY == 1);
-                    bool isSameTile = (tileDistX == 0 && tileDistY == 0);
-
-                    // Cardinal-adjacent only counts if the NPC is in player's facing direction.
-                    bool isInCorrectDirection = false;
-                    if (isCardinalAdjacent)
+                    switch (playerDir)
                     {
-                        switch (playerDir)
-                        {
-                            case Direction::DOWN:
-                                isInCorrectDirection =
-                                    (npcTileY > playerTileY && npcTileX == playerTileX);
-                                break;
-                            case Direction::UP:
-                                isInCorrectDirection =
-                                    (npcTileY < playerTileY && npcTileX == playerTileX);
-                                break;
-                            case Direction::LEFT:
-                                isInCorrectDirection =
-                                    (npcTileX < playerTileX && npcTileY == playerTileY);
-                                break;
-                            case Direction::RIGHT:
-                                isInCorrectDirection =
-                                    (npcTileX > playerTileX && npcTileY == playerTileY);
-                                break;
-                        }
+                        case Direction::DOWN:
+                            isInCorrectDirection =
+                                (npcTileY > playerTileY && npcTileX == playerTileX);
+                            break;
+                        case Direction::UP:
+                            isInCorrectDirection =
+                                (npcTileY < playerTileY && npcTileX == playerTileX);
+                            break;
+                        case Direction::LEFT:
+                            isInCorrectDirection =
+                                (npcTileX < playerTileX && npcTileY == playerTileY);
+                            break;
+                        case Direction::RIGHT:
+                            isInCorrectDirection =
+                                (npcTileX > playerTileX && npcTileY == playerTileY);
+                            break;
                     }
+                }
 
-                    // Very-close, roughly-in-front fallback (more lenient direction check).
-                    bool isVeryClose = (distance <= COLLISION_DISTANCE);
-                    glm::vec2 toNPC = npcPos - playerPos;
-                    bool isRoughlyInFront = false;
-                    if (isVeryClose)
+                bool isVeryClose = (distance <= COLLISION_DISTANCE);
+                glm::vec2 toNPC = npcPos - playerPos;
+                bool isRoughlyInFront = false;
+                if (isVeryClose)
+                {
+                    switch (playerDir)
                     {
-                        switch (playerDir)
-                        {
-                            case Direction::DOWN:
-                                isRoughlyInFront = (toNPC.y > -DIRECTION_LENIENCY);
-                                break;
-                            case Direction::UP:
-                                isRoughlyInFront = (toNPC.y < DIRECTION_LENIENCY);
-                                break;
-                            case Direction::LEFT:
-                                isRoughlyInFront = (toNPC.x < DIRECTION_LENIENCY);
-                                break;
-                            case Direction::RIGHT:
-                                isRoughlyInFront = (toNPC.x > -DIRECTION_LENIENCY);
-                                break;
-                        }
+                        case Direction::DOWN:
+                            isRoughlyInFront = (toNPC.y > -DIRECTION_LENIENCY);
+                            break;
+                        case Direction::UP:
+                            isRoughlyInFront = (toNPC.y < DIRECTION_LENIENCY);
+                            break;
+                        case Direction::LEFT:
+                            isRoughlyInFront = (toNPC.x < DIRECTION_LENIENCY);
+                            break;
+                        case Direction::RIGHT:
+                            isRoughlyInFront = (toNPC.x > -DIRECTION_LENIENCY);
+                            break;
                     }
+                }
 
-                    // Start dialogue if: colliding, on front tile, cardinal-adjacent in
-                    // facing direction, or very close + roughly in front.
-                    if (isColliding || isOnFrontTile || isInCorrectDirection ||
-                        (isVeryClose && isRoughlyInFront))
+                // allow contact or a front-facing nearby NPC; proximity alone behind the player
+                // does not start dialogue.
+                if (isColliding || isOnFrontTile || isInCorrectDirection ||
+                    (isVeryClose && isRoughlyInFront))
+                {
+                    // Start dialogue only after alignment completes.
+                    const Dialogue& npcDialogue = m_World.get<Dialogue>(npcE);
+                    const WorldServices* npcSvc = m_World.ctx().find<WorldServices>();
+                    m_DialogueUi.npcId = m_World.get<Identity>(npcE).instanceId;
+                    m_DialogueUi.page = 0;
+                    m_DialogueUi.snap.prefersTree = npcSvc != nullptr &&
+                                                    npcSvc->dialogue != nullptr &&
+                                                    npcSvc->dialogue->HasTree(npcDialogue.tree);
+                    m_DialogueUi.snap.fallbackText = npcDialogue.text;
+
+                    playerPos = m_World.get<Transform>(m_PlayerEntity).position;
+                    npcPos = m_World.get<Transform>(npcE).position;
+
+                    // feet anchor Y is at the bottom edge; subtract one tile for the standing row.
+                    int snapTileY = static_cast<int>(
+                        std::round((npcPos.y - TILE_PIXEL_SIZE) / TILE_PIXEL_SIZE));
+
+                    m_DialogueUi.snap.npcTileX = npcTileX;
+                    m_DialogueUi.snap.npcTileY = snapTileY;
+                    glm::vec2 npcTargetPos(
+                        static_cast<float>(m_DialogueUi.snap.npcTileX * TILE_PIXEL_SIZE +
+                                           TILE_PIXEL_SIZE / 2),
+                        static_cast<float>(m_DialogueUi.snap.npcTileY * TILE_PIXEL_SIZE +
+                                           TILE_PIXEL_SIZE));
+
+                    playerTileX =
+                        TileMath::TileIndex(playerPos.x, static_cast<float>(TILE_PIXEL_SIZE));
+                    playerTileY =
+                        TileMath::StandingTileRow(playerPos.y, static_cast<float>(TILE_PIXEL_SIZE));
+
+                    npcTileY = snapTileY;
+
+                    int dx = playerTileX - npcTileX;
+                    int dy = playerTileY - npcTileY;
+
+                    // TODO: extract cardinal direction selection into the dialogue snap helper.
+                    int finalDx = 0;
+                    int finalDy = 0;
+                    if (dx != 0 && dy != 0)
                     {
-                        // Delay dialogue activation until the alignment snap completes.
-                        const Dialogue& npcDialogue = m_World.get<Dialogue>(npcE);
-                        const WorldServices* npcSvc = m_World.globals().find<WorldServices>();
-                        m_DialogueUi.npcId = m_World.get<Identity>(npcE).instanceId;
-                        m_DialogueUi.page = 0;
-                        m_DialogueUi.snap.prefersTree = npcSvc != nullptr &&
-                                                        npcSvc->dialogue != nullptr &&
-                                                        npcSvc->dialogue->HasTree(npcDialogue.tree);
-                        m_DialogueUi.snap.fallbackText = npcDialogue.text;
-
-                        playerPos = m_World.get<Transform>(m_PlayerEntity).position;
-                        npcPos = m_World.get<Transform>(npcE).position;
-
-                        // Snap NPC to center of its tile. X anchor is centered so
-                        // floor(x/TILE) already gives the right tile; Y anchor is at
-                        // the bottom, so subtract TILE to find the standing tile.
-                        int snapTileY = static_cast<int>(
-                            std::round((npcPos.y - TILE_PIXEL_SIZE) / TILE_PIXEL_SIZE));
-
-                        m_DialogueUi.snap.npcTileX = npcTileX;
-                        m_DialogueUi.snap.npcTileY = snapTileY;
-                        glm::vec2 npcTargetPos(
-                            static_cast<float>(m_DialogueUi.snap.npcTileX * TILE_PIXEL_SIZE +
-                                               TILE_PIXEL_SIZE / 2),
-                            static_cast<float>(m_DialogueUi.snap.npcTileY * TILE_PIXEL_SIZE +
-                                               TILE_PIXEL_SIZE));
-
-                        // Recompute player tile from fresh position.
-                        playerTileX =
-                            TileMath::TileIndex(playerPos.x, static_cast<float>(TILE_PIXEL_SIZE));
-                        playerTileY = TileMath::StandingTileRow(
-                            playerPos.y, static_cast<float>(TILE_PIXEL_SIZE));
-
-                        // Use the new NPC tile coordinates so the search for a snap spot
-                        // relative to where the NPC ended up.
-                        npcTileY = snapTileY;
-
-                        // Direction NPC -> player.
-                        int dx = playerTileX - npcTileX;
-                        int dy = playerTileY - npcTileY;
-
-                        // Diagonal snaps to the dominant cardinal axis.
-                        // TODO: Extract this (cardinal-aligned + diagonal->cardinal
-                        // fallback) into a FindDialogueSnapTile helper next to the
-                        // DialogueSnapState code so the snap rules live with their state.
-                        int finalDx = 0;
-                        int finalDy = 0;
-                        if (dx != 0 && dy != 0)
-                        {
-                            if (std::abs(dx) > std::abs(dy))
-                            {
-                                finalDx = (dx > 0) ? 1 : -1;
-                                finalDy = 0;
-                            }
-                            else
-                            {
-                                finalDx = 0;
-                                finalDy = (dy > 0) ? 1 : -1;
-                            }
-                        }
-                        else if (dx != 0)
+                        if (std::abs(dx) > std::abs(dy))
                         {
                             finalDx = (dx > 0) ? 1 : -1;
                             finalDy = 0;
                         }
-                        else if (dy != 0)
+                        else
                         {
                             finalDx = 0;
                             finalDy = (dy > 0) ? 1 : -1;
                         }
-                        else
-                        {
-                            // Same tile: default to down.
-                            finalDx = 0;
-                            finalDy = 1;
-                        }
-
-                        // Round, not floor, so the player doesn't snap when slightly off-center.
-                        int currentPlayerTileX = static_cast<int>(
-                            std::round((playerPos.x - TILE_PIXEL_SIZE / 2) / TILE_PIXEL_SIZE));
-                        int currentPlayerTileY = static_cast<int>(
-                            std::round((playerPos.y - TILE_PIXEL_SIZE) / TILE_PIXEL_SIZE));
-
-                        glm::ivec2 snapTile = FindDialogueSnapTile(npcTileX,
-                                                                   npcTileY,
-                                                                   currentPlayerTileX,
-                                                                   currentPlayerTileY,
-                                                                   finalDx,
-                                                                   finalDy);
-                        int playerTileXFinal = snapTile.x;
-                        int playerTileYFinal = snapTile.y;
-
-                        glm::vec2 playerTargetPos = playerPos;
-                        bool hasPlayerTileTarget = (playerTileXFinal >= 0 && playerTileYFinal >= 0);
-                        if (hasPlayerTileTarget)
-                        {
-                            playerTargetPos =
-                                glm::vec2(static_cast<float>(playerTileXFinal * TILE_PIXEL_SIZE +
-                                                             TILE_PIXEL_SIZE / 2),
-                                          static_cast<float>(playerTileYFinal * TILE_PIXEL_SIZE +
-                                                             TILE_PIXEL_SIZE));
-                        }
-
-                        // NPC faces player; player faces NPC.
-                        glm::vec2 npcToPlayer = playerTargetPos - npcTargetPos;
-                        Direction npcFacing = CardinalFromDelta(npcToPlayer.x, npcToPlayer.y);
-
-                        glm::vec2 playerToNPC = npcTargetPos - playerTargetPos;
-                        Direction playerFacing = CardinalFromDelta(playerToNPC.x, playerToNPC.y);
-
-                        // Freeze both and begin smooth alignment.
-                        assert(!m_Editor.IsActive() &&
-                               "Dialogue cannot start while editor is active");
-                        PlayerSystem::Stop(m_World, m_PlayerEntity);
-                        m_World.get<NpcIdle>(npcE).isStopped = true;
-                        CharacterKinematics::ResetAnimation(m_World.get<AnimationState>(npcE));
-
-                        m_DialogueUi.snap.active = true;
-                        m_DialogueUi.snap.timer = 0.0f;
-                        m_DialogueUi.snap.duration = 0.42f;
-                        m_DialogueUi.snap.playerStart = playerPos;
-                        m_DialogueUi.snap.playerTarget = playerTargetPos;
-                        m_DialogueUi.snap.npcStart = npcPos;
-                        m_DialogueUi.snap.npcTarget = npcTargetPos;
-                        m_DialogueUi.snap.playerTileX =
-                            hasPlayerTileTarget
-                                ? playerTileXFinal
-                                : static_cast<int>(std::round(
-                                      (playerTargetPos.x - TILE_PIXEL_SIZE / 2) / TILE_PIXEL_SIZE));
-                        m_DialogueUi.snap.playerTileY =
-                            hasPlayerTileTarget
-                                ? playerTileYFinal
-                                : static_cast<int>(std::round(
-                                      (playerTargetPos.y - TILE_PIXEL_SIZE) / TILE_PIXEL_SIZE));
-                        m_DialogueUi.snap.hasPlayerTile = hasPlayerTileTarget;
-                        m_DialogueUi.snap.playerFacing = playerFacing;
-                        m_DialogueUi.snap.npcFacing = npcFacing;
-
-                        Logger::InfoF(LOG_SUBSYSTEM,
-                                      "Starting dialogue snap with NPC: {} target NPC tile ({}, "
-                                      "{}), target player tile ({}, {})",
-                                      m_World.get<Dialogue>(npcE).type,
-                                      m_DialogueUi.snap.npcTileX,
-                                      m_DialogueUi.snap.npcTileY,
-                                      m_DialogueUi.snap.playerTileX,
-                                      m_DialogueUi.snap.playerTileY);
-                        dialogueStarted = true;
-                        return;
                     }
+                    else if (dx != 0)
+                    {
+                        finalDx = (dx > 0) ? 1 : -1;
+                        finalDy = 0;
+                    }
+                    else if (dy != 0)
+                    {
+                        finalDx = 0;
+                        finalDy = (dy > 0) ? 1 : -1;
+                    }
+                    else
+                    {
+                        finalDx = 0;
+                        finalDy = 1;
+                    }
+
+                    // Round to avoid snapping feet that are slightly off-center.
+                    int currentPlayerTileX = static_cast<int>(
+                        std::round((playerPos.x - TILE_PIXEL_SIZE / 2) / TILE_PIXEL_SIZE));
+                    int currentPlayerTileY = static_cast<int>(
+                        std::round((playerPos.y - TILE_PIXEL_SIZE) / TILE_PIXEL_SIZE));
+
+                    glm::ivec2 snapTile = FindDialogueSnapTile(npcTileX,
+                                                               npcTileY,
+                                                               currentPlayerTileX,
+                                                               currentPlayerTileY,
+                                                               finalDx,
+                                                               finalDy);
+                    int playerTileXFinal = snapTile.x;
+                    int playerTileYFinal = snapTile.y;
+
+                    glm::vec2 playerTargetPos = playerPos;
+                    bool hasPlayerTileTarget = (playerTileXFinal >= 0 && playerTileYFinal >= 0);
+                    if (hasPlayerTileTarget)
+                    {
+                        playerTargetPos =
+                            glm::vec2(static_cast<float>(playerTileXFinal * TILE_PIXEL_SIZE +
+                                                         TILE_PIXEL_SIZE / 2),
+                                      static_cast<float>(playerTileYFinal * TILE_PIXEL_SIZE +
+                                                         TILE_PIXEL_SIZE));
+                    }
+
+                    glm::vec2 npcToPlayer = playerTargetPos - npcTargetPos;
+                    Direction npcFacing = CardinalFromDelta(npcToPlayer.x, npcToPlayer.y);
+
+                    glm::vec2 playerToNPC = npcTargetPos - playerTargetPos;
+                    Direction playerFacing = CardinalFromDelta(playerToNPC.x, playerToNPC.y);
+
+                    assert(!m_Editor.IsActive() && "Dialogue cannot start while editor is active");
+                    PlayerSystem::Stop(m_World, m_PlayerEntity);
+                    m_World.get<NpcIdle>(npcE).isStopped = true;
+                    CharacterKinematics::ResetAnimation(m_World.get<AnimationState>(npcE));
+
+                    m_DialogueUi.snap.active = true;
+                    m_DialogueUi.snap.timer = 0.0f;
+                    m_DialogueUi.snap.duration = 0.42f;
+                    m_DialogueUi.snap.playerStart = playerPos;
+                    m_DialogueUi.snap.playerTarget = playerTargetPos;
+                    m_DialogueUi.snap.npcStart = npcPos;
+                    m_DialogueUi.snap.npcTarget = npcTargetPos;
+                    m_DialogueUi.snap.playerTileX =
+                        hasPlayerTileTarget
+                            ? playerTileXFinal
+                            : static_cast<int>(std::round(
+                                  (playerTargetPos.x - TILE_PIXEL_SIZE / 2) / TILE_PIXEL_SIZE));
+                    m_DialogueUi.snap.playerTileY =
+                        hasPlayerTileTarget
+                            ? playerTileYFinal
+                            : static_cast<int>(std::round((playerTargetPos.y - TILE_PIXEL_SIZE) /
+                                                          TILE_PIXEL_SIZE));
+                    m_DialogueUi.snap.hasPlayerTile = hasPlayerTileTarget;
+                    m_DialogueUi.snap.playerFacing = playerFacing;
+                    m_DialogueUi.snap.npcFacing = npcFacing;
+
+                    Logger::InfoF(LOG_SUBSYSTEM,
+                                  "Starting dialogue snap with NPC: {} target NPC tile ({}, "
+                                  "{}), target player tile ({}, {})",
+                                  m_World.get<Dialogue>(npcE).type,
+                                  m_DialogueUi.snap.npcTileX,
+                                  m_DialogueUi.snap.npcTileY,
+                                  m_DialogueUi.snap.playerTileX,
+                                  m_DialogueUi.snap.playerTileY);
+                    break;
                 }
-            });
+            }
+        }
     }
 
     ProcessDialogueInput();
 
-    // WASD stays world-absolute even when the camera has orbited: W is always
-    // map-north, never "away from the camera". Deliberate - it keeps movement
-    // predictable against the tile grid the collision and navigation maps are
-    // built on, and matches how the flat pipeline has always behaved. Only the
-    // sprite row is camera-relative (see cameraFacing::ScreenFacing), so a
-    // character walking north still shows the correct side to the viewer.
+    // movement stays world-relative; only the sprite row rotates with the camera.
     ProcessPlayerMovement(moveDirection, deltaTime);
 
-    // Process mouse input for editor
     if (m_Editor.IsActive())
     {
         m_Editor.ProcessMouseInput(MakeEditorContext());
@@ -618,7 +573,7 @@ void Game::ProcessDialogueInput()
 {
     if (m_DialogueManager.IsActive())
     {
-        // Up/Down or W/S navigate options; Enter/Space confirm; Esc force-closes.
+        // Arrow keys or W/S change options; Enter/Space advances and Escape closes immediately.
         if (m_KeyDialogueUp.JustPressed(m_Window))
             m_DialogueManager.SelectPrevious();
 
@@ -650,26 +605,23 @@ void Game::ProcessDialogueInput()
 
 void Game::ProcessPlayerMovement(glm::vec2 moveDirection, float deltaTime)
 {
-    // Gate on: not in editor, not in dialogue, console closed.
     if (!m_Editor.IsActive() && !m_DialogueUi.inDialogue && !m_DialogueManager.IsActive() &&
         !m_DialogueUi.snap.active && !m_Console.IsOpen())
     {
         const glm::vec2 beforeMove = m_World.get<Transform>(m_PlayerEntity).position;
 
-        // Reuses the pre-allocated member (no per-frame alloc). The ECS analog
-        // is world.each<const Transform, const NpcTag>.
+        // reuse collision scratch storage across frames.
         BuildNpcCollisionBodies(m_World, m_NpcBodies);
 
-        // No-clip bypasses tile + NPC collision via null pointers; Move() and
-        // CollisionSystem::HandleStuckRecovery both handle null safely.
+        // Null world and NPC inputs select no-clip without changing the shared movement
+        // implementation.
         const Tilemap* tilemap =
             m_World.get<PlayerModes>(m_PlayerEntity).noClip ? nullptr : &m_Tilemap;
         const std::vector<CharacterCollisionBody>* npcBodies =
             m_World.get<PlayerModes>(m_PlayerEntity).noClip ? nullptr : &m_NpcBodies;
         PlayerSystem::Move(m_World, m_PlayerEntity, moveDirection, deltaTime, tilemap, npcBodies);
 
-        // Collision-aware movement already committed support atomically. No-clip
-        // has no movement probe, so derive its support from the completed move.
+        // no-clip has no accepted probe; derive support from the final position.
         if (!tilemap)
         {
             CharacterKinematics::DerivePlane(m_World.get<Elevation>(m_PlayerEntity),
@@ -684,7 +636,7 @@ void Game::ProcessPlayerMovement(glm::vec2 moveDirection, float deltaTime)
     }
 }
 
-void Game::ScrollCallback(GLFWwindow* window, double /*xoffset*/, double yoffset)
+void Game::ScrollCallback(GLFWwindow* window, double, double yoffset)
 {
     Game* game = static_cast<Game*>(glfwGetWindowUserPointer(window));
     if (!game)
@@ -692,11 +644,9 @@ void Game::ScrollCallback(GLFWwindow* window, double /*xoffset*/, double yoffset
         return;
     }
 
-    // Console takes scroll exclusively while open (scrollback navigation).
     if (game->m_Console.IsOpen())
     {
-        // Suggestion dropdown gets first crack: if the cursor is over it, the
-        // wheel scrolls suggestions instead of scrollback.
+        // scroll suggestions before console history when the cursor is over the dropdown.
         double mx = 0.0;
         double my = 0.0;
         glfwGetCursorPos(window, &mx, &my);
@@ -710,7 +660,7 @@ void Game::ScrollCallback(GLFWwindow* window, double /*xoffset*/, double yoffset
     if (game->m_Editor.IsActive())
     {
         game->m_Editor.HandleScroll(yoffset, game->MakeEditorContext());
-        // Tile picker swallows all scroll when open.
+
         if (game->m_Editor.IsShowTilePicker())
         {
             return;
@@ -720,7 +670,6 @@ void Game::ScrollCallback(GLFWwindow* window, double /*xoffset*/, double yoffset
     bool ctrlPressed = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
                        glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
 
-    // Ctrl+scroll zooms the camera.
     if (ctrlPressed)
     {
         float baseWorldWidth =
@@ -761,8 +710,7 @@ void Game::CharCallback(GLFWwindow* window, unsigned int codepoint)
 
 void Game::PumpConsoleKeys()
 {
-    // Function-local statics for the keys the console consumes - only allocate
-    // once the console is open.
+    // Console key latches share function-local state across calls.
     static KeyToggle<GLFW_KEY_ENTER> kEnter;
     static KeyToggle<GLFW_KEY_BACKSPACE> kBackspace;
     static KeyToggle<GLFW_KEY_DELETE> kDelete;
@@ -790,9 +738,7 @@ void Game::PumpConsoleKeys()
         m_Console.OnDelete();
     if (kTab.JustPressed(m_Window))
     {
-        // Empty input: Tab toggles Half <-> Full so the user can resize the
-        // console for longer sessions. Non-empty input: Tab is autocomplete
-        // (cycles through suggestions, same as before).
+        // Empty input toggles console size; nonempty input cycles completion.
         if (m_Console.Buffer().Input().empty())
             m_Console.ToggleFullscreen();
         else
@@ -813,8 +759,7 @@ void Game::PumpConsoleKeys()
     if (kEscape.JustPressed(m_Window))
         m_Console.OnEscape();
 
-    // Suggestion dropdown: hover keeps the highlight under the cursor; click
-    // splices the chosen suggestion into the input (same path as Tab).
+    // hover selects a suggestion; click uses the same insertion path as Tab completion.
     double mouseX = 0.0;
     double mouseY = 0.0;
     glfwGetCursorPos(m_Window, &mouseX, &mouseY);
@@ -829,7 +774,7 @@ void Game::PumpConsoleKeys()
 
 void Game::ReleaseDialogueNPC()
 {
-    if (const ecs::entity dialogueNpc = FindNPCById(m_DialogueUi.npcId))
+    if (const entt::entity dialogueNpc = FindNPCById(m_DialogueUi.npcId); dialogueNpc != entt::null)
     {
         m_World.get<NpcIdle>(dialogueNpc).isStopped = false;
     }
@@ -845,7 +790,6 @@ void Game::CloseSimpleDialogue()
 
 void Game::ConfirmOrAdvanceTreeDialogue()
 {
-    // If the typewriter is still revealing, skip to full reveal first.
     if (m_DialogueUi.charReveal >= 0.0f)
     {
         m_DialogueUi.charReveal = -1.0f;
@@ -883,7 +827,6 @@ glm::ivec2 Game::FindDialogueSnapTile(int npcTileX,
                                       int preferredDx,
                                       int preferredDy) const
 {
-    // Valid: in bounds, not the NPC's tile, not blocked.
     auto isValidSnapTile = [&](int tx, int ty)
     {
         if (tx < 0 || ty < 0 || tx >= m_Tilemap.GetMapWidth() || ty >= m_Tilemap.GetMapHeight())
@@ -897,7 +840,6 @@ glm::ivec2 Game::FindDialogueSnapTile(int npcTileX,
         return !m_Tilemap.GetTileCollision(tx, ty);
     };
 
-    // If the player is already on a valid cardinal-adjacent tile, stay put.
     if (playerTileX != npcTileX || playerTileY != npcTileY)
     {
         if (isValidSnapTile(playerTileX, playerTileY))
@@ -913,14 +855,12 @@ glm::ivec2 Game::FindDialogueSnapTile(int npcTileX,
         }
     }
 
-    // Ensure non-zero preferred direction (default: down).
     if (preferredDx == 0 && preferredDy == 0)
     {
         preferredDx = 0;
         preferredDy = 1;
     }
 
-    // Try preferred direction first, then all four cardinals.
     struct CardinalDir
     {
         int dx, dy;
@@ -947,12 +887,11 @@ glm::ivec2 Game::FindDialogueSnapTile(int npcTileX,
         }
     }
 
-    // No cardinal worked: fall back to the current player tile if it's valid.
+    // If no adjacent tile is safe, allow the current player tile before reporting failure.
     if (isValidSnapTile(playerTileX, playerTileY))
     {
         return glm::ivec2(playerTileX, playerTileY);
     }
 
-    // No safe tile found.
     return glm::ivec2(-1, -1);
 }
