@@ -18,13 +18,10 @@
 
 namespace
 {
-// A character is one queue item even though the current renderer still submits
-// its two sprite halves. The thunk executes those submissions consecutively, so
-// no tile can ever sort between feet, body, hair, equipment, or taller future
-// character art.
+// Character sprite parts submit consecutively so tiles cannot split the character.
 void AddEntityDrawable(std::vector<Drawable>& list,
-                       const ecs::registry& world,
-                       ecs::entity entity,
+                       const entt::registry& world,
+                       entt::entity entity,
                        glm::vec2 feetPos,
                        SupportSurface supportSurface,
                        float supportHeight,
@@ -48,17 +45,15 @@ void AddEntityDrawable(std::vector<Drawable>& list,
 }  // namespace
 
 void AddNpcDrawable(std::vector<Drawable>& list,
-                    const ecs::registry& world,
-                    ecs::entity npc,
+                    const entt::registry& world,
+                    entt::entity npc,
                     glm::vec2 feetPos,
                     SupportSurface supportSurface,
                     float supportHeight,
                     int surfaceRegionId,
                     std::uint8_t tieBias)
 {
-    // Capture-less lambda -> function pointer. Re-resolves the NPC's render
-    // components from (world, handle) at draw time. Both halves are submitted
-    // inside this one thunk, making the character atomic to the render queue.
+    // Resolve live components at draw time; cache no component references.
     void (*thunk)(const Drawable&, IRenderer&, glm::vec2) =
         +[](const Drawable& d, IRenderer& r, glm::vec2 cam)
     {
@@ -73,8 +68,8 @@ void AddNpcDrawable(std::vector<Drawable>& list,
 }
 
 void AddPlayerDrawable(std::vector<Drawable>& list,
-                       const ecs::registry& world,
-                       ecs::entity player,
+                       const entt::registry& world,
+                       entt::entity player,
                        glm::vec2 feetPos,
                        SupportSurface supportSurface,
                        float supportHeight,
@@ -165,9 +160,7 @@ void SortDrawables(std::vector<Drawable>& list)
     {
         (void)regionId;
 
-        // Underpass: only actors whose feet are actually inside this elevation
-        // footprint move behind its artwork. A character merely beside the ramp
-        // has no region id and therefore keeps ordinary authored Y sorting.
+        // Underpass edges apply only within the actor's elevation footprint.
         for (size_t actor : region.groundActors)
         {
             for (size_t tile : region.tiles)
@@ -176,9 +169,8 @@ void SortDrawables(std::vector<Drawable>& list)
             }
         }
 
-        // Deck/ramp: inferred background surface art stays below actors on the
-        // elevated support. Explicit ySortPlus/ySortMinus tiles are deliberately
-        // not constrained here; their authored top/bottom railing behavior wins.
+        // Deck edges keep inferred background art below elevated actors; authored Y-sort keeps its
+        // role.
         for (size_t tile : region.backgroundSurfaceTiles)
         {
             for (size_t actor : region.elevatedActors)
@@ -187,10 +179,7 @@ void SortDrawables(std::vector<Drawable>& list)
             }
         }
 
-        // Authored Y-sort on elevated artwork is local to actors supported by
-        // that elevation region. This preserves top/bottom railing behavior on
-        // the deck without letting the same railing occlude a ground actor
-        // merely standing beside the ramp.
+        // Authored railing constraints apply only to elevated actors in the same region.
         for (size_t tile : region.authoredYSortTiles)
         {
             for (size_t actor : region.elevatedActors)
@@ -212,9 +201,7 @@ void SortDrawables(std::vector<Drawable>& list)
         return;
     }
 
-    // Stable topological sort: baseline painter index is the priority whenever
-    // two nodes are unconstrained, so the graph changes only relationships the
-    // local under/on-surface rules explicitly require.
+    // Baseline indices break unconstrained ties in the topological sort.
     std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>> ready;
     for (size_t index = 0; index < incomingCount.size(); ++index)
     {
@@ -243,8 +230,7 @@ void SortDrawables(std::vector<Drawable>& list)
 
     if (order.size() != list.size())
     {
-        // The semantic roles above are acyclic by construction. Keep the valid
-        // baseline order if future roles accidentally introduce a cycle.
+        // Retain baseline order if constraints form a cycle.
         return;
     }
 
