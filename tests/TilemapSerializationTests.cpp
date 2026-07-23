@@ -1,16 +1,13 @@
-// Round-trip and migration guard for the per-tile TileStance field.
-//
-// Before this file the map format had NO test coverage at all: nothing under
-// tests/ touched SaveMapToJSON or LoadMapFromJSON, so a save/load regression
-// would have shipped silently. `stance` is also the format's first per-layer
-// enum, and it carries a one-time migration for maps authored before it
-// existed, so both halves are pinned here.
-//
-// No GL/Vulkan context is created (see the rift_tests constraint in
-// CMakeLists.txt) - serialization is pure data.
+// saved stance values take precedence over legacy flags; missing stance triggers the migration
+// cases below.
+
+#include "../src/EntityStore.hpp"
+#include "../src/NpcRecord.hpp"
 #include "../src/Tilemap.hpp"
 
 #include <gtest/gtest.h>
+
+#include <entt/entt.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -22,8 +19,6 @@ constexpr size_t kGround = 0;
 constexpr size_t kGroundDetail = 1;
 constexpr size_t kObjects = 2;
 
-// A unique path per test, so a failure leaves its artifact behind for
-// inspection without the next test tripping over it.
 std::string TempMapPath(const std::string& name)
 {
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / "rift_tests";
@@ -46,13 +41,13 @@ void WriteWholeFile(const std::string& path, const std::string& contents)
 // A legacy map: three layers, no "stance" key anywhere, flags in the old
 // encoding. 4x4 tiles, so flat index = y * 4 + x.
 //
-// Layer 0 "Ground"        : index 0 noProjection
-// Layer 1 "Ground Detail" : index 5 ySortPlus          (a flat decal)
-// Layer 2 "Objects"       : index 3 ySortPlus          (an isolated prop)
+// layer 0 "Ground"        : index 0 noProjection
+// layer 1 "Ground Detail" : index 5 ySortPlus          (a flat decal)
+// layer 2 "Objects"       : index 3 ySortPlus          (an isolated prop)
 //                           indices 12,13 ySortPlus    (two neighbours: a fence)
 //
-// Index 3 is (3,0) and the fence is (0,3),(1,3) - deliberately not 4-connected
-// to it. Picking a cell in the same COLUMN as the fence would make the "isolated"
+// index 3 is (3,0) and the fence is (0,3),(1,3) - deliberately not 4-connected
+// to it. placing a cell in the same column as the fence would make the "isolated"
 // prop a neighbour of it and the split untested.
 std::string LegacyMapJson()
 {
@@ -85,6 +80,48 @@ std::string LegacyMapJson()
 }
 }  // namespace
 
+TEST(TilemapSerializationTest, NpcOrderIsStableAcrossSaveLoadSave)
+{
+    Tilemap saved;
+    saved.SetTilemapSize(8, 8, false);
+    entt::registry npcs;
+
+    NpcRecord first;
+    first.type = "first";
+    first.name = "first NPC";
+    first.tileX = 1;
+    first.tileY = 2;
+    const entt::entity firstEntity = EntityStore::SpawnNpc(npcs, first);
+
+    NpcRecord second;
+    second.type = "second";
+    second.name = "second NPC";
+    second.tileX = 3;
+    second.tileY = 4;
+    const entt::entity secondEntity = EntityStore::SpawnNpc(npcs, second);
+
+    NpcRecord third;
+    third.type = "third";
+    third.name = "third NPC";
+    third.tileX = 5;
+    third.tileY = 6;
+    const entt::entity thirdEntity = EntityStore::SpawnNpc(npcs, third);
+
+    ASSERT_NE(firstEntity, entt::null);
+    ASSERT_NE(secondEntity, entt::null);
+    ASSERT_NE(thirdEntity, entt::null);
+
+    const std::string firstPath = TempMapPath("npc_order_first");
+    const std::string secondPath = TempMapPath("npc_order_second");
+    ASSERT_TRUE(saved.SaveMapToJSON(firstPath, &npcs));
+
+    Tilemap loaded;
+    ASSERT_TRUE(loaded.LoadMapFromJSON(firstPath, &npcs));
+    ASSERT_TRUE(loaded.SaveMapToJSON(secondPath, &npcs));
+
+    EXPECT_EQ(ReadWholeFile(firstPath), ReadWholeFile(secondPath));
+}
+
 TEST(TilemapSerializationTest, EveryStanceSurvivesARoundTrip)
 {
     Tilemap saved;
@@ -112,9 +149,8 @@ TEST(TilemapSerializationTest, EveryStanceSurvivesARoundTrip)
 
 TEST(TilemapSerializationTest, StanceIsSparseAndTheLegacyKeyIsNeverWritten)
 {
-    // Flat cells must not be written - a 125x125 map would otherwise gain 15625
-    // entries per layer - and the field this replaced must not reappear in the
-    // output, or an older build would silently read a contradictory map.
+    // omit Flat stance entries to keep maps sparse; do not emit the obsolete
+    // upright field alongside stance.
     Tilemap tm;
     tm.SetTilemapSize(8, 8, false);
     tm.SetLayerTile(2, 2, kGround, 3);
@@ -127,7 +163,7 @@ TEST(TilemapSerializationTest, StanceIsSparseAndTheLegacyKeyIsNeverWritten)
     EXPECT_EQ(text.find("noProjection\""), std::string::npos)
         << "the legacy per-tile key was written again";
 
-    // Exactly one stance entry: flat index 2 * 8 + 2 = 18, value Wall (2).
+    // exactly one stance entry: flat index 2 * 8 + 2 = 18, value Wall (2).
     const size_t stanceKey = text.find("\"stance\"");
     ASSERT_NE(stanceKey, std::string::npos) << "the stance key was not written at all";
     const size_t closing = text.find('}', stanceKey);
@@ -150,9 +186,6 @@ TEST(TilemapSerializationTest, AnAllFlatLayerOmitsTheStanceKeyEntirely)
 
 TEST(TilemapSerializationTest, LegacyNoProjectionMigratesToStructure)
 {
-    // The one exact equivalence in the migration: noProjection has always meant
-    // "this artwork stands up as part of a structure", so the flat pipeline's
-    // behaviour is unchanged by construction.
     const std::string path = TempMapPath("legacy_noprojection");
     WriteWholeFile(path, LegacyMapJson());
 
@@ -163,8 +196,6 @@ TEST(TilemapSerializationTest, LegacyNoProjectionMigratesToStructure)
 
 TEST(TilemapSerializationTest, LegacyYSortOnAGroundLayerStaysFlat)
 {
-    // The bug that motivated the whole change: 168 Ground Detail cells carried a
-    // y-sort flag and were being stood on their edge in 3D. They are decals.
     const std::string path = TempMapPath("legacy_grounddetail");
     WriteWholeFile(path, LegacyMapJson());
 
@@ -175,26 +206,23 @@ TEST(TilemapSerializationTest, LegacyYSortOnAGroundLayerStaysFlat)
 
 TEST(TilemapSerializationTest, LegacyYSortOnAnObjectLayerSplitsByAdjacency)
 {
-    // An isolated y-sort cell on an object layer is a lone prop; a run of them is
-    // a fence. The adjacency read here is a ONE-OFF seed of a field that did not
-    // exist, not a rule - nothing at render time may consult a neighbour.
+    // migration maps isolated object-layer y-sort cells to props and adjacent
+    // cells to walls. rendering must use the stored stance, not repeat inference.
     const std::string path = TempMapPath("legacy_objects");
     WriteWholeFile(path, LegacyMapJson());
 
     Tilemap tm;
     ASSERT_TRUE(tm.LoadMapFromJSON(path));
 
-    // Index 3 = (3, 0), alone.
     EXPECT_EQ(tm.GetLayerStance(3, 0, kObjects), TileStance::Prop);
-    // Indices 12 and 13 = (0, 3) and (1, 3), touching.
+
     EXPECT_EQ(tm.GetLayerStance(0, 3, kObjects), TileStance::Wall);
     EXPECT_EQ(tm.GetLayerStance(1, 3, kObjects), TileStance::Wall);
 }
 
 TEST(TilemapSerializationTest, APresentStanceKeyWinsOverAStaleLegacyKey)
 {
-    // A map written by a newer build and then touched by an older one could carry
-    // both. The authored field must win outright rather than the two fighting.
+    // explicit stance takes precedence when a map also contains legacy flags.
     const std::string path = TempMapPath("stance_beats_legacy");
     WriteWholeFile(path, R"({
       "width": 4, "height": 4, "tileWidth": 16, "tileHeight": 16,
@@ -216,8 +244,6 @@ TEST(TilemapSerializationTest, APresentStanceKeyWinsOverAStaleLegacyKey)
 
 TEST(TilemapSerializationTest, AnOutOfRangeStanceValueIsIgnoredNotCastBlindly)
 {
-    // The value is cast to an enum, so an out-of-range integer would otherwise
-    // produce a TileStance nothing in the engine handles.
     const std::string path = TempMapPath("stance_out_of_range");
     WriteWholeFile(path, R"({
       "width": 4, "height": 4, "tileWidth": 16, "tileHeight": 16,
@@ -238,10 +264,6 @@ TEST(TilemapSerializationTest, AnOutOfRangeStanceValueIsIgnoredNotCastBlindly)
 
 TEST(TilemapSerializationTest, TheSiblingPerTileFieldsStillRoundTrip)
 {
-    // Guards the five-place checklist that adding `stance` to TileLayer had to
-    // satisfy: a field missing from the resize_all fold is silently swallowed by
-    // the bounds guards, and a neighbour dropped from the save/load loops fails
-    // just as quietly. Cheap insurance on fields that had no coverage either.
     Tilemap saved;
     saved.SetTilemapSize(8, 8, false);
     saved.SetLayerTile(3, 4, kObjects, 11);
@@ -290,8 +312,7 @@ TEST(TilemapSerializationTest, EveryElevationRoleSurvivesARoundTrip)
 
 TEST(TilemapSerializationTest, ElevationRoleIsPerLayerThroughARoundTrip)
 {
-    // The storage decision has to survive the file, not just memory: one cell, one
-    // elevation, two layers disagreeing about whether they rise to it.
+    // serialization must retain one shared height and independent per-layer roles.
     Tilemap saved;
     saved.SetTilemapSize(8, 8, false);
     saved.SetElevation(4, 4, 6);
@@ -312,8 +333,7 @@ TEST(TilemapSerializationTest, ElevationRoleIsPerLayerThroughARoundTrip)
 
 TEST(TilemapSerializationTest, AnAllGroundLayerOmitsTheElevationRoleKey)
 {
-    // Elevation alone must not write the role key - a 125x125 map would otherwise
-    // gain 15625 entries per layer for a field nobody set.
+    // elevation alone must not serialize default roles for every layer.
     Tilemap tm;
     tm.SetTilemapSize(4, 4, false);
     tm.SetLayerTile(1, 1, kGround, 3);
@@ -326,7 +346,6 @@ TEST(TilemapSerializationTest, AnAllGroundLayerOmitsTheElevationRoleKey)
 
 TEST(TilemapSerializationTest, ElevationRoleIsSparse)
 {
-    // Only non-Ground cells are written.
     Tilemap tm;
     tm.SetTilemapSize(8, 8, false);
     tm.SetLayerTile(2, 2, kGround, 3);
@@ -342,15 +361,14 @@ TEST(TilemapSerializationTest, ElevationRoleIsSparse)
     ASSERT_NE(closing, std::string::npos);
     const std::string block = text.substr(key, closing - key);
 
-    // Flat index 2 * 8 + 2 = 18, value Ramp (2).
+    // flat index 2 * 8 + 2 = 18, value Ramp (2).
     EXPECT_NE(block.find("\"18\""), std::string::npos) << block;
     EXPECT_EQ(block.find("\"0\""), std::string::npos) << "a Ground cell was written: " << block;
 }
 
 TEST(TilemapSerializationTest, AMapWithNoElevationRoleKeyLoadsAsAllGround)
 {
-    // No migration by design: the absence of the key IS the correct answer, so an
-    // old map renders exactly as it did until something is marked.
+    // a missing role key means Ground; loading must not infer a raised role.
     const std::string path = TempMapPath("elevation_role_absent");
     WriteWholeFile(path, R"({
       "width": 4, "height": 4, "tileWidth": 16, "tileHeight": 16,
@@ -371,8 +389,6 @@ TEST(TilemapSerializationTest, AMapWithNoElevationRoleKeyLoadsAsAllGround)
 
 TEST(TilemapSerializationTest, AnOutOfRangeElevationRoleIsIgnoredNotCastBlindly)
 {
-    // The value is cast to an enum, so an out-of-range integer would otherwise
-    // produce an ElevationRole nothing in the engine handles.
     const std::string path = TempMapPath("elevation_role_out_of_range");
     WriteWholeFile(path, R"({
       "width": 4, "height": 4, "tileWidth": 16, "tileHeight": 16,
