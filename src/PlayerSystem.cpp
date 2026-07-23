@@ -33,49 +33,47 @@ namespace
 {
 constexpr const char* LOG_SUBSYSTEM = "Player";
 
-// Shared empty texture returned by the sheet accessors when no store is bound.
-// Static so callers can safely bind a reference even when textures are absent.
+// static fallback keeps borrowed texture references valid without services.
 const Texture& EmptyPlayerTexture()
 {
     static const Texture empty;
     return empty;
 }
 
-// The TextureStore published in globals, or nullptr when no WorldServices is
-// registered (e.g. a bare test world with no renderer/services wired up).
-TextureStore* TexturesOf(const ecs::registry& world)
+// registry services are optional in headless worlds; resolve a nullable store for each operation.
+TextureStore* TexturesOf(const entt::registry& world)
 {
-    const WorldServices* svc = world.globals().find<WorldServices>();
+    const WorldServices* svc = world.ctx().find<WorldServices>();
     return (svc != nullptr) ? svc->textures : nullptr;
 }
 
-// The AssetRegistry published in globals, or nullptr (see TexturesOf).
-AssetRegistry* AssetsOf(const ecs::registry& world)
+// character paths come from the optional registry AssetRegistry.
+AssetRegistry* AssetsOf(const entt::registry& world)
 {
-    const WorldServices* svc = world.globals().find<WorldServices>();
+    const WorldServices* svc = world.ctx().find<WorldServices>();
     return (svc != nullptr) ? svc->assets : nullptr;
 }
 }  // namespace
 
 namespace PlayerSystem
 {
-bool SwitchCharacter(ecs::registry& world, ecs::entity player, CharacterType type)
+bool SwitchCharacter(entt::registry& world, entt::entity player, CharacterType type)
 {
     const auto typeName = EnumTraits<CharacterType>::ToString(type);
 
-    // Both services are mandatory: the AssetRegistry resolves the sprite paths and
-    // the TextureStore loads them. Bail before touching any component so a failed
-    // switch leaves the player's current appearance intact.
+    // Validate services before changing appearance.
     AssetRegistry* assets = AssetsOf(world);
     TextureStore* textures = TexturesOf(world);
     if (assets == nullptr)
     {
-        Logger::Error(LOG_SUBSYSTEM, "SwitchCharacter called with no AssetRegistry in globals");
+        Logger::Error(LOG_SUBSYSTEM,
+                      "SwitchCharacter called with no AssetRegistry in the registry context");
         return false;
     }
     if (textures == nullptr)
     {
-        Logger::Error(LOG_SUBSYSTEM, "SwitchCharacter called with no TextureStore in globals");
+        Logger::Error(LOG_SUBSYSTEM,
+                      "SwitchCharacter called with no TextureStore in the registry context");
         return false;
     }
 
@@ -89,7 +87,7 @@ bool SwitchCharacter(ecs::registry& world, ecs::entity player, CharacterType typ
         return path;
     };
 
-    // Acquire into temporaries so committed handles only change on success.
+    // acquire into temporary handles; commit only after validation.
     auto acquire = [&](const std::string& path) -> TextureHandle
     { return path.empty() ? TextureHandle{} : textures->Acquire(path); };
 
@@ -97,20 +95,18 @@ bool SwitchCharacter(ecs::registry& world, ecs::entity player, CharacterType typ
     TextureHandle newRunning = acquire(getAssetPath("Running"));
     TextureHandle newBicycle = acquire(getAssetPath("Bicycle"));
 
-    // Walk + run are required; a missing either sheet aborts the switch.
     if (!textures->IsValid(newWalking) || !textures->IsValid(newRunning))
     {
         Logger::ErrorF(LOG_SUBSYSTEM, "Failed to load character sprites for {}", typeName);
         return false;
     }
 
-    // Bicycle is optional: warn and keep the previous bicycle sheet if absent.
+    // bicycle is optional; retain the previous sheet if loading fails.
     if (!textures->IsValid(newBicycle))
     {
         Logger::WarnF(LOG_SUBSYSTEM, "Bicycle sprite not found for {}", typeName);
     }
 
-    // Past all validation - commit the new handles onto the components.
     auto& sprite = world.get<PlayerSprite>(player);
     auto& appearance = world.get<Appearance>(player);
     sprite.walk = newWalking;
@@ -120,7 +116,7 @@ bool SwitchCharacter(ecs::registry& world, ecs::entity player, CharacterType typ
         sprite.bicycle = newBicycle;
     }
     appearance.characterType = type;
-    // Walking sheet swapped; re-sample the accent color from the new pixels.
+
     appearance.accentColor =
         textures->SampleAccent(sprite.walk, ambience::DIALOGUE_ACCENT_FALLBACK);
 
@@ -128,18 +124,17 @@ bool SwitchCharacter(ecs::registry& world, ecs::entity player, CharacterType typ
     return true;
 }
 
-bool CopyAppearanceFrom(ecs::registry& world, ecs::entity player, const std::string& spritePath)
+bool CopyAppearanceFrom(entt::registry& world, entt::entity player, const std::string& spritePath)
 {
-    // Disguise the player as an NPC by swapping in that NPC's walking sheet.
     TextureStore* textures = TexturesOf(world);
     if (textures == nullptr)
     {
-        Logger::Error(LOG_SUBSYSTEM, "CopyAppearanceFrom called with no TextureStore in globals");
+        Logger::Error(LOG_SUBSYSTEM,
+                      "CopyAppearanceFrom called with no TextureStore in the registry context");
         return false;
     }
 
-    // NPC sheets have only a walking sprite; running/bicycle auto-restore the
-    // original, so only the walking sheet needs replacing.
+    // NPC disguise supplies walking only; run and bicycle restore the original sheets.
     const TextureHandle disguise = textures->Acquire(spritePath);
     if (!textures->IsValid(disguise))
     {
@@ -157,14 +152,14 @@ bool CopyAppearanceFrom(ecs::registry& world, ecs::entity player, const std::str
     return true;
 }
 
-void RestoreOriginalAppearance(ecs::registry& world, ecs::entity player)
+void RestoreOriginalAppearance(entt::registry& world, entt::entity player)
 {
     auto& appearance = world.get<Appearance>(player);
     if (!appearance.usingCopiedAppearance)
     {
         return;
     }
-    // Reload original character sprites - only clear the flag on success.
+
     if (SwitchCharacter(world, player, appearance.characterType))
     {
         world.get<Appearance>(player).usingCopiedAppearance = false;
@@ -176,10 +171,8 @@ void RestoreOriginalAppearance(ecs::registry& world, ecs::entity player)
     }
 }
 
-void UploadTextures(const ecs::registry& world, ecs::entity player, IRenderer& renderer)
+void UploadTextures(const entt::registry& world, entt::entity player, IRenderer& renderer)
 {
-    // Re-push the player's three sheets to the GPU; needed after a character switch
-    // or a renderer/backend swap (which drops previously uploaded textures).
     TextureStore* textures = TexturesOf(world);
     if (textures == nullptr)
     {
@@ -191,16 +184,13 @@ void UploadTextures(const ecs::registry& world, ecs::entity player, IRenderer& r
     renderer.UploadTexture(textures->Get(sprite.bicycle));
 }
 
-void SetAtlasBinding(ecs::registry& world,
-                     ecs::entity player,
+void SetAtlasBinding(entt::registry& world,
+                     entt::entity player,
                      const Texture* atlasTex,
                      glm::vec2 walkOffset,
                      glm::vec2 runOffset,
                      glm::vec2 bicycleOffset)
 {
-    // Point the player's sprite at a shared atlas plus per-mode pixel offsets; the
-    // render path folds these offsets into the sampled UVs. A null atlas reverts to
-    // the per-player walk/run/bicycle sheets.
     auto& sprite = world.get<PlayerSprite>(player);
     sprite.atlas = atlasTex;
     sprite.atlasWalkOffset = walkOffset;
@@ -208,30 +198,27 @@ void SetAtlasBinding(ecs::registry& world,
     sprite.atlasBicycleOffset = bicycleOffset;
 }
 
-// Sheet accessors: resolve a handle through the globals TextureStore, falling back
-// to the shared empty texture when no store is bound (e.g. headless test worlds).
-const Texture& GetSpriteSheet(const ecs::registry& world, const PlayerSprite& sprite)
+const Texture& GetSpriteSheet(const entt::registry& world, const PlayerSprite& sprite)
 {
     TextureStore* textures = TexturesOf(world);
     return (textures != nullptr) ? textures->Get(sprite.walk) : EmptyPlayerTexture();
 }
 
-const Texture& GetRunningSpriteSheet(const ecs::registry& world, const PlayerSprite& sprite)
+const Texture& GetRunningSpriteSheet(const entt::registry& world, const PlayerSprite& sprite)
 {
     TextureStore* textures = TexturesOf(world);
     return (textures != nullptr) ? textures->Get(sprite.run) : EmptyPlayerTexture();
 }
 
-const Texture& GetBicycleSpriteSheet(const ecs::registry& world, const PlayerSprite& sprite)
+const Texture& GetBicycleSpriteSheet(const entt::registry& world, const PlayerSprite& sprite)
 {
     TextureStore* textures = TexturesOf(world);
     return (textures != nullptr) ? textures->Get(sprite.bicycle) : EmptyPlayerTexture();
 }
 
-void Update(ecs::registry& world, ecs::entity player, float deltaTime)
+void Update(entt::registry& world, entt::entity player, float deltaTime)
 {
-    // Per-frame cosmetic advance only: velocity-driven walk cadence + smooth
-    // elevation lerp. Positional movement is applied separately in Move().
+    // Advance cosmetic state here; Move applies positional movement separately.
     auto& anim = world.get<AnimationState>(player);
     auto& elev = world.get<Elevation>(player);
     PlayerMovementSystem::UpdateAnimation(anim,
@@ -242,16 +229,15 @@ void Update(ecs::registry& world, ecs::entity player, float deltaTime)
     CharacterKinematics::UpdateElevation(elev, deltaTime);
 }
 
-void Move(ecs::registry& world,
-          ecs::entity player,
+void Move(entt::registry& world,
+          entt::entity player,
           glm::vec2 direction,
           float deltaTime,
           const Tilemap* tilemap,
           const std::vector<CharacterCollisionBody>* npcBodies)
 {
-    // Fan the player's components out to the stateless movement step. Collision
-    // response and per-frame hysteresis (slide / lane-snap / stuck recovery) are
-    // threaded through the PlayerMovementState component, not held here.
+    // The component retains collision hysteresis between calls; this wrapper owns no movement
+    // State.
     PlayerMovementSystem::Step(world.get<Transform>(player),
                                world.get<Motor>(player),
                                world.get<Facing>(player),
@@ -268,29 +254,25 @@ void Move(ecs::registry& world,
                                npcBodies);
 }
 
-void Stop(ecs::registry& world, ecs::entity player)
+void Stop(entt::registry& world, entt::entity player)
 {
-    // Halt motion and drop back to the idle animation frame.
     PlayerMovementSystem::Stop(world.get<AnimationState>(player),
                                world.get<PlayerInputState>(player),
                                world.get<PlayerModes>(player),
                                world.get<Motor>(player));
 }
 
-void SetTilePosition(ecs::registry& world, ecs::entity player, int tileX, int tileY)
+void SetTilePosition(entt::registry& world, entt::entity player, int tileX, int tileY)
 {
-    // Snap the feet anchor to the tile's bottom-center, then reset the motor so no
-    // residual velocity or stop-target carries across the teleport.
-    // NOTE: tile size is hardcoded 16px here; everywhere else it comes from the
-    // project manifest (tileWidth/tileHeight), so non-16px projects would mis-snap.
+    // Clear the latched motor target so a teleport cannot pull the player back toward its old grid
+    // stop.
     world.get<Transform>(player).position = TileMath::TileFeetCenter(tileX, tileY, 16.0f);
     MotionSystem::Reset(world.get<Motor>(player));
 }
 
-void SetPositionRaw(ecs::registry& world, ecs::entity player, glm::vec2 pos)
+void SetPositionRaw(entt::registry& world, entt::entity player, glm::vec2 pos)
 {
-    // Exact-position variant (no tile snapping); used by dialogue alignment to place
-    // the player precisely. Also resets the motor, like SetTilePosition.
+    // Dialogue alignment needs exact feet positions without tile snapping.
     world.get<Transform>(player).position = pos;
     MotionSystem::Reset(world.get<Motor>(player));
 }
