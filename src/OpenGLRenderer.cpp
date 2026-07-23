@@ -1,40 +1,14 @@
-// OpenGLRenderer - OpenGL 4.6 backend: four batch types, one shader, one post-FX chain.
+// Each flush establishes its own GL state; error exits need not restore it.
+
 //
-// @author Alex (https://github.com/lextpf)
-// Reading order and the two invariants that explain most of the code:
-//
-// 1. four batches, one program. Sprites, rects, particles and text accumulate into
-//    separate vertex vectors but are drawn with the same m_ShaderProgram, switched by
-//    the `useColorOnly` uniform (0 = texture, 1 = uniform color, 2 = vertex color,
-//    3 = texture x vertex color). Because the uniform is global, geometry of one type
-//    must be flushed before another type's state is set - hence the
-//    "BatchTypeChange(x<-y)" drains at the top of the Draw* entry points, and hence
-//    an interleaved draw order costs draw calls. A batch also ends on texture change,
-//    blend-mode change, buffer-full, and at BeginScene / EndSceneApplyPostFX /
-//    EndFrame.
-//
-//    Text is the exception worth remembering: it does not flush per DrawText call.
-//    Consecutive DrawText calls sharing an atlas accumulate into a single draw.
-//
-// 2. every Flush* owns its GL state. Each one sets the program, blend func, uniforms
-//    and buffers it needs at entry and restores nothing on the way out, because its
-//    error-return paths can skip a restore and the next flush must not inherit a
-//    half-set state. Two exits are deliberate exceptions: FlushBatch3D turns the
-//    depth test off and the depth mask on before returning (the 2D paths know
-//    nothing about depth, and the mask gates glClear in BeginScene), and
-//    EndSceneApplyPostFX restores alpha blending for the UI drawn after it.
-//
-// Frame shape:
+// FlushBatch3D restores depth writes and disables depth testing for 2D draws.
+// EndSceneApplyPostFX restores alpha blending for UI.
 //
 //   BeginFrame -> BeginScene [binds RGB16F scene FBO]
 //              -> world/sky/particle draws (batched)
 //              -> EndSceneApplyPostFX [bloom mip chain + composite to swapchain]
 //              -> UI draws (straight to swapchain, ungraded, ungrained)
 //              -> EndFrame
-//
-// To see where the draw calls go, enable DrawTracer (console
-// `renderer.trace`) for a labelled per-frame log, or SetDebugDrawSleep to watch the
-// frame assemble one batch at a time.
 
 #include "OpenGLRenderer.hpp"
 
@@ -57,7 +31,6 @@ namespace
 {
 constexpr const char* LOG_SUBSYSTEM = "Render";
 
-// Per-draw-call debug visualization state.
 bool s_DebugDrawSleep = false;
 GLFWwindow* s_DebugWindow = nullptr;
 int s_DebugDrawCallIndex = 0;
@@ -79,8 +52,6 @@ bool IsDebugDrawSleepEnabled()
     return s_DebugDrawSleep;
 }
 
-// Step-through debug aid: pushes the partially-drawn frame to the screen and
-// pauses, so each draw call can be watched landing in submission order.
 static void DebugAfterDraw(const char* label, int count)
 {
     if (s_DebugDrawSleep && s_DebugWindow)
@@ -97,8 +68,8 @@ unsigned int OpenGLRenderer::EnsureTextureReady(const Texture& texture)
 {
     unsigned int texID = texture.GetID();
     const std::uint64_t currentGen = Texture::GetCurrentOpenGLContextGeneration();
-    // A renderer/context hot-swap invalidates every GL texture id; a generation
-    // mismatch (or id 0) means this one is stale, so rebuild it from its CPU copy.
+    // Context generations invalidate GL texture ids; rebuild stale textures from retained CPU
+    // pixels.
     if (texture.GetOpenGLContextGeneration() != currentGen || texID == 0)
     {
         texture.RecreateOpenGLTexture();
@@ -120,7 +91,7 @@ OpenGLRenderer::OpenGLRenderer()
       m_ColorLoc(-1),
       m_AlphaLoc(-1),
       m_AmbientColorLoc(-1),
-      m_AmbientColor(1.0f, 1.0f, 1.0f),  // White = full bright.
+      m_AmbientColor(1.0f, 1.0f, 1.0f),
       m_BatchVAO(0),
       m_BatchVBO(0),
       m_CurrentBatchTexture(0),
@@ -181,7 +152,7 @@ void OpenGLRenderer::Shutdown()
     }
 #endif
 
-    // Reset handles to 0 to prevent double-deletion.
+    // Clear deleted handles so repeated shutdown is safe.
     if (m_VAO != 0)
     {
         glDeleteVertexArrays(1, &m_VAO);
@@ -291,7 +262,6 @@ std::string OpenGLRenderer::LoadShaderFromFile(const std::string& filepath)
     std::ifstream file(filepath);
     if (!file.is_open())
     {
-        // Fall back to parent directory.
         std::string parentPath = "../" + filepath;
         file.open(parentPath);
         if (!file.is_open())
@@ -387,7 +357,6 @@ bool OpenGLRenderer::InitPostFXShaders()
         return false;
     }
 
-    // Composite (PostFXComposite.frag) uniforms.
     m_PostULoc_Scene = glGetUniformLocation(m_PostProgram, "uScene");
     m_PostULoc_Bloom = glGetUniformLocation(m_PostProgram, "uBloom");
     m_PostULoc_BloomIntensity = glGetUniformLocation(m_PostProgram, "uBloomIntensity");
@@ -407,7 +376,6 @@ bool OpenGLRenderer::InitPostFXShaders()
     m_PostULoc_TonemapKnee = glGetUniformLocation(m_PostProgram, "uTonemapKnee");
     m_PostULoc_Enabled = glGetUniformLocation(m_PostProgram, "uPostFXEnabled");
 
-    // Bloom prep uniforms.
     m_BloomThresholdULoc_Scene = glGetUniformLocation(m_BloomThresholdProgram, "uScene");
     m_BloomThresholdULoc_SatThreshold =
         glGetUniformLocation(m_BloomThresholdProgram, "uSatThreshold");
@@ -440,7 +408,7 @@ void OpenGLRenderer::EnsureSceneFramebuffer(int width, int height)
 
     glGenTextures(1, &m_SceneColorTex);
     glBindTexture(GL_TEXTURE_2D, m_SceneColorTex);
-    // HDR float target (RGB16F) so highlights keep values >1.0 for bloom threshold + tonemapping.
+    // RGB16F preserves highlights above 1 for bloom and tonemapping.
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -468,7 +436,6 @@ void OpenGLRenderer::EnsureSceneFramebuffer(int width, int height)
 
 void OpenGLRenderer::EnsureBloomFramebuffers(int width, int height)
 {
-    // Mip 0 is half scene resolution; each subsequent mip is half the previous.
     int mip0W = std::max(1, width / 2);
     int mip0H = std::max(1, height / 2);
 
@@ -492,8 +459,7 @@ void OpenGLRenderer::EnsureBloomFramebuffers(int width, int height)
         glBindFramebuffer(GL_FRAMEBUFFER, m_BloomMipFBO[i]);
         glBindTexture(GL_TEXTURE_2D, m_BloomMipTex[i]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_FLOAT, nullptr);
-        // Linear filtering is essential - the downsample/upsample shaders sample
-        // at fractional offsets to combine multiple texels per fetch.
+        // Fractional shader offsets require linear filtering.
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -551,8 +517,7 @@ void OpenGLRenderer::BeginScene()
 {
     if (m_ViewportWidth <= 0 || m_ViewportHeight <= 0)
     {
-        // Game::Render hasn't called SetViewport yet - bail and keep rendering to
-        // the swapchain. EndSceneApplyPostFX will short-circuit on m_SceneBound.
+        // No viewport yet; retain direct swapchain rendering.
         return;
     }
 
@@ -564,7 +529,8 @@ void OpenGLRenderer::BeginScene()
         return;
     }
 
-    // Flush straggling batch state from the previous frame's UI before swapping FBOs.
+    // Drain queued world batches before changing the scene target; UI leftovers must not enter the
+    // new scene.
     PrepFlushReason("BeginScene");
     FlushBatch();
     PrepFlushReason("BeginScene");
@@ -577,10 +543,7 @@ void OpenGLRenderer::BeginScene()
     glBindFramebuffer(GL_FRAMEBUFFER, m_SceneFBO);
     glViewport(0, 0, m_SceneFBOWidth, m_SceneFBOHeight);
 
-    // The scene FBO's depth attachment persists between frames, so it must be
-    // cleared before any depth-tested geometry is submitted. Depth writes have to
-    // be enabled for the clear to take effect - glDepthMask gates glClear too,
-    // and the 3D flush leaves the mask restored but the test disabled.
+    // Depth writes must be enabled for glClear to clear the persistent scene depth attachment.
     glDepthMask(GL_TRUE);
     glClear(GL_DEPTH_BUFFER_BIT);
 
@@ -601,7 +564,6 @@ void OpenGLRenderer::RunBloomPrep()
     glBindVertexArray(m_PostVAO);
     glActiveTexture(GL_TEXTURE0);
 
-    // Step 1: threshold pass into mip[0].
     glDisable(GL_BLEND);
     glViewport(0, 0, m_BloomMipWidth[0], m_BloomMipHeight[0]);
     glBindFramebuffer(GL_FRAMEBUFFER, m_BloomMipFBO[0]);
@@ -612,7 +574,6 @@ void OpenGLRenderer::RunBloomPrep()
     glUniform1f(m_BloomThresholdULoc_SatThreshold, ambience::BLOOM_SATURATION_THRESHOLD);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    // Step 2: downsample chain. Each pass reads from the previous mip.
     glUseProgram(m_BloomDownProgram);
     glUniform1i(m_BloomDownULoc_Input, 0);
     for (int i = 1; i < kBloomMipLevels; ++i)
@@ -621,14 +582,15 @@ void OpenGLRenderer::RunBloomPrep()
         glBindFramebuffer(GL_FRAMEBUFFER, m_BloomMipFBO[i]);
         glClear(GL_COLOR_BUFFER_BIT);
         glBindTexture(GL_TEXTURE_2D, m_BloomMipTex[i - 1]);
-        // Texel size of the source mip, the one being sampled.
+
         glUniform2f(m_BloomDownULoc_SrcTexelSize,
                     1.0f / static_cast<float>(m_BloomMipWidth[i - 1]),
                     1.0f / static_cast<float>(m_BloomMipHeight[i - 1]));
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
 
-    // Step 3: upsample chain. Additively combine each mip into the next-finer one.
+    // Add each coarse mip into the next finer mip so broad bloom contributes to the final
+    // half-size image.
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE);
     glUseProgram(m_BloomUpProgram);
@@ -644,13 +606,9 @@ void OpenGLRenderer::RunBloomPrep()
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
 
-    // Final bloom is in mip[0]. Restore non-additive blending.
     glDisable(GL_BLEND);
 }
 
-// Composite the offscreen scene through the post chain into the swapchain. Bails
-// when BeginScene never bound the FBO, so a frame drawn straight to the swapchain
-// is left alone rather than being composited from an unbound target.
 void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
 {
     if (!m_SceneBound)
@@ -658,8 +616,7 @@ void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
         return;
     }
 
-    // Ensure all world rendering inside the scene FBO has flushed before the
-    // composite samples the color attachment.
+    // Flush scene draws before sampling its color attachment.
     PrepFlushReason("EndScene");
     FlushBatch();
     PrepFlushReason("EndScene");
@@ -671,7 +628,6 @@ void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
 
     RunBloomPrep();
 
-    // Composite to the default framebuffer (swapchain).
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, m_ViewportWidth, m_ViewportHeight);
     glDisable(GL_BLEND);
@@ -683,12 +639,10 @@ void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
     glBindTexture(GL_TEXTURE_2D, m_SceneColorTex);
     glUniform1i(m_PostULoc_Scene, 0);
 
-    // Final bloom result is in mip[0] after the upsample chain.
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, m_BloomMipTex[0]);
     glUniform1i(m_PostULoc_Bloom, 1);
 
-    // Bloom + grading.
     glUniform1f(m_PostULoc_BloomIntensity, params.bloomIntensity);
     glUniform3f(m_PostULoc_Lift,
                 params.gradingParams.lift.r,
@@ -704,7 +658,6 @@ void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
                 params.gradingParams.gain.b);
     glUniform1f(m_PostULoc_Saturation, params.saturation);
 
-    // Lens character.
     glUniform1f(m_PostULoc_CAStrength, ambience::CA_STRENGTH);
     glUniform1f(m_PostULoc_VignetteIntensity, params.vignetteIntensity);
     glUniform1f(m_PostULoc_VignetteInnerR, ambience::VIGNETTE_INNER_R);
@@ -712,20 +665,16 @@ void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
     glUniform1f(m_PostULoc_VignetteAspectY, ambience::VIGNETTE_ASPECT_Y_SCALE);
     glUniform1f(m_PostULoc_EdgeDesat, ambience::VIGNETTE_EDGE_DESAT);
 
-    // Grain.
     glUniform1f(m_PostULoc_GrainIntensity, params.grainIntensity);
     glUniform1f(m_PostULoc_GrainChromaMix, ambience::GRAIN_CHROMA_MIX);
     glUniform1f(m_PostULoc_Time, params.time);
 
-    // Tonemap.
     glUniform1f(m_PostULoc_TonemapKnee, ambience::TONEMAP_KNEE);
 
-    // Master gate. When false the shader early-returns the raw scene.
     glUniform1i(m_PostULoc_Enabled, params.postFXEnabled ? 1 : 0);
 
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    // Restore default state for subsequent UI rendering.
     glActiveTexture(GL_TEXTURE0);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -737,20 +686,19 @@ void OpenGLRenderer::EndSceneApplyPostFX(const PostFXParams& params)
 
 bool OpenGLRenderer::Init()
 {
-    // Order: geometry buffers, textures, then shaders.
     SetupQuad();
     CreateWhiteTexture();
 
 #ifdef USE_FREETYPE
-    // Project-configured fonts first, then defaults.
+
     std::vector<std::string> fontCandidates = m_FontCandidates;
     if (fontCandidates.empty())
     {
         fontCandidates.push_back("assets/fonts/c8ab67e0-519a-49b5-b693-e8fc86d08efa.ttf");
     }
 #ifdef _WIN32
-    fontCandidates.push_back("C:/Windows/Fonts/segoeui.ttf");  // Fallback
-    fontCandidates.push_back("C:/Windows/Fonts/arial.ttf");    // Fallback
+    fontCandidates.push_back("C:/Windows/Fonts/segoeui.ttf");
+    fontCandidates.push_back("C:/Windows/Fonts/arial.ttf");
 #endif
 
     bool fontLoaded = false;
@@ -838,7 +786,6 @@ bool OpenGLRenderer::Init()
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
 
-    // Cache uniform locations.
     m_ModelLoc = glGetUniformLocation(m_ShaderProgram, "model");
     m_ProjectionLoc = glGetUniformLocation(m_ShaderProgram, "projection");
     m_ColorLoc = glGetUniformLocation(m_ShaderProgram, "spriteColor");
@@ -848,9 +795,7 @@ bool OpenGLRenderer::Init()
 
     glUseProgram(m_ShaderProgram);
 
-    // World-space 3D program. A failure here is not fatal: nothing draws through
-    // DrawQuad3D until the world geometry path is switched over, and the 2D path
-    // above is fully functional on its own.
+    // A failed 3D shader disables world geometry; the 2D path can still draw.
     {
         const std::string vert3D = LoadShaderFromFile("shaders/Geometry3D.vert");
         const std::string frag3D = LoadShaderFromFile("shaders/Geometry3D.frag");
@@ -873,9 +818,9 @@ bool OpenGLRenderer::Init()
                 m_Ambient3DLoc = glGetUniformLocation(m_Geometry3DProgram, "ambientColor");
                 m_AlphaCutoff3DLoc = glGetUniformLocation(m_Geometry3DProgram, "alphaCutoff");
                 SetupBatch3DBuffers();
-                // A -1 here means the uniform was optimised out or misnamed, and
-                // the symptom would be an invisible world rather than an error -
-                // so it is worth stating plainly in the log.
+
+                // Log missing uniform locations: OpenGL silently ignores writes to -1, which can
+                // leave world geometry invisible.
                 Logger::DebugF(LOG_SUBSYSTEM,
                                "Geometry3D program={} viewProjection={} ambientColor={} "
                                "alphaCutoff={}",
@@ -889,15 +834,12 @@ bool OpenGLRenderer::Init()
 
     if (!InitPostFXShaders())
     {
-        // Not graceful degradation: the composite path is unguarded, so a missing
-        // program means the scene stays in the FBO and the screen stays blank.
+        // The unguarded composite requires valid shaders or the scene remains offscreen.
         Logger::Warn(LOG_SUBSYSTEM,
                      "Post-FX shaders failed to compile - the scene will not be composited to "
                      "the screen");
     }
 
-    // Populate RendererInfo for GetBackendInfo. Uses the caller's current GL
-    // context; safe at end of Init.
     m_Info.backendName = "OpenGL";
     if (auto* s = reinterpret_cast<const char*>(glGetString(GL_VERSION)); s != nullptr)
     {
@@ -926,19 +868,8 @@ RendererInfo OpenGLRenderer::GetBackendInfo() const
 
 void OpenGLRenderer::SetAmbientColor(const glm::vec3& color)
 {
-    // Ambient is a deferred uniform: FlushBatch() bakes the current m_AmbientColor
-    // into the sprite shader at flush time, and the sprite batch flushes lazily
-    // (on texture/batch-type change). Changing the color without draining the
-    // pending batch retroactively recolors already-queued sprites - e.g. the sky
-    // pass sets ambient to white while night foreground tiles are still queued,
-    // so the sky's first atlas draw flushes them at white and they flash to "day".
-    // Drain first so queued geometry keeps the ambient that was live when drawn.
-    //
-    // Only the sprite batch is drained here. Ambient-sensitive batches are the
-    // sprite batch (mode 0) and the 3D batch, whose FlushBatch3D reads
-    // m_AmbientColor at flush time in the same way - so pending world-space
-    // geometry can still be recolored by this call. Rects (mode 2) and
-    // particles/text (mode 3) ignore ambientColor entirely.
+    // Flush sprites before ambient changes; pending 3D batches still read ambient at their later
+    // flush.
     if (color == m_AmbientColor)
         return;
     PrepFlushReason("AmbientColorChange");
@@ -957,14 +888,12 @@ void OpenGLRenderer::BeginFrame()
     m_CurrentTextAtlas = 0;
     m_DrawCallCount = 0;
 
-    // Roll the draw-call trace: stash the just-finished frame in "last frame"
-    // (renderer.trace dumps from there) and clear the live buffer.
+    // Publish the finished trace before clearing this frame's entries.
     DrawTracer::BeginFrame();
 }
 
 void OpenGLRenderer::EndFrame()
 {
-    // Flush any remaining batched world quads, sprites, rects, particles, and text.
     PrepFlushReason("EndFrame");
     FlushBatch3D();
     PrepFlushReason("EndFrame");
@@ -990,7 +919,7 @@ void OpenGLRenderer::SetupBatch3DBuffers()
         nullptr,
         GL_DYNAMIC_DRAW);
 
-    // location 0: vec3 scene position, 1: vec2 uv, 2: vec4 rgba.
+    // Location 0: vec3 scene position, 1: vec2 uv, 2: vec4 rgba.
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(BatchVertex3D), (void*)0);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(
@@ -1024,9 +953,7 @@ void OpenGLRenderer::ApplyPass3DState(renderModes::BlendMode blend, renderModes:
             break;
 
         case renderModes::DepthMode::TestOnly:
-            // Translucent geometry reads depth so it is correctly hidden behind
-            // solid things, but must not write it - otherwise a nearer
-            // translucent quad would occlude a farther one drawn after it.
+            // Translucent quads test depth without writing it, so later quads remain visible.
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
             glDepthMask(GL_FALSE);
@@ -1062,14 +989,14 @@ void OpenGLRenderer::FlushBatch3D()
     }
     if (m_Ambient3DLoc >= 0)
     {
-        glUniform3f(m_Ambient3DLoc, m_AmbientColor.r, m_AmbientColor.g, m_AmbientColor.b);
+        // Self-lit geometry uses neutral ambient so authored colors survive night lighting.
+        const glm::vec3 ambient =
+            (m_Batch3DLight == renderModes::LightMode::SelfLit) ? glm::vec3(1.0f) : m_AmbientColor;
+        glUniform3f(m_Ambient3DLoc, ambient.r, ambient.g, ambient.b);
     }
     if (m_AlphaCutoff3DLoc >= 0)
     {
-        // Only the depth-writing pass cuts out: a discarded fragment writes no
-        // depth, which is exactly what makes sorting unnecessary there. The
-        // translucent pass must keep every partially transparent texel, so it
-        // uses a cutoff low enough to drop only fully empty ones.
+        // Depth-writing passes discard cutout texels; translucent passes discard only empty texels.
         const float cutoff = (m_Batch3DDepth == renderModes::DepthMode::TestAndWrite)
                                  ? renderModes::OPAQUE_ALPHA_CUTOFF
                                  : 1.0f / 255.0f;
@@ -1116,7 +1043,7 @@ void OpenGLRenderer::FlushBatch3D()
         const std::string_view depthName =
             EnumTraits<renderModes::DepthMode>::ToString(m_Batch3DDepth);
         char buf[128];
-        // %.*s, not %s: a string_view's data() carries no null-terminator guarantee.
+        // string_view is not necessarily null-terminated; bound the conversion with %.*s.
         std::snprintf(buf,
                       sizeof(buf),
                       "flush quad3D (%s) %zu verts tex=%u blend=%.*s depth=%.*s",
@@ -1130,8 +1057,7 @@ void OpenGLRenderer::FlushBatch3D()
         DrawTracer::Mark(buf, m_DrawCallCount);
     }
 
-    // Leave depth off so the untouched 2D paths, which know nothing about depth,
-    // behave exactly as they always have.
+    // Restore depth state for the 2D paths and the next scene clear.
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
 
@@ -1149,16 +1075,15 @@ void OpenGLRenderer::DrawQuad3D(const Texture& texture,
                                 renderModes::DepthMode depth,
                                 bool flipY,
                                 bool tileFlipX,
-                                bool tileFlipY)
+                                bool tileFlipY,
+                                renderModes::LightMode light)
 {
     if (m_Geometry3DProgram == 0)
     {
         return;
     }
 
-    // Drain the 2D batches first, so anything queued before this quad renders
-    // underneath it and call-site insertion order is preserved across the
-    // 2D/3D boundary.
+    // Drain 2D batches to preserve order across the geometry boundary.
     if (!m_BatchVertices.empty())
     {
         PrepFlushReason("BatchTypeChange(quad3D<-sprite)");
@@ -1181,13 +1106,9 @@ void OpenGLRenderer::DrawQuad3D(const Texture& texture,
         return;
     }
 
-    // Texture, blend mode and depth mode are all pipeline state, so any change
-    // ends the batch. Within one pass the caller controls how often that happens
-    // by grouping submissions per texture - which the opaque pass is free to do
-    // in any order, because the depth buffer resolves occlusion rather than
-    // submission sequence.
-    const bool stateChanged =
-        m_CurrentBatch3DTexture != texID || m_Batch3DBlend != blend || m_Batch3DDepth != depth;
+    // Flush before any texture, blend, depth or light change.
+    const bool stateChanged = m_CurrentBatch3DTexture != texID || m_Batch3DBlend != blend ||
+                              m_Batch3DDepth != depth || m_Batch3DLight != light;
     if (!m_Batch3DVertices.empty() && stateChanged)
     {
         PrepFlushReason("StateChange(quad3D)");
@@ -1203,6 +1124,7 @@ void OpenGLRenderer::DrawQuad3D(const Texture& texture,
     m_CurrentBatch3DTexture = texID;
     m_Batch3DBlend = blend;
     m_Batch3DDepth = depth;
+    m_Batch3DLight = light;
 
     const float texW = static_cast<float>(texture.GetWidth());
     const float texH = static_cast<float>(texture.GetHeight());
@@ -1211,9 +1133,7 @@ void OpenGLRenderer::DrawQuad3D(const Texture& texture,
         return;
     }
 
-    // UV derivation deliberately matches the 2D sprite path: both take
-    // the same [TL, TR, BR, BL] corner order, so atlas handling stays in one
-    // shape across the 2D and 3D paths.
+    // Keep TL, TR, BR, BL UV ordering identical to the flat sprite path.
     float u0 = texCoord.x / texW;
     float u1 = (texCoord.x + texSize.x) / texW;
 
@@ -1221,8 +1141,8 @@ void OpenGLRenderer::DrawQuad3D(const Texture& texture,
     float v1 = 0.0f;
     if (flipY)
     {
-        v0 = (texH - (texCoord.y + texSize.y)) / texH;  // bottom verts (BL/BR)
-        v1 = (texH - texCoord.y) / texH;                // top verts (TL/TR)
+        v0 = (texH - (texCoord.y + texSize.y)) / texH;  // Bottom verts (BL/BR)
+        v1 = (texH - texCoord.y) / texH;                // Top verts (TL/TR)
     }
     else
     {
@@ -1270,8 +1190,7 @@ void OpenGLRenderer::DrawQuad3D(const Texture& texture,
 
 void OpenGLRenderer::SetViewProjection(const glm::mat4& viewProjection)
 {
-    // Geometry queued under the previous matrix must not be drawn with the new
-    // one, so the pending 3D batch ends here.
+    // Flush geometry queued under the previous matrix.
     PrepFlushReason("SetViewProjection");
     FlushBatch3D();
     m_ViewProjection = viewProjection;
@@ -1279,9 +1198,7 @@ void OpenGLRenderer::SetViewProjection(const glm::mat4& viewProjection)
 
 void OpenGLRenderer::SetProjection(const glm::mat4& projection)
 {
-    // Flush pending batches first so world-space sprites don't get drawn with
-    // UI projection (or vice versa). Text matters too: a HUD string queued
-    // under one projection must not render with another.
+    // Flush all batches before switching world/UI projection.
     PrepFlushReason("SetProjection");
     FlushBatch();
     PrepFlushReason("SetProjection");
@@ -1290,9 +1207,9 @@ void OpenGLRenderer::SetProjection(const glm::mat4& projection)
     FlushParticleBatch();
     PrepFlushReason("SetProjection");
     FlushTextBatch();
-    // The 3D path has its own matrix, but it shares the frame's painter order:
-    // world geometry queued before a projection switch must land before the UI
-    // that switch is preparing for.
+
+    // Flush 3D geometry before installing the UI projection to preserve submission order across
+    // paths.
     PrepFlushReason("SetProjection");
     FlushBatch3D();
     m_Projection = projection;
@@ -1301,8 +1218,7 @@ void OpenGLRenderer::SetProjection(const glm::mat4& projection)
 void OpenGLRenderer::SetViewport(int x, int y, int width, int height)
 {
     glViewport(x, y, width, height);
-    // Track the size so BeginScene() can match it. Deferred so it does not
-    // recreate FBO GL resources mid-frame.
+    // Defer FBO resizing to BeginScene to avoid reallocating during a frame.
     m_ViewportWidth = width;
     m_ViewportHeight = height;
 }
@@ -1315,7 +1231,8 @@ void OpenGLRenderer::Clear(float r, float g, float b, float a)
 
 void OpenGLRenderer::UploadTexture(const Texture& texture)
 {
-    // Recreate only if the texture isn't from the active GL context generation.
+    // Renderer switches invalidate IDs by context generation; reuse only textures from this
+    // context.
     const std::uint64_t currentGen = Texture::GetCurrentOpenGLContextGeneration();
     if (texture.GetID() == 0 || texture.GetOpenGLContextGeneration() != currentGen)
     {
@@ -1325,10 +1242,8 @@ void OpenGLRenderer::UploadTexture(const Texture& texture)
 
 void OpenGLRenderer::SetupQuad()
 {
-    // Unit quad (0,0)-(1,1). Uploaded here but never bound for a draw; all sprites
-    // go through the batch VAO set up below.
-    // Each vertex: 4 floats - position (x,y) then UV (u,v).
-    float vertices[] = {                          // pos      // tex
+    // Unit quad layout is position XY then UV; draws use the batch vaos instead.
+    float vertices[] = {                          // Pos      // tex
                         0.0f, 1.0f, 0.0f, 1.0f,   // Bottom-left
                         1.0f, 0.0f, 1.0f, 0.0f,   // Top-right
                         0.0f, 0.0f, 0.0f, 0.0f,   // Top-left
@@ -1349,15 +1264,13 @@ void OpenGLRenderer::SetupQuad()
 
     glBindVertexArray(m_VAO);
 
-    // Static buffer - unit quad never changes.
     glBindBuffer(GL_ARRAY_BUFFER, m_VBO);
     glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
-    // Vertex attribs: 0=pos(2f@0), 1=UV(2f@8), 2=color disabled here (only
-    // colored rect / particle batches use it).
+    // Attributes: 0 = position, 1 = UV, 2 disabled without vertex color.
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
@@ -1366,20 +1279,17 @@ void OpenGLRenderer::SetupQuad()
 
     glBindVertexArray(0);
 
-    // Text batches dynamically: every glyph in a DrawText call is uploaded at once
-    // and drawn in a single call (outline strokes + foreground share one stream).
+    // Outline and foreground glyphs share one vertex stream and atlas, so both can flush together.
     glGenVertexArrays(1, &m_TextVAO);
     glGenBuffers(1, &m_TextVBO);
 
     glBindVertexArray(m_TextVAO);
     glBindBuffer(GL_ARRAY_BUFFER, m_TextVBO);
 
-    // Pre-allocate buffer for text quads (6 vertices per character, dynamic for frequent updates)
     glBufferData(
         GL_ARRAY_BUFFER, MAX_TEXT_QUADS * 6 * sizeof(TextVertex), nullptr, GL_DYNAMIC_DRAW);
 
-    // Text layout: position + texcoord + per-vertex RGBA. Per-vertex color lets
-    // one DrawText call submit outline and foreground in a single draw.
+    // Per-vertex RGBA allows different outline and foreground colors in one draw.
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(TextVertex), (void*)0);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(TextVertex), (void*)(2 * sizeof(float)));
@@ -1390,19 +1300,17 @@ void OpenGLRenderer::SetupQuad()
     glBindVertexArray(0);
     m_TextBatchVertices.reserve(MAX_TEXT_QUADS * 6);
 
-    // Sprite batch: sprites with the same texture collapse into one draw call.
+    // Reserve a sprite stream for consecutive draws that share a texture.
     glGenVertexArrays(1, &m_BatchVAO);
     glGenBuffers(1, &m_BatchVBO);
 
     glBindVertexArray(m_BatchVAO);
     glBindBuffer(GL_ARRAY_BUFFER, m_BatchVBO);
 
-    // Pre-allocate for max batch; dynamic since vertices change every frame.
     size_t batchBufferSize = MAX_BATCH_SPRITES * VERTICES_PER_SPRITE * sizeof(BatchVertex);
     glBufferData(GL_ARRAY_BUFFER, batchBufferSize, nullptr, GL_DYNAMIC_DRAW);
 
-    // Layout: pos(xy) + uv. Sprites use uniform color (no per-vertex color, so
-    // attribute 2 is disabled).
+    // Sprites have uniform color; disable the per-vertex color attribute.
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(BatchVertex), (void*)0);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(
@@ -1412,7 +1320,7 @@ void OpenGLRenderer::SetupQuad()
 
     glBindVertexArray(0);
 
-    // Rect + particle batch (per-vertex color for gradients, fading particles, lights).
+    // Rectangles and particles use per-vertex color for fades and light gradients.
     glGenVertexArrays(1, &m_RectBatchVAO);
     glGenBuffers(1, &m_RectBatchVBO);
 
@@ -1422,7 +1330,6 @@ void OpenGLRenderer::SetupQuad()
     size_t rectBatchBufferSize = MAX_BATCH_SPRITES * VERTICES_PER_SPRITE * sizeof(ColoredVertex);
     glBufferData(GL_ARRAY_BUFFER, rectBatchBufferSize, nullptr, GL_DYNAMIC_DRAW);
 
-    // Layout: pos(xy) + uv + color(rgba).
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(ColoredVertex), (void*)0);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(
@@ -1451,15 +1358,7 @@ void OpenGLRenderer::DrawSprite(
         false);
 }
 
-// Queue a sub-rectangle of a texture into the sprite batch. DrawSprite forwards
-// here with the full texture as the region.
-//
-// `color` is accepted for interface parity only - this backend ignores it. The
-// sprite batch carries position and UV per vertex and no color, and FlushBatch
-// sets spriteColor to white for the whole batch. VulkanRenderer does apply the
-// tint, so the same tinted call differs between backends. DrawSpriteAtlas and
-// DrawSpriteAlpha are the tinting paths here: they route into the per-vertex-color
-// particle batch.
+// OpenGL ignores this color argument; DrawSpriteAlpha and DrawSpriteAtlas support per-vertex tint.
 void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
                                       glm::vec2 position,
                                       glm::vec2 size,
@@ -1494,7 +1393,6 @@ void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
         DrawTracer::Mark(buf, m_DrawCallCount);
     }
 
-    // Switching from rect to sprite batch requires a flush first.
     if (!m_RectBatchVertices.empty())
     {
         PrepFlushReason("BatchTypeChange(sprite<-rect)");
@@ -1505,9 +1403,7 @@ void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
     if (texID == 0)
         return;
 
-    // Texture change forces a flush. Check batch contents (not
-    // m_CurrentBatchTexture != 0) so an invalid texture ID (0) can't
-    // contaminate subsequent sprites in the same batch.
+    // Test queued vertices, not texture id, so an invalid id 0 cannot leak into the next batch.
     if (!m_BatchVertices.empty() && m_CurrentBatchTexture != texID)
     {
         PrepFlushReason("TextureChange");
@@ -1522,17 +1418,14 @@ void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
 
     m_CurrentBatchTexture = texID;
 
-    // Guard division by zero.
     if (texture.GetWidth() == 0 || texture.GetHeight() == 0)
         return;
 
-    // Pixel coords -> normalized UV (0..1).
     float texX = texCoord.x / texture.GetWidth();
     float texY = texCoord.y / texture.GetHeight();
     float texW = texSize.x / texture.GetWidth();
     float texH = texSize.y / texture.GetHeight();
 
-    // Y-flip for OpenGL: GL origin is bottom-left, image data is top-left.
     float finalTexYTop, finalTexYBottom;
     if (flipY)
     {
@@ -1545,14 +1438,13 @@ void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
         finalTexYBottom = texY + texH;
     }
 
-    // No texel offset needed for GL_NEAREST + pixel art.
+    // GL_NEAREST pixel art needs no texel inset.
     float u0 = texX;
     float u1 = texX + texW;
     float vTop = finalTexYTop;
     float vBottom = finalTexYBottom;
 
-    // Per-tile mirror in texture space: swap UVs to flip horizontally (tileFlipX)
-    // or vertically (tileFlipY); independent of the geometry rotation below.
+    // Mirror in UV space before rotating geometry so tile flips do not alter the rotation center.
     if (tileFlipX)
     {
         std::swap(u0, u1);
@@ -1562,7 +1454,6 @@ void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
         std::swap(vTop, vBottom);
     }
 
-    // Local-space corners (origin at sprite top-left).
     glm::vec2 corners[4] = {
         {0.0f, 0.0f},      // Top-left
         {size.x, 0.0f},    // Top-right
@@ -1577,7 +1468,6 @@ void OpenGLRenderer::DrawSpriteRegion(const Texture& texture,
         corners[i] += position;
     }
 
-    // V flipped for OpenGL convention.
     glm::vec2 uvs[4] = {
         {u0, vBottom},  // Top-left corner uses bottom V
         {u1, vBottom},  // Top-right
@@ -1640,11 +1530,6 @@ void OpenGLRenderer::DrawSpriteAtlas(const Texture& texture,
         DrawTracer::Mark(buf, m_DrawCallCount);
     }
 
-    // General path behind DrawSpriteAlpha and atlas draws. Routes into the
-    // per-vertex-color particle batch (not the plain sprite batch) so each vertex
-    // carries its own RGBA tint/alpha.
-
-    // Flush other batch types before switching to the particle batch.
     if (!m_BatchVertices.empty())
     {
         PrepFlushReason("BatchTypeChange(particle<-sprite)");
@@ -1660,9 +1545,7 @@ void OpenGLRenderer::DrawSpriteAtlas(const Texture& texture,
     if (texID == 0)
         return;
 
-    // Flush if texture or blend mode changed. Same rule as sprite batch:
-    // once vertices exist, a texture mismatch must flush even if the previous
-    // texture ID was 0.
+    // Flush populated batches even when the previous texture id was 0.
     if (!m_ParticleBatchVertices.empty() &&
         (m_CurrentParticleTexture != texID || m_ParticleBatchAdditive != additive))
     {
@@ -1691,7 +1574,6 @@ void OpenGLRenderer::DrawSpriteAtlas(const Texture& texture,
         corners[i] += position;
     }
 
-    // UV with OpenGL Y-flip.
     glm::vec2 uvs[4] = {
         {u0, v1},  // Top-left
         {u1, v1},  // Top-right
@@ -1699,7 +1581,6 @@ void OpenGLRenderer::DrawSpriteAtlas(const Texture& texture,
         {u0, v0}   // Bottom-left
     };
 
-    // Two triangles with per-vertex color.
     float r = color.r, g = color.g, b = color.b, a = color.a;
     m_ParticleBatchVertices.push_back({corners[0].x, corners[0].y, uvs[0].x, uvs[0].y, r, g, b, a});
     m_ParticleBatchVertices.push_back({corners[2].x, corners[2].y, uvs[2].x, uvs[2].y, r, g, b, a});
@@ -1717,10 +1598,7 @@ void OpenGLRenderer::FlushBatch()
         return;
     }
 
-    // Drain pending text first so anything queued before the current sprites
-    // renders underneath them, preserving the call-site insertion order.
-    // (Done after the empty check so DrawText's drain-sprite call doesn't
-    // mutually flush the text it is about to accumulate.)
+    // Drain text only after the empty check to avoid mutual text/sprite flushing.
     if (!m_TextBatchVertices.empty())
     {
         const char* savedReason = m_PendingFlushReason;
@@ -1728,8 +1606,7 @@ void OpenGLRenderer::FlushBatch()
         m_PendingFlushReason = savedReason;
     }
 
-    // Texture ID 0 is invalid for sprite sampling in core profile. Drop the
-    // batch rather than accidentally sampling a previously bound texture.
+    // Discard texture id 0 instead of sampling a stale binding.
     if (m_CurrentBatchTexture == 0 || !m_Initialized)
     {
         m_BatchVertices.clear();
@@ -1739,24 +1616,19 @@ void OpenGLRenderer::FlushBatch()
 
     glUseProgram(m_ShaderProgram);
 
-    // Every Flush* owns its GL state; set everything at entry instead of
-    // relying on the previous flush to have restored defaults (its error-return
-    // paths may have skipped the restore).
+    // Set every required state; previous flushes may exit before restoring it.
     if (m_UseColorOnlyLoc >= 0)
-        glUniform1i(m_UseColorOnlyLoc, 0);  // mode 0: sample from bound texture
+        glUniform1i(m_UseColorOnlyLoc, 0);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // Vertices are pre-transformed, so the model matrix is identity.
     glm::mat4 identity = glm::mat4(1.0f);
     glUniformMatrix4fv(m_ModelLoc, 1, GL_FALSE, glm::value_ptr(identity));
     glUniformMatrix4fv(m_ProjectionLoc, 1, GL_FALSE, glm::value_ptr(m_Projection));
-    glUniform3f(m_ColorLoc, 1.0f, 1.0f, 1.0f);  // No tint.
-    glUniform1f(m_AlphaLoc, 1.0f);              // Full opacity.
+    glUniform3f(m_ColorLoc, 1.0f, 1.0f, 1.0f);
+    glUniform1f(m_AlphaLoc, 1.0f);
     glUniform3f(m_AmbientColorLoc, m_AmbientColor.r, m_AmbientColor.g, m_AmbientColor.b);
 
-    // Buffer orphaning: GL_MAP_INVALIDATE_BUFFER_BIT tells the driver the old
-    // contents are not needed, so it can allocate fresh storage instead of stalling
-    // on the in-flight copy.
+    // Orphan the buffer so the driver need not wait for in-flight storage.
     size_t dataSize = m_BatchVertices.size() * sizeof(BatchVertex);
     glBindBuffer(GL_ARRAY_BUFFER, m_BatchVBO);
     void* ptr = glMapBufferRange(
@@ -1780,7 +1652,6 @@ void OpenGLRenderer::FlushBatch()
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_CurrentBatchTexture);
 
-    // Single draw call for all sprites in the batch.
     glBindVertexArray(m_BatchVAO);
     const size_t spriteVertCount = m_BatchVertices.size();
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(spriteVertCount));
@@ -1802,22 +1673,18 @@ void OpenGLRenderer::FlushBatch()
     }
     m_PendingFlushReason = nullptr;
 
-    // Clear texture so the next batch must rebind (prevents stale state).
     m_BatchVertices.clear();
     m_CurrentBatchTexture = 0;
 }
 
 void OpenGLRenderer::CreateWhiteTexture()
 {
-    // 1x1 white texture for colored rects - bind this, and the per-vertex /
-    // uniform color drives the final output.
     glGenTextures(1, &m_WhiteTexture);
     glBindTexture(GL_TEXTURE_2D, m_WhiteTexture);
 
     unsigned char whitePixel[] = {255, 255, 255, 255};
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, whitePixel);
 
-    // Clamp + nearest to prevent border artifacts.
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1850,7 +1717,6 @@ void OpenGLRenderer::DrawColoredRect(glm::vec2 position,
         DrawTracer::Mark(buf, m_DrawCallCount);
     }
 
-    // Switching from sprite to rect mode requires a flush first.
     if (!m_BatchVertices.empty())
     {
         PrepFlushReason("BatchTypeChange(rect<-sprite)");
@@ -1870,7 +1736,6 @@ void OpenGLRenderer::DrawColoredRect(glm::vec2 position,
         FlushRectBatch();
     }
 
-    // No rotation for rects.
     glm::vec2 corners[4] = {
         position,                                    // Top-left
         {position.x + size.x, position.y},           // Top-right
@@ -1878,7 +1743,6 @@ void OpenGLRenderer::DrawColoredRect(glm::vec2 position,
         {position.x, position.y + size.y}            // Bottom-left
     };
 
-    // Two triangles with per-vertex color.
     float r = color.r, g = color.g, b = color.b, a = color.a;
     m_RectBatchVertices.push_back({corners[0].x, corners[0].y, 0.0f, 0.0f, r, g, b, a});
     m_RectBatchVertices.push_back({corners[2].x, corners[2].y, 1.0f, 1.0f, r, g, b, a});
@@ -1889,8 +1753,6 @@ void OpenGLRenderer::DrawColoredRect(glm::vec2 position,
     m_RectBatchVertices.push_back({corners[2].x, corners[2].y, 1.0f, 1.0f, r, g, b, a});
 }
 
-// Rects (UI/debug colored quads) batch separately from the textured sprite
-// path: per-vertex color, white placeholder texture, own blend mode.
 void OpenGLRenderer::FlushRectBatch()
 {
     if (m_RectBatchVertices.empty() || !m_Initialized)
@@ -1899,10 +1761,7 @@ void OpenGLRenderer::FlushRectBatch()
         return;
     }
 
-    // Drain pending text first so anything queued before these rects renders
-    // underneath them, preserving the call-site insertion order.
-    // (Done after the empty check so DrawText's drain-rect call doesn't
-    // mutually flush the text it is about to accumulate.)
+    // Drain text only after the empty check to avoid mutual text/rect flushing.
     if (!m_TextBatchVertices.empty())
     {
         const char* savedReason = m_PendingFlushReason;
@@ -1912,8 +1771,7 @@ void OpenGLRenderer::FlushRectBatch()
 
     glUseProgram(m_ShaderProgram);
 
-    // Set blend func unconditionally (every Flush* owns its GL state).
-    // Additive: dest = src*alpha + dest. Standard: src*alpha + dest*(1-alpha).
+    // Additive: src*alpha + dest; standard: src*alpha + dest*(1-alpha).
     if (m_RectBatchAdditive)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     else
@@ -1923,11 +1781,9 @@ void OpenGLRenderer::FlushRectBatch()
     glUniformMatrix4fv(m_ModelLoc, 1, GL_FALSE, glm::value_ptr(identity));
     glUniformMatrix4fv(m_ProjectionLoc, 1, GL_FALSE, glm::value_ptr(m_Projection));
 
-    // useColorOnly modes: 0=texture, 1=uniform, 2=per-vertex, 3=texture*per-vertex.
     if (m_UseColorOnlyLoc >= 0)
         glUniform1i(m_UseColorOnlyLoc, 2);
 
-    // Buffer orphaning to avoid GPU sync stall.
     size_t dataSize = m_RectBatchVertices.size() * sizeof(ColoredVertex);
     glBindBuffer(GL_ARRAY_BUFFER, m_RectBatchVBO);
     void* ptr = glMapBufferRange(
@@ -1947,7 +1803,6 @@ void OpenGLRenderer::FlushRectBatch()
         return;
     }
 
-    // White texture as placeholder; shader ignores it in vertex-color mode.
     glBindTexture(GL_TEXTURE_2D, m_WhiteTexture);
 
     glBindVertexArray(m_RectBatchVAO);
@@ -1966,23 +1821,17 @@ void OpenGLRenderer::FlushRectBatch()
     }
     m_PendingFlushReason = nullptr;
 
-    // No state restoration needed; the next Flush* sets what it wants at entry.
     m_RectBatchVertices.clear();
 }
 
 void OpenGLRenderer::FlushParticleBatch()
 {
-    // Particles are batched separately because they use per-vertex color/alpha
-    // for fades, color variation, and glow intensity.
     if (m_ParticleBatchVertices.empty())
     {
         return;
     }
 
-    // Drain pending text first so anything queued before these particles
-    // renders underneath them, preserving the call-site insertion order.
-    // (Done after the empty check so DrawText's drain-particle call doesn't
-    // mutually flush the text it is about to accumulate.)
+    // Drain text only after the empty check to avoid mutual text/particle flushing.
     if (!m_TextBatchVertices.empty())
     {
         const char* savedReason = m_PendingFlushReason;
@@ -1999,7 +1848,6 @@ void OpenGLRenderer::FlushParticleBatch()
 
     glUseProgram(m_ShaderProgram);
 
-    // Every Flush* owns its GL state; set blend func unconditionally.
     if (m_ParticleBatchAdditive)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     else
@@ -2009,12 +1857,10 @@ void OpenGLRenderer::FlushParticleBatch()
     glUniformMatrix4fv(m_ModelLoc, 1, GL_FALSE, glm::value_ptr(identity));
     glUniformMatrix4fv(m_ProjectionLoc, 1, GL_FALSE, glm::value_ptr(m_Projection));
 
-    // Mode 3: texture * per-vertex color - particles tint/fade individually
-    // while sharing one texture.
     if (m_UseColorOnlyLoc >= 0)
         glUniform1i(m_UseColorOnlyLoc, 3);
 
-    // Reuse the rect batch VBO (same vertex layout).
+    // Particle and rect vertices share a VAO/VBO.
     size_t dataSize = m_ParticleBatchVertices.size() * sizeof(ColoredVertex);
     glBindBuffer(GL_ARRAY_BUFFER, m_RectBatchVBO);
     void* ptr = glMapBufferRange(
@@ -2036,7 +1882,6 @@ void OpenGLRenderer::FlushParticleBatch()
         return;
     }
 
-    // All particles in this batch share one texture (e.g., soft glow circle).
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_CurrentParticleTexture);
 
@@ -2062,7 +1907,6 @@ void OpenGLRenderer::FlushParticleBatch()
     }
     m_PendingFlushReason = nullptr;
 
-    // No state restoration needed; the next Flush* sets what it wants at entry.
     m_ParticleBatchVertices.clear();
     m_CurrentParticleTexture = 0;
 }
@@ -2084,9 +1928,6 @@ void OpenGLRenderer::LoadFont(const std::string& fontPath)
         return;
     }
 
-    // Two atlases from the same face, both baked at 96 px. The body atlas is
-    // normalized to a logical 24-px size (BODY_METRIC_NORM) so small text stays
-    // crisp; the headline atlas stays logical 96 for the large title logo.
     BuildAtlasInto(BODY_FONT_PIXEL_SIZE,
                    m_Characters,
                    m_FontAtlasTexture,
@@ -2132,23 +1973,20 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
 
     FT_Set_Pixel_Sizes(m_Face, 0, pixelSize);
 
-    // FreeType emits 8-bit grayscale; disable 4-byte row alignment.
+    // FreeType grayscale rows require byte alignment.
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    // Two-pass packing: pass 1 measures so the exact atlas size can be allocated,
-    // pass 2 copies pixels. Left-to-right with row wrap.
+    // Measure and cache glyphs before allocating the atlas, then copy with the same row layout.
     int atlasWidth = 0;
     int atlasHeight = 0;
     int rowHeight = 0;
     int currentX = 0;
-    // Wider row limit for large atlases (96-px glyphs at 512px wide is ~17 rows).
+
     const int ATLAS_MAX_WIDTH = (pixelSize >= 64) ? 2048 : 512;
-    // Gap between glyphs. Enlarged (was 2) so mipmap minification doesn't bleed
-    // neighboring glyphs together at the small on-screen sizes (version footer,
-    // debug HUD) that now minify from the supersampled atlas.
+    // 8-texel glyph padding prevents mipmap bleed.
     const int PADDING = 8;
 
-    // Cache bitmaps + metrics - FreeType reuses its internal buffer per glyph.
+    // Copy glyph pixels before FreeType reuses its buffer.
     struct GlyphData
     {
         std::vector<unsigned char> bitmap;
@@ -2158,19 +1996,16 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
     };
     std::map<char, GlyphData> glyphData;
 
-    // Pass 1: rasterize each ASCII glyph, cache it, and simulate atlas packing
-    // to find the final atlas dimensions.
     for (unsigned char c = 0; c < 128; c++)
     {
         if (FT_Load_Char(m_Face, c, FT_LOAD_RENDER))
         {
-            continue;  // Skip glyphs that fail to load.
+            continue;
         }
 
         int w = m_Face->glyph->bitmap.width;
         int h = m_Face->glyph->bitmap.rows;
 
-        // Bearing: cursor -> glyph top-left. Advance: cursor step per glyph.
         GlyphData gd;
         gd.width = w;
         gd.height = h;
@@ -2178,7 +2013,6 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
         gd.bearingY = m_Face->glyph->bitmap_top;
         gd.advance = static_cast<unsigned int>(m_Face->glyph->advance.x);
 
-        // Must copy - FreeType reuses the buffer for the next glyph.
         if (w > 0 && h > 0)
         {
             gd.bitmap.assign(m_Face->glyph->bitmap.buffer, m_Face->glyph->bitmap.buffer + w * h);
@@ -2198,9 +2032,8 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
         if (currentX > atlasWidth)
             atlasWidth = currentX;
     }
-    atlasHeight += rowHeight;  // Include the final row.
+    atlasHeight += rowHeight;
 
-    // Round up to power of 2 (some drivers require it).
     auto nextPow2 = [](int v)
     {
         v--;
@@ -2217,14 +2050,12 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
     outWidth = atlasWidth;
     outHeight = atlasHeight;
 
-    // RGBA: white color + alpha from glyph grayscale (enables color tint via uniform).
     std::vector<unsigned char> atlasData(atlasWidth * atlasHeight * 4, 0);
 
     currentX = 0;
     int currentY = 0;
     rowHeight = 0;
 
-    // Pass 2: place each glyph in the atlas (same packing logic as pass 1) and record UVs.
     for (unsigned char c = 0; c < 128; c++)
     {
         auto it = glyphData.find(c);
@@ -2250,10 +2081,10 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
                 {
                     int atlasIdx = ((currentY + y) * atlasWidth + (currentX + x)) * 4;
                     unsigned char value = gd.bitmap[y * w + x];
-                    atlasData[atlasIdx + 0] = 255;    // R (white)
-                    atlasData[atlasIdx + 1] = 255;    // G (white)
-                    atlasData[atlasIdx + 2] = 255;    // B (white)
-                    atlasData[atlasIdx + 3] = value;  // A (glyph coverage)
+                    atlasData[atlasIdx + 0] = 255;
+                    atlasData[atlasIdx + 1] = 255;
+                    atlasData[atlasIdx + 2] = 255;
+                    atlasData[atlasIdx + 3] = value;
                 }
             }
         }
@@ -2286,16 +2117,14 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
                  GL_UNSIGNED_BYTE,
                  atlasData.data());
 
-    // Mipmaps so text that minifies from the supersampled atlas (small UI text)
-    // stays clean: trilinear on minify, linear on magnify. glGenerateMipmap runs
-    // after the base-level glTexImage2D upload above.
+    // Mipmaps filter the supersampled atlas at small UI sizes.
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    // Restore default alignment for subsequent uploads.
+    // Restore default unpack alignment for later uploads.
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 #else
     (void)pixelSize;
@@ -2309,7 +2138,6 @@ void OpenGLRenderer::BuildAtlasInto(int pixelSize,
 
 float OpenGLRenderer::GetTextAscent(float scale) const
 {
-    // Max bearing.y across loaded characters; fall back to font size if empty.
     int maxAscent = 0;
     for (const auto& pair : m_Characters)
     {
@@ -2320,7 +2148,7 @@ float OpenGLRenderer::GetTextAscent(float scale) const
     }
     if (maxAscent == 0)
     {
-        maxAscent = BODY_FONT_PIXEL_SIZE;  // Physical fallback; normalized below.
+        maxAscent = BODY_FONT_PIXEL_SIZE;
     }
     return static_cast<float>(maxAscent) * scale * BODY_METRIC_NORM;
 }
@@ -2341,7 +2169,7 @@ float OpenGLRenderer::GetTextWidthImpl(const std::string& text,
         auto it = chars.find(c);
         if (it != chars.end())
         {
-            // Advance is in 1/64th pixels (FreeType convention)
+            // FreeType advance is in 1/64 px.
             width += (it->second.Advance >> 6) * scale * metricNorm;
         }
     }
@@ -2414,7 +2242,6 @@ void OpenGLRenderer::DrawTextLarge(const std::string& text,
     }
     if (m_HeadlineCharacters.empty() || m_HeadlineFontAtlasTexture == 0)
     {
-        // No headline atlas - fall back to scaled body atlas (blurry but visible).
         IRenderer::DrawTextLarge(text, position, scale, color, outlineSize, alpha);
         return;
     }
@@ -2450,19 +2277,12 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
         return;
     }
 
-    // Different atlas (body vs headline) than the currently batched text -
-    // flush before switching, since FlushTextBatch binds one atlas per draw.
     if (!m_TextBatchVertices.empty() && m_CurrentTextAtlas != atlasTexture)
     {
         PrepFlushReason("AtlasChange");
         FlushTextBatch();
     }
 
-    // Sprites use mode 0, rects mode 2, particles and text both mode 3. The mode
-    // is one global uniform on the one shared program, so any pending geometry
-    // must be drained before the text pass sets its own state, whatever its mode
-    // value. (Mode 1, uniform colorOnly, exists in Geometry.frag but no call site
-    // in this backend selects it.)
     PrepFlushReason("DrawText");
     FlushBatch();
     PrepFlushReason("DrawText");
@@ -2472,7 +2292,6 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
 
     m_CurrentTextAtlas = atlasTexture;
 
-    // Take line height from the first printable character.
     float lineHeight = 24.0f;
     for (auto c : text)
     {
@@ -2489,9 +2308,7 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
 
     float outlineOffset = 2.0f * scale * outlineSize;
 
-    // Glyph geometry is in physical atlas texels; normalize so on-screen size is
-    // independent of the bake resolution. (Outline offset above stays raw `scale`:
-    // it is a screen-space offset, so it must not change with atlas resolution.)
+    // Normalize atlas metrics, but retain screen-space outline offsets.
     const float gscale = scale * metricNorm;
 
     const size_t maxTextVertices = MAX_TEXT_QUADS * 6;
@@ -2509,20 +2326,13 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
                                                              float b,
                                                              float a)
     {
-        // The text batch is shared across every DrawText call in the frame and
-        // only auto-flushes on EndFrame or an atlas/state change. A long run of
-        // text (e.g. the console scrollback in fullscreen) can exceed the
-        // pre-allocated VBO; when it would, flush the accumulated glyphs and
-        // continue into a fresh batch rather than silently dropping the rest.
-        // Dropping truncated the console after ~7 lines (outlined glyphs cost
-        // 5 quads each, so the 2048-quad budget filled fast).
+        // Flush at capacity and continue the string; outlined glyphs consume five quads.
         if (m_TextBatchVertices.size() + 6 > maxTextVertices)
         {
             FlushTextBatch();
-            m_CurrentTextAtlas = atlasTexture;  // re-arm; FlushTextBatch reset it to 0
+            m_CurrentTextAtlas = atlasTexture;  // FlushTextBatch cleared the active atlas.
         }
 
-        // Two triangles per glyph; per-vertex color is uniform across the quad.
         m_TextBatchVertices.push_back({xpos, ypos, u0, v0, r, g, b, a});          // TL
         m_TextBatchVertices.push_back({xpos, ypos + h, u0, v1, r, g, b, a});      // BL
         m_TextBatchVertices.push_back({xpos + w, ypos + h, u1, v1, r, g, b, a});  // BR
@@ -2550,7 +2360,6 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
                 continue;
             const Character& ch = it->second;
 
-            // Bearing offsets the glyph from the cursor to its top-left.
             float xpos = x + ch.Bearing.x * gscale;
             float ypos = y - ch.Bearing.y * gscale;
             float w = ch.Size.x * gscale;
@@ -2558,14 +2367,12 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
 
             addCharQuad(xpos, ypos, w, h, ch.u0, ch.v0, ch.u1, ch.v1, r, g, b, a);
 
-            // Advance is in 1/64 px (shift right 6 bits).
+            // FreeType advance is in 1/64 px.
             x += (ch.Advance >> 6) * gscale;
         }
     };
 
-    // Outline first: four stroke passes offset by (+/-outlineOffset). Each
-    // vertex carries (0,0,0,alpha) so the shader (mode 3) outputs a black
-    // halo where the glyph is non-transparent.
+    // Draw four black offset strokes before the foreground.
     static const float outlineDirections[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
     for (int dir = 0; dir < 4; dir++)
     {
@@ -2577,12 +2384,7 @@ void OpenGLRenderer::DrawTextImpl(const std::string& text,
                           alpha);
     }
 
-    // Main text on top, carrying the requested color.
     buildTextVertices(0.0f, 0.0f, color.x, color.y, color.z, alpha);
-
-    // Vertices accumulate in m_TextBatchVertices. The actual draw is deferred
-    // to FlushTextBatch, which is triggered by EndFrame or any non-text draw
-    // (sprite/rect/particle) that needs to reset shader state.
 }
 
 void OpenGLRenderer::FlushTextBatch()
@@ -2593,8 +2395,7 @@ void OpenGLRenderer::FlushTextBatch()
         return;
     }
 
-    // Glyphs buffered but no atlas bound (or renderer not initialized): drop them,
-    // nothing to draw against.
+    // Drop buffered glyphs when no initialized renderer and atlas can draw them.
     if (m_CurrentTextAtlas == 0 || !m_Initialized)
     {
         m_TextBatchVertices.clear();
@@ -2611,8 +2412,7 @@ void OpenGLRenderer::FlushTextBatch()
     glUniformMatrix4fv(m_ModelLoc, 1, GL_FALSE, glm::value_ptr(model));
     glUniformMatrix4fv(m_ProjectionLoc, 1, GL_FALSE, glm::value_ptr(m_Projection));
 
-    // Mode 3: FragColor = texture(font, uv) * VertexColor. Per-quad color
-    // (outline vs foreground) is baked into the vertex stream.
+    // Mode 3 multiplies glyph coverage by the per-vertex outline or foreground color.
     if (m_UseColorOnlyLoc >= 0)
         glUniform1i(m_UseColorOnlyLoc, 3);
 
@@ -2643,7 +2443,6 @@ void OpenGLRenderer::FlushTextBatch()
     }
     m_PendingFlushReason = nullptr;
 
-    // Reset state so the next caller doesn't inherit mode 3.
     if (m_UseColorOnlyLoc >= 0)
         glUniform1i(m_UseColorOnlyLoc, 0);
     glBindVertexArray(0);
