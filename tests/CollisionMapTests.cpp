@@ -8,13 +8,8 @@ class CollisionMapTest : public ::testing::Test
 protected:
     CollisionMap<std::vector> map;
 
-    void SetUp() override
-    {
-        map.Resize(10, 10);
-    }
+    void SetUp() override { map.Resize(10, 10); }
 };
-
-// --- Basic Operations ---
 
 TEST_F(CollisionMapTest, InitiallyEmpty)
 {
@@ -64,8 +59,6 @@ TEST_F(CollisionMapTest, Clear_RemovesAll)
     EXPECT_EQ(map.GetCollisionCount(), 0);
 }
 
-// --- Bounds Handling ---
-
 TEST_F(CollisionMapTest, HasCollision_OutOfBounds_ReturnsFalse)
 {
     EXPECT_FALSE(map.HasCollision(-1, 0));
@@ -81,8 +74,6 @@ TEST_F(CollisionMapTest, SetCollision_OutOfBounds_Ignored)
     map.SetCollision(100, 100, true);
     EXPECT_EQ(map.GetCollisionCount(), 0);
 }
-
-// --- 2D Array Syntax ---
 
 TEST_F(CollisionMapTest, OperatorBracket_Write)
 {
@@ -112,11 +103,9 @@ TEST_F(CollisionMapTest, OperatorBracket_OutOfBounds_WriteIgnored)
     EXPECT_EQ(map.GetCollisionCount(), 0);
 }
 
-// --- Row-Major Layout ---
-
 TEST_F(CollisionMapTest, RowMajorLayout_IndexCalculation)
 {
-    // Set collision at (3, 2), which should be at index 2*10+3 = 23
+    // (3, 2) uses row-major index 2 * 10 + 3 = 23.
     map.SetCollision(3, 2, true);
     auto indices = map.GetCollisionIndices();
     ASSERT_EQ(indices.size(), 1);
@@ -125,20 +114,17 @@ TEST_F(CollisionMapTest, RowMajorLayout_IndexCalculation)
 
 TEST_F(CollisionMapTest, GetCollisionIndices_Multiple)
 {
-    map.SetCollision(0, 0, true); // index 0
-    map.SetCollision(9, 0, true); // index 9
-    map.SetCollision(0, 1, true); // index 10
+    map.SetCollision(0, 0, true);  // index 0
+    map.SetCollision(9, 0, true);  // index 9
+    map.SetCollision(0, 1, true);  // index 10
 
     auto indices = map.GetCollisionIndices();
     ASSERT_EQ(indices.size(), 3);
 
-    // Indices should be in order
     EXPECT_EQ(indices[0], 0);
     EXPECT_EQ(indices[1], 9);
     EXPECT_EQ(indices[2], 10);
 }
-
-// --- Resize ---
 
 TEST_F(CollisionMapTest, Resize_UpdatesDimensions)
 {
@@ -150,29 +136,27 @@ TEST_F(CollisionMapTest, Resize_UpdatesDimensions)
 TEST_F(CollisionMapTest, Resize_LargerAllowsNewArea)
 {
     map.Resize(100, 100);
-    // Can now set in larger area
+
     map.SetCollision(99, 99, true);
     EXPECT_TRUE(map.HasCollision(99, 99));
 }
 
-// --- SetData ---
-
 TEST_F(CollisionMapTest, SetData_ValidSize)
 {
     std::vector<bool> data(25, false);
-    data[12] = true; // Center of 5x5
+    data[12] = true;  // center of 5x5
 
     EXPECT_TRUE(map.SetData(data, 5, 5));
     EXPECT_EQ(map.GetWidth(), 5);
     EXPECT_EQ(map.GetHeight(), 5);
-    EXPECT_TRUE(map.HasCollision(2, 2)); // 12 = 2*5+2
+    EXPECT_TRUE(map.HasCollision(2, 2));  // 12 = 2*5+2
 }
 
 TEST_F(CollisionMapTest, SetData_InvalidSize_Rejected)
 {
     std::vector<bool> data(10, false);
-    EXPECT_FALSE(map.SetData(data, 5, 5)); // 10 != 25
-    // Original dimensions unchanged
+    EXPECT_FALSE(map.SetData(data, 5, 5));  // 10 != 25
+
     EXPECT_EQ(map.GetWidth(), 10);
     EXPECT_EQ(map.GetHeight(), 10);
 }
@@ -185,8 +169,6 @@ TEST_F(CollisionMapTest, SetData_NegativeDimensions_Rejected)
     EXPECT_EQ(map.GetWidth(), 10);
     EXPECT_EQ(map.GetHeight(), 10);
 }
-
-// --- Copy/Move ---
 
 TEST_F(CollisionMapTest, CopyConstructor)
 {
@@ -210,8 +192,6 @@ TEST_F(CollisionMapTest, CopyAssignment)
     other = map;
     EXPECT_TRUE(other.HasCollision(5, 5));
 }
-
-// --- Edge Cases ---
 
 TEST_F(CollisionMapTest, ZeroSizedMap)
 {
