@@ -1,5 +1,5 @@
-// Renderer-free tests for the procedural aurora texture builders. These assert
-// the *shape* of the alpha envelope (feathered edges, profile) without a GPU.
+// alpha must fade at every texture border so adjacent ribbon quads have no visible seams.
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -14,9 +14,7 @@ int A(const std::vector<unsigned char>& px, int width, int x, int y)
     return px[(static_cast<size_t>(y) * width + x) * 4 + 3];
 }
 
-// Highest alpha found anywhere on the 1-pixel border ring (top/bottom rows +
-// left/right columns). A seamless, feathered texture must reach ~0 all the way
-// around so segment quads dissolve into the sky with no hard seam on any edge.
+// the outer pixel ring must fade to zero to hide seams between sky quads.
 int MaxBorderAlpha(const std::vector<unsigned char>& px, int width, int height)
 {
     int maxA = 0;
@@ -55,8 +53,7 @@ TEST(AuroraTextureTests, BeamIsSoftFeatheredVerticalOval)
 {
     const int w = 64, h = 256;
     auto px = AuroraTextures::BuildBeamPixels(w, h);
-    // Brightest near the vertical center, feathering to ~0 at BOTH ends (floats,
-    // no hard base) with oval sides that fade out.
+
     const int center = A(px, w, w / 2, h / 2);
     EXPECT_GT(center, A(px, w, w / 2, 4));      // fades toward the top
     EXPECT_GT(center, A(px, w, w / 2, h - 5));  // fades toward the bottom (soft base)
@@ -70,8 +67,7 @@ TEST(AuroraTextureTests, CurtainEntireBorderFeathersToZero)
 {
     const int w = 128, h = 256;
     auto px = AuroraTextures::BuildCurtainPixels(w, h);
-    // Every edge - including the top and bottom rows - must fade to ~0 so the
-    // ribbon's silhouette blends seamlessly into the sky with no hard cut.
+
     EXPECT_LE(MaxBorderAlpha(px, w, h), 3);
     EXPECT_LT(A(px, w, w / 2, 0), 4);       // top-center feathered (was a hard ~25)
     EXPECT_LT(A(px, w, w / 2, h - 1), 4);   // bottom-center feathered
@@ -88,8 +84,7 @@ TEST(AuroraTextureTests, CurtainHasVisibleCoreAndSoftOuterHalo)
     const int horizontalOuter = A(px, w, w / 8, h / 2);
     const int horizontalInner = A(px, w, w / 4, h / 2);
 
-    // The core is clearly visible but translucent, while both broad envelopes
-    // retain a faint tail before the border reaches zero.
+    // the core stays translucent; the outer envelope retains a faint tail before the border.
     EXPECT_GT(center, 155);
     EXPECT_LT(center, 185);
     EXPECT_GT(verticalOuter, 4);
@@ -106,8 +101,7 @@ TEST(AuroraTextureTests, BeamEntireBorderFeathersToZero)
 {
     const int w = 64, h = 256;
     auto px = AuroraTextures::BuildBeamPixels(w, h);
-    // The beam floats free, so all four borders - top and bottom included -
-    // must reach ~0; no edge should read as a hard line against the sky.
+
     EXPECT_LE(MaxBorderAlpha(px, w, h), 3);
     EXPECT_LT(A(px, w, w / 2, 0), 4);       // top-center feathered (was a hard ~15)
     EXPECT_LT(A(px, w, w / 2, h - 1), 4);   // bottom-center feathered
