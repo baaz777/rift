@@ -1,9 +1,4 @@
-// Pure-math guard for damped billboard orientation. No GL/Vulkan context is
-// created here (see the rift_tests constraint in CMakeLists.txt).
-//
-// The calibration figures are measured from Pokemon DS Map Studio's shipped
-// tilesets, which bake this lean into static geometry; they are what the default
-// damping factors were chosen to reproduce.
+// billboard calibration uses the lean measured from Pokemon DS map Studio tilesets.
 #include "../src/Billboard.hpp"
 #include "../src/CameraRig.hpp"
 #include "../src/MathConstants.hpp"
@@ -27,9 +22,7 @@ constexpr billboard::Damping kFull{1.0f, 1.0f};
 
 TEST(BillboardTest, FullFollowUpMatchesTheCameraUpVector)
 {
-    // A quad that follows the camera completely has, by definition, the camera's
-    // own up vector - it lies in the image plane. This single identity pins both
-    // the yaw and the lean formulas at once.
+    // full camera follow aligns the quad with the image plane.
     for (const float yawDeg : {0.0f, 37.0f, 90.0f, 180.0f, -125.0f})
     {
         for (const float pitchDeg : {10.0f, 51.34f, 89.0f, 90.0f})
@@ -64,9 +57,7 @@ TEST(BillboardTest, ZeroLeanStandsBoltUpright)
 
 TEST(BillboardTest, FullLeanFromOverheadLiesFlatPointingNorth)
 {
-    // The top edge tips AWAY from the camera. Looking straight down, a fully
-    // facing quad is flat on the ground with its top toward map-north (-Z), not
-    // standing up. Getting this sign backwards is the easy mistake here.
+    // the top edge leans away from the camera: at pitch 90 it points toward map-north (-Z).
     const billboard::Orientation o = billboard::Orient(0.0f, Degrees(90.0f), kFull);
     EXPECT_NEAR(o.up.x, 0.0f, kTol);
     EXPECT_NEAR(o.up.y, 0.0f, kTol);
@@ -106,9 +97,8 @@ TEST(BillboardTest, ApparentHeightSquashesAnUprightQuad)
 
 TEST(BillboardTest, MatchesTheMeasuredHeartGoldTreeLean)
 {
-    // Pokemon DS Map Studio's HGSS overworld tree quad leans 39.57 deg from
-    // vertical under a camera 51.34 deg above the horizon, and so renders at
-    // ~98% of full height. Scenery damping is calibrated to land there.
+    // the HGSS tree lean is 39.57 degrees under a 51.34 degree camera, preserving
+    // about 98% of its height. scenery damping targets this ratio.
     const float pitch = cameraRig::DS_PITCH_RADIANS;
     const billboard::Damping scenery = billboard::DefaultDamping(billboard::Role::Scenery);
     const float lean = scenery.leanFollow * pitch;
@@ -119,7 +109,7 @@ TEST(BillboardTest, MatchesTheMeasuredHeartGoldTreeLean)
 
 TEST(BillboardTest, CharacterFollowsYawCompletely)
 {
-    // Characters must never be seen edge-on, so their yaw is undamped even
+    // characters must never be seen edge-on, so their yaw is undamped even
     // though their lean is not.
     const billboard::Damping character = billboard::DefaultDamping(billboard::Role::Character);
     EXPECT_NEAR(character.yawFollow, 1.0f, kTol);
@@ -128,7 +118,6 @@ TEST(BillboardTest, CharacterFollowsYawCompletely)
 
 TEST(BillboardTest, SceneryUnderFollowsYaw)
 {
-    // The residual mismatch is the "follows the camera a bit" read.
     const billboard::Damping scenery = billboard::DefaultDamping(billboard::Role::Scenery);
     EXPECT_GT(scenery.yawFollow, 0.0f);
     EXPECT_LT(scenery.yawFollow, 1.0f);
@@ -141,7 +130,6 @@ TEST(BillboardTest, QuadStandsOnItsFootCenterAtTheAuthoredSize)
     const glm::vec2 size{16.0f, 32.0f};
     billboard::MakeQuad(foot, size, Degrees(35.0f), Degrees(50.0f), kFull, corners);
 
-    // Bottom edge straddles the feet, and both edges are the authored width.
     const glm::vec3 bottomMid =
         (corners[sceneMath::QUAD_BOTTOM_LEFT] + corners[sceneMath::QUAD_BOTTOM_RIGHT]) * 0.5f;
     EXPECT_NEAR(bottomMid.x, foot.x, kTol);
