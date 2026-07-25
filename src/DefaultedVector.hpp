@@ -6,12 +6,9 @@
 #include <vector>
 
 /**
- * @brief Type supporting parallel resize and reset-to-default operations.
- * @author Alex (https://github.com/lextpf)
+ * @brief Containers with resize and resetToDefault operations.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
- *
- * Satisfied by any type with `resize(size_t)` and `resetToDefault()` methods,
- * including the defaulted_vector template below.
  */
 template <typename F>
 concept resettable_container = requires(F& f, size_t n) {
@@ -21,30 +18,19 @@ concept resettable_container = requires(F& f, size_t n) {
 
 /**
  * @class defaulted_vector
- * @brief Vector wrapper with a compile-time default value for parallel array patterns.
- * @author Alex (https://github.com/lextpf)
+ * @brief Vector with a compile-time fill value.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * Wraps `std::vector<T>` and associates a compile-time default value used by
- * resize_all / reset_all fold expressions. Provides transparent `operator[]`,
- * `size()`, and iteration so existing access patterns work unchanged.
+ * New slots and `resetToDefault` use `Default`. Resizing preserves the retained prefix; resetting
+ * fills existing slots without changing the size. Subscript forwards `std::vector<bool>` proxies.
  *
- * @tparam T       Element type.
- * @tparam Default Compile-time default value. Any structural NTTP type is accepted;
- *                 in practice int, float, bool and scoped enums (see
- *                 TileLayer::stance and TileLayer::elevationRole).
- *
- * @par Usage
  * @code{.cpp}
  * defaulted_vector<int, -1> tiles;
  * tiles.resize(100);       // 100 elements, all -1
  * tiles[42] = 7;
  * tiles.resetToDefault();  // all 100 elements back to -1
  * @endcode
- *
- * @par Proxy handling
- * Uses `decltype(auto)` for `operator[]` to correctly forward
- * `std::vector<bool>`'s proxy reference type.
  */
 template <typename T, auto Default>
 class defaulted_vector
@@ -54,30 +40,45 @@ public:
     static constexpr auto default_value = static_cast<T>(Default);
 
     /**
-     * @brief Index access. Returns `T&` for most types, proxy for `bool`.
-     *
-     * Uses C++23 deducing this to unify const/non-const overloads. The subscript is
-     * unchecked - it forwards to `std::vector::operator[]`, so `i` must be less than
-     * `size()`. Unlike BoolGrid and ColumnProxy, there is no clamp and no default
-     * return. Callers bounds-check the coordinate instead: `resize_all` keeps the
-     * parallel arrays of one TileLayer at a single common size.
+     * @fn decltype(auto) defaulted_vector::operator[](this auto&& self, size_t i)
+     * @brief Unchecked access; the index must be below size.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] decltype(auto) operator[](this auto&& self, size_t i) { return self.m_Data[i]; }
 
     [[nodiscard]] size_t size() const noexcept { return m_Data.size(); }
     [[nodiscard]] bool empty() const noexcept { return m_Data.empty(); }
 
-    /// @brief Iterator access. Deducing this forwards const-ness automatically.
+    /**
+     * @fn auto defaulted_vector::begin(this auto&& self) noexcept
+     * @brief Iterator access.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * Deducing this forwards const-ness automatically.
+     *
+     */
     [[nodiscard]] auto begin(this auto&& self) noexcept { return self.m_Data.begin(); }
     [[nodiscard]] auto end(this auto&& self) noexcept { return self.m_Data.end(); }
 
-    /// @brief Resize to n elements; new slots initialized to default_value.
+    /**
+     * @fn void defaulted_vector::resize(size_t n)
+     * @brief Resize to n elements; new slots initialized to default_value.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void resize(size_t n) { m_Data.resize(n, default_value); }
 
-    /// @brief Replace contents with n copies of value.
+    /**
+     * @fn void defaulted_vector::assign(size_t n, const T& value)
+     * @brief Replace contents with n copies of value.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void assign(size_t n, const T& value) { m_Data.assign(n, value); }
 
-    /// @brief Fill every element with default_value (size unchanged).
+    /**
+     * @fn void defaulted_vector::resetToDefault()
+     * @brief Fill every element with default_value (size unchanged).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void resetToDefault() { std::ranges::fill(m_Data, default_value); }
 
 private:
@@ -85,21 +86,21 @@ private:
 };
 
 /**
- * @brief Resize all resettable_container members to the same size.
+ * @fn template <resettable_container... Containers> void resize_all(size_t n, Containers&... \
+ *     containers)
+ * @brief Resize parallel containers to the same size.
+ * @author Alex (<https://github.com/lextpf>)
+ *
  * @ingroup Core
  *
- * Uses a fold expression to call `resize(n)` on each container in a single
- * statement. The intended use is keeping a family of parallel per-tile arrays
- * (tiles, rotation, flips, structureId, ...) in lockstep on a TileLayer.
+ * Containers resize in argument order. If one resize throws, earlier containers stay resized;
+ * the operation does not restore their original contents or sizes.
  *
  * @code{.cpp}
  * defaulted_vector<int, -1> tiles;
  * defaulted_vector<float, 0.0f> rotation;
  * resize_all(100, tiles, rotation);  // both resized to 100
  * @endcode
- *
- * @param n          New size for all containers.
- * @param containers Pack of resettable_container references.
  */
 template <resettable_container... Containers>
 void resize_all(size_t n, Containers&... containers)
@@ -108,13 +109,11 @@ void resize_all(size_t n, Containers&... containers)
 }
 
 /**
- * @brief Reset all resettable_container members to their compile-time defaults.
+ * @fn template <resettable_container... Containers> void reset_all(Containers&... containers)
+ * @brief Fills each container with its own default; sizes remain unchanged.
+ * @author Alex (<https://github.com/lextpf>)
+ *
  * @ingroup Core
- *
- * Uses a fold expression to call `resetToDefault()` on each container.
- * Preserves size; only the contents revert to the per-container Default NTTP.
- *
- * @param containers Pack of resettable_container references.
  */
 template <resettable_container... Containers>
 void reset_all(Containers&... containers)
