@@ -4,24 +4,14 @@
 
 /**
  * @class CollisionMap
- * @brief Boolean grid for per-tile collision flags in 2D tile-based worlds.
- * @author Alex (https://github.com/lextpf)
+ * @brief Authored tile collision flags backed by BoolGrid.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * CollisionMap stores collision flags for a 2D tile grid. Inherits all
- * storage and access logic from BoolGrid, adding semantic method names
- * for the collision domain.
+ * Collision and NPC navigation are independent grids. Inherited bounds handling returns
+ * false on reads and ignores writes outside the map.
  *
- * @tparam Container Template for the storage container (e.g., `std::vector`).
- *                   The container is instantiated as `Container<bool>`.
- *
- * @par Class hierarchy
- * CollisionMap and NavigationMap are thin semantic wrappers over the same
- * generic boolean storage so the two grids can be edited independently
- * without sharing state:
- *
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * classDiagram
  *     class BoolGrid~Container~ {
  *         +Resize(w, h)
@@ -41,10 +31,8 @@
  *     }
  *     BoolGrid <|-- CollisionMap
  *     BoolGrid <|-- NavigationMap
- * </pre>
- * @endhtmlonly
+ * ```
  *
- * @par Usage
  * @code{.cpp}
  * CollisionMap<std::vector> col;
  * col.Resize(64, 64);
@@ -53,20 +41,6 @@
  * if (col.HasCollision(10, 20)) { ... }
  * if (col[10, 20]) { ... }  // C++23 multidimensional subscript
  * @endcode
- *
- * @par Bounds handling
- * - **Read**: Out-of-bounds returns `false` (passable)
- * - **Write**: Out-of-bounds silently ignored
- *
- * @par Design note
- * Collision and navigation are deliberately separate grids: a fence tile may
- * be non-walkable for NPC pathfinding without blocking player movement, and
- * an interactive prop may block the player without affecting NPC routes.
- * Sharing one bit-grid for both would couple unrelated gameplay concerns.
- *
- * @see BoolGrid For full implementation details
- * @see NavigationMap Similar structure for NPC walkability
- * @see ColumnProxy For 2D array syntax implementation
  */
 template <template <typename...> class Container>
     requires RandomAccessContainerOf<Container<bool>, bool> &&
@@ -81,14 +55,16 @@ public:
     using BoolGrid<Container>::BoolGrid;
     using BoolGrid<Container>::operator[];
 
-    /// @brief Mutable column proxy; named alias kept for backwards compatibility.
+    /// Mutable proxy into one collision-grid column.
     using CollisionColumn = typename BoolGrid<Container>::Column;
 
-    /// @brief Read-only column proxy returned by the const `operator[]`.
     using ConstCollisionColumn = typename BoolGrid<Container>::ConstColumn;
 
     /**
+     * @fn void SetCollision(int x, int y, bool collision) noexcept
      * @brief Set collision flag for a tile.
+     * @author Alex (<https://github.com/lextpf>)
+     *
      * @param x         Column (out-of-bounds ignored).
      * @param y         Row (out-of-bounds ignored).
      * @param collision `true` if blocking, `false` if passable.
@@ -99,9 +75,10 @@ public:
     }
 
     /**
+     * @fn bool HasCollision(int x, int y) const noexcept
      * @brief Query if a tile blocks movement.
-     * @param x Column (out-of-bounds returns `false`).
-     * @param y Row (out-of-bounds returns `false`).
+     * @author Alex (<https://github.com/lextpf>)
+     *
      * @return `true` if blocking, `false` if passable or out-of-bounds.
      */
     [[nodiscard]] constexpr bool HasCollision(int x, int y) const noexcept
@@ -109,15 +86,7 @@ public:
         return this->Get(x, y);
     }
 
-    /**
-     * @brief Get flat indices of all blocking tiles.
-     * @return Vector of indices where collision is `true`.
-     */
     [[nodiscard]] std::vector<int> GetCollisionIndices() const { return this->GetTrueIndices(); }
 
-    /**
-     * @brief Count blocking tiles.
-     * @return Number of tiles where collision is `true`.
-     */
     [[nodiscard]] int GetCollisionCount() const { return this->GetTrueCount(); }
 };
