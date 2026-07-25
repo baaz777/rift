@@ -1,4 +1,3 @@
-// Renderer-free tests for the pure aurora math helpers.
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -31,7 +30,7 @@ TEST(AuroraMathTests, TangentAngleFlatIsZero)
 
 TEST(AuroraMathTests, TangentAngleSlopeSign)
 {
-    // Screen space: +Y is down, so a segment going down-right has a positive angle.
+    // screen space: +Y is down, so a segment going down-right has a positive angle.
     EXPECT_GT(AuroraMath::TangentAngleDeg({0.0f, 0.0f}, {10.0f, 10.0f}), 0.0f);
     EXPECT_LT(AuroraMath::TangentAngleDeg({0.0f, 0.0f}, {10.0f, -10.0f}), 0.0f);
     EXPECT_NEAR(AuroraMath::TangentAngleDeg({0.0f, 0.0f}, {10.0f, 10.0f}), 45.0f, 1e-3f);
@@ -39,7 +38,7 @@ TEST(AuroraMathTests, TangentAngleSlopeSign)
 
 TEST(AuroraMathTests, SweepBoostPeaksAtCenterAndDecays)
 {
-    // At t=0, seed=0 the hot-spot center sits at segNorm 0.
+    // at t=0, seed=0 the hot-spot center sits at segNorm 0.
     float atCenter = AuroraMath::SweepBoost(0.0f, 0.0f, 0.15f, 0.20f, 0.0f);
     float farAway = AuroraMath::SweepBoost(0.5f, 0.0f, 0.15f, 0.20f, 0.0f);
     EXPECT_NEAR(atCenter, 1.0f, 1e-4f);
