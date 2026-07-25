@@ -9,53 +9,63 @@
 
 /**
  * @class AssetRegistry
- * @brief World-reachable registry of character + NPC sprite asset paths.
- * @author Alex (https://github.com/lextpf)
+ * @brief Sprite paths keyed by player variant or NPC type.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * Two independent lookup tables of sprite-sheet file paths: player characters keyed
- * by (@c CharacterType, sprite type), NPCs keyed by type id. Paths only - the pixels
- * belong to @ref TextureStore. Both tables are filled once at startup from the
- * project manifest (@c playerCharacters / @c npcSprites).
- *
- * @ref Game holds one instance by value and publishes a non-owning pointer to it as
- * @c WorldServices::assets in the registry's @c globals(), mirroring
- * @ref TextureStore / @ref DialogueStore. No entity holds a pointer - the
- * spawn/switch paths (@c EntityStore::SpawnNpc, @c PlayerSystem) read it out of the
- * world.
+ * Game owns the registry and publishes it through WorldServices::assets.
+ * The project manifest fills the paths; TextureStore owns the pixels.
  */
 class AssetRegistry
 {
 public:
-    /// @brief Register a player character sprite path, keyed by (type, spriteType).
+    /**
+     * @fn void AssetRegistry::SetCharacterAsset(CharacterType type, const std::string& \
+     *     spriteType, const std::string& path)
+     * @brief Register a player character sprite path, keyed by (type, spriteType).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void SetCharacterAsset(CharacterType type,
                            const std::string& spriteType,
                            const std::string& path);
 
-    /// @brief Resolve a player character sprite path, or "" if unregistered.
+    /**
+     * @fn std::string AssetRegistry::ResolveCharacterAsset(CharacterType type, const std::string& \
+     *     spriteType) const
+     * @brief Resolve a player character sprite path, or "" if unregistered.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::string ResolveCharacterAsset(CharacterType type,
                                                     const std::string& spriteType) const;
 
-    /// @brief Register an NPC sprite path for a type id (filename without extension).
-    /// An empty @p type is ignored silently; a known type id has its path overwritten.
+    /**
+     * @fn void AssetRegistry::SetNpcAsset(const std::string& type, const std::string& path)
+     * @brief Register an NPC sprite path for a type id (filename without extension).
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * An empty `type` is ignored silently; a known type id has its path overwritten.
+     */
     void SetNpcAsset(const std::string& type, const std::string& path);
 
     /**
-     * @brief Resolve an NPC sprite path, or the assets/non-player fallback.
+     * @fn std::string AssetRegistry::ResolveNpcAsset(const std::string& type) const
+     * @brief Returns the registered path or a working-directory-relative fallback.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * The two results have different resolution bases. A registered path comes back exactly
-     * as stored, already resolved through @ref ProjectManifest by whoever registered it. An
-     * unregistered id yields the literal `assets/non-player/<type>.png`, which is relative to
-     * the process working directory and ignores the manifest base directory, so it misses
-     * whenever the game runs from anywhere but the project root.
+     * Registered paths are returned unchanged. Unknown types resolve to
+     * `assets/non-player/<type>.png`, independent of the manifest base directory.
      */
     [[nodiscard]] std::string ResolveNpcAsset(const std::string& type) const;
 
-    /// @brief Registered NPC type ids, unspecified order (npc.spawn autocomplete).
+    /**
+     * @fn std::vector<std::string> AssetRegistry::AvailableNpcTypes() const
+     * @brief Registered NPC type ids, unspecified order (npc.spawn autocomplete).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::vector<std::string> AvailableNpcTypes() const;
 
 private:
-    /// @brief Key for the player character asset table.
+    /// Key for the player character asset table.
     struct CharacterAssetKey
     {
         CharacterType type;
