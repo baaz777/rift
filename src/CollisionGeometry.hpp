@@ -3,25 +3,20 @@
 #include <glm/glm.hpp>
 
 /**
- * @brief Shared feet-anchored AABB helpers for entity collision tests.
- * @author Alex (https://github.com/lextpf)
+ * @brief Feet-anchored AABB helpers.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * Every character hitbox is anchored at bottom-center: it extends @c halfWidth to each
- * side of the feet and @c boxHeight straight up. These helpers are the single source for building
- * that box and testing two of them for overlap, so the epsilon-shrink convention stays consistent
- * across every call site.
+ * World pixels use downward Y. Boxes extend halfWidth to either side of the feet and
+ * boxHeight above them; eps shrinks each edge inward.
  */
 namespace CollisionGeometry
 {
 /**
  * @struct Aabb
- * @brief Axis-aligned box in world space.
+ * @brief World-pixel bounds with downward Y.
  *
- * World pixels with +Y down, so @ref minY is the top edge and @ref maxY the bottom.
- * @ref MakeFeetAabb builds these rather than call sites aggregate-initializing them. No invariant
- * is enforced: two equal-size boxes inverted by the same over-large epsilon can never overlap, but
- * an inverted box still overlaps a larger normal one, so inversion is not a safety net.
+ * Bounds are not validated. An epsilon that inverts a box does not guarantee no overlap.
  */
 struct Aabb
 {
@@ -33,11 +28,10 @@ struct Aabb
 
 /**
  * @struct Hitbox
- * @brief Feet-anchored hitbox dimensions.
+ * @brief Local hitbox dimensions.
  *
- * @warning Unused: nothing in the tree constructs or consumes it, and the name shadows the live
- * per-entity ECS component ::Hitbox in Hitbox.hpp. The helpers below take loose @c halfWidth and
- * @c boxHeight floats rather than either struct. Do not build on this one.
+ * Entity collision uses the distinct global Hitbox component; the helpers take dimensions
+ * directly.
  */
 struct Hitbox
 {
@@ -46,14 +40,15 @@ struct Hitbox
 };
 
 /**
+ * @fn Aabb MakeFeetAabb(glm::vec2 feet, float halfWidth, float boxHeight, float eps = 0.0f)
  * @brief Build a feet-anchored AABB, anchored at bottom-center.
+ * @author Alex (<https://github.com/lextpf>)
  *
  * @param feet       Feet position in world pixels.
  * @param halfWidth  Half-width to each side of the feet.
  * @param boxHeight  Box height above the feet.
  * @param eps        Amount to shrink the box inward on every side, which avoids edge-on-edge
  *                   false positives. Pass 0 for an exact box.
- * @return           The resulting box.
  */
 inline Aabb MakeFeetAabb(glm::vec2 feet, float halfWidth, float boxHeight, float eps = 0.0f)
 {
@@ -61,14 +56,23 @@ inline Aabb MakeFeetAabb(glm::vec2 feet, float halfWidth, float boxHeight, float
         feet.x - halfWidth + eps, feet.x + halfWidth - eps, feet.y - boxHeight + eps, feet.y - eps};
 }
 
-/// @brief Test two axis-aligned boxes for overlap on both axes.
+/**
+ * @fn bool AabbOverlap(const Aabb& a, const Aabb& b)
+ * @brief Test for positive overlap on both axes.
+ * @author Alex (<https://github.com/lextpf>)
+ *
+ * Exact edge contact is not overlap. Supply ordered bounds; inverted boxes are not rejected.
+ */
 inline bool AabbOverlap(const Aabb& a, const Aabb& b)
 {
     return a.minX < b.maxX && a.maxX > b.minX && a.minY < b.maxY && a.maxY > b.minY;
 }
 
 /**
+ * @fn bool FeetBoxesOverlap(glm::vec2 a, glm::vec2 b, float halfWidth, float boxHeight, float \
+ *     eps)
  * @brief Test two same-size feet-anchored boxes for overlap.
+ * @author Alex (<https://github.com/lextpf>)
  *
  * @param a          Feet position of the first box.
  * @param b          Feet position of the second box.
