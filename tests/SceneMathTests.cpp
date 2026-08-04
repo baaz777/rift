@@ -1,5 +1,5 @@
-// Pure-math guard for the world-pixel <-> scene-space lift. No GL/Vulkan context
-// is created here (see the rift_tests constraint in CMakeLists.txt).
+// world Y maps to scene Z; scene Y carries height above the ground.
+
 #include "../src/SceneMath.hpp"
 
 #include <gtest/gtest.h>
@@ -11,7 +11,7 @@ constexpr float kTol = 1e-4f;
 
 TEST(SceneMathTest, ToSceneRelabelsAxes)
 {
-    // World Y (south) becomes scene Z; the height argument becomes scene Y.
+    // world Y (south) becomes scene Z; the height argument becomes scene Y.
     const glm::vec3 s = sceneMath::ToScene({120.0f, 340.0f}, 8.0f);
     EXPECT_NEAR(s.x, 120.0f, kTol);
     EXPECT_NEAR(s.y, 8.0f, kTol);
@@ -31,8 +31,6 @@ TEST(SceneMathTest, GroundQuadCornersFollowTheDocumentedOrder)
     glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
     sceneMath::MakeGroundQuad({16.0f, 32.0f}, {16.0f, 16.0f}, 0.0f, 0.0f, corners);
 
-    // Top-left is the map-north-west corner; the quad reads the same way round
-    // as the 2D path drew it.
     EXPECT_NEAR(corners[sceneMath::QUAD_TOP_LEFT].x, 16.0f, kTol);
     EXPECT_NEAR(corners[sceneMath::QUAD_TOP_LEFT].z, 32.0f, kTol);
     EXPECT_NEAR(corners[sceneMath::QUAD_TOP_RIGHT].x, 32.0f, kTol);
@@ -55,12 +53,9 @@ TEST(SceneMathTest, GroundQuadIsFlatAtTheGivenHeight)
 
 TEST(SceneMathTest, GroundQuadRotationMatchesTheFlatPipelineFormula)
 {
-    // Per-tile rotation must reproduce IRenderer::RotateCorners exactly, or
-    // rotated tiles change orientation the moment world3d is switched on. That
-    // routine rotates screen-space corners in a Y-DOWN frame:
-    //     p' = (p.x cos - p.y sin,  p.x sin + p.y cos)
-    // On the ground plane screen-x is world-x and screen-y is world-y (scene z),
-    // so the same numbers must come out here.
+    // rotation must match IRenderer::RotateCorners in the Y-down frame:
+    //     p' = (p.x cos - p.y sin, p.x sin + p.y cos)
+    // world X maps to scene X and world Y to scene Z.
     constexpr float kRotation = 37.0f;
     const glm::vec2 topLeft{0.0f, 0.0f};
     const glm::vec2 size{16.0f, 16.0f};
@@ -68,7 +63,6 @@ TEST(SceneMathTest, GroundQuadRotationMatchesTheFlatPipelineFormula)
     glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
     sceneMath::MakeGroundQuad(topLeft, size, 0.0f, kRotation, corners);
 
-    // Reference: the flat path's own maths, applied to the same corner offsets.
     const float rad = kRotation * 3.14159265f / 180.0f;
     const float cosR = std::cos(rad);
     const float sinR = std::sin(rad);
@@ -87,15 +81,12 @@ TEST(SceneMathTest, GroundQuadRotationMatchesTheFlatPipelineFormula)
 
 TEST(SceneMathTest, QuarterTurnRotatesCornersOntoTheirNeighbours)
 {
-    // A 90 degree turn must land each corner exactly where the next one was -
-    // the check that catches a wrong rotation SIGN, which a symmetric angle
-    // would hide.
+    // a quarter turn catches a reversed rotation sign that a symmetric angle could hide.
     glm::vec3 unrotated[sceneMath::QUAD_CORNER_COUNT];
     glm::vec3 rotated[sceneMath::QUAD_CORNER_COUNT];
     sceneMath::MakeGroundQuad({0.0f, 0.0f}, {16.0f, 16.0f}, 0.0f, 0.0f, unrotated);
     sceneMath::MakeGroundQuad({0.0f, 0.0f}, {16.0f, 16.0f}, 0.0f, 90.0f, rotated);
 
-    // Screen-space clockwise (Y-down): top-left moves to where top-right was.
     for (int i = 0; i < sceneMath::QUAD_CORNER_COUNT; ++i)
     {
         const int next = (i + 1) % sceneMath::QUAD_CORNER_COUNT;
@@ -125,10 +116,7 @@ TEST(SceneMathTest, RotationPreservesSizeAndCentre)
 
 TEST(SceneMathTest, AdjacentGroundQuadsShareExactCorners)
 {
-    // The reason the flat pipeline needed a `seamFix = 0.1f` tile inflation was
-    // that it warped each quad independently, so neighbours disagreed on their
-    // shared edge. Deriving corners from the tile grid makes them bit-identical,
-    // which is what lets the fudge go away.
+    // shared grid expressions give adjacent corners identical bits, preventing seams.
     glm::vec3 a[sceneMath::QUAD_CORNER_COUNT];
     glm::vec3 b[sceneMath::QUAD_CORNER_COUNT];
     sceneMath::MakeGroundQuad({0.0f, 0.0f}, {16.0f, 16.0f}, 0.0f, 0.0f, a);
@@ -139,8 +127,7 @@ TEST(SceneMathTest, AdjacentGroundQuadsShareExactCorners)
 
 TEST(SceneMathTest, SlopeHeightsAreConstantWhenBothEdgesMatch)
 {
-    // Ground and Raised both collapse to a level quad, so one code path serves all
-    // three roles and the flat case stays bit-identical to a plain ground quad.
+    // Ground and Raised have level corners, so slope application preserves their quads.
     glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
     sceneMath::MakeGroundQuad({32.0f, 48.0f}, {16.0f, 16.0f}, 0.0f, 0.0f, corners);
     sceneMath::ApplySlopeHeights({32.0f, 48.0f}, {16.0f, 16.0f}, 6.0f, 6.0f, false, corners);
@@ -177,9 +164,8 @@ TEST(SceneMathTest, SlopeAlongZRaisesTheSouthEdge)
 
 TEST(SceneMathTest, SlopeIsSampledByPositionSoRotationStillSlopesAlongTheWorldAxis)
 {
-    // Why heights come from each corner's world position rather than its index: a
-    // rotated quad's corners move, but the ground still slopes east-west.
-    // Assigning by index would rotate the slope along with the artwork.
+    // sample heights at rotated world positions; indexing corners would rotate the slope with the
+    // art.
     glm::vec3 corners[sceneMath::QUAD_CORNER_COUNT];
     sceneMath::MakeGroundQuad({32.0f, 48.0f}, {16.0f, 16.0f}, 0.0f, 90.0f, corners);
     sceneMath::ApplySlopeHeights({32.0f, 48.0f}, {16.0f, 16.0f}, 0.0f, 6.0f, false, corners);
