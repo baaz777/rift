@@ -1,5 +1,5 @@
-// Pure-math guard for clip-plane extraction and containment tests. No GL/Vulkan
-// context is created here (see the rift_tests constraint in CMakeLists.txt).
+// culling must retain partial intersections, including ground exposed by camera rotation.
+
 #include "../src/CameraRig.hpp"
 #include "../src/Frustum.hpp"
 #include "../src/MathConstants.hpp"
@@ -50,7 +50,6 @@ TEST(FrustumTest, RejectsPointsOutsideEachFace)
 
 TEST(FrustumTest, SphereStraddlingAFaceIsKept)
 {
-    // Culling must be conservative: never reject something partly visible.
     const frustum::Frustum f = frustum::FromViewProjection(MakeBoxViewProjection());
     EXPECT_TRUE(frustum::IntersectsSphere(f, {110.0f, 0.0f, 0.0f}, 20.0f));
     EXPECT_FALSE(frustum::IntersectsSphere(f, {130.0f, 0.0f, 0.0f}, 20.0f));
@@ -80,16 +79,14 @@ TEST(FrustumTest, ClassicCameraKeepsTheFocusAndRejectsFarOffMapTiles)
     const frustum::Frustum f = frustum::FromViewProjection(cameraRig::BuildViewProjection(params));
 
     EXPECT_TRUE(frustum::ContainsPoint(f, {1000.0f, 0.0f, 500.0f}));
-    // Well outside the 320x180 visible window on the ground plane.
+
     EXPECT_FALSE(frustum::ContainsPoint(f, {1000.0f + 400.0f, 0.0f, 500.0f}));
     EXPECT_FALSE(frustum::ContainsPoint(f, {1000.0f, 0.0f, 500.0f + 300.0f}));
 }
 
 TEST(FrustumTest, OrbitedCameraSeesWhatTheAxisAlignedRectWouldHaveMissed)
 {
-    // The whole reason the five inflated-rectangle cull tests had to go: with the
-    // camera yawed 45 degrees, ground content diagonally off the old axis-aligned
-    // window is squarely on screen.
+    // yaw 45 makes diagonally placed ground content visible outside the unrotated rectangle.
     cameraRig::RigParams params;
     params.target = {0.0f, 0.0f};
     params.visibleWorldSize = {320.0f, 180.0f};
