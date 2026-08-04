@@ -12,13 +12,10 @@ namespace cameraRig
 {
 namespace
 {
-// Below this the projection is treated as degenerate rather than dividing by it.
+
 constexpr float EPSILON = 1e-6f;
 
-// A corner ray that never meets the ground plane is followed this many scene
-// units before its endpoint is projected down, so GroundFootprintAabb returns a
-// finite box when the camera can see the horizon. Expressed as a multiple of
-// sceneRadius so it scales with the map rather than being an absolute fudge.
+// Horizon rays use a finite distance scaled by sceneRadius.
 constexpr float HORIZON_RAY_LIMIT_SCALE = 4.0f;
 }  // namespace
 
@@ -32,11 +29,9 @@ OrbitAngles ApplyOrbitDrag(OrbitAngles current, glm::vec2 dragPixels, glm::vec2 
     const glm::vec2 size = glm::max(viewportSize, glm::vec2(1.0f));
 
     OrbitAngles next;
-    // Negated on X so the ground tracks the cursor: dragging right swings the
-    // camera west, which reads as pushing the world right.
+    // Negative yaw makes the ground follow a rightward drag.
     next.yawRadians = WrapYaw(current.yawRadians - DRAG_SWEEP_RADIANS * (dragPixels.x / size.x));
-    // Positive on Y for the same reason: dragging down pulls the ground toward
-    // the viewer, which means the camera rises toward top-down.
+    // Raising pitch makes the ground follow a downward drag.
     next.pitchRadians =
         ClampPitch(current.pitchRadians + DRAG_SWEEP_RADIANS * (dragPixels.y / size.y));
     return next;
@@ -65,16 +60,13 @@ float DistanceForVisibleHeight(float visibleWorldHeight, float fovYRadians)
 glm::vec3 EyeDirection(float yawRadians, float pitchRadians)
 {
     const float cp = std::cos(pitchRadians);
-    // yaw 0 -> +Z (map south); yaw grows toward +X (map east).
+    // Yaw 0 -> +Z (map south); yaw grows toward +X (map east).
     return {std::sin(yawRadians) * cp, std::sin(pitchRadians), std::cos(yawRadians) * cp};
 }
 
 glm::vec3 UpVector(float yawRadians, float pitchRadians)
 {
-    // cross(right, forward) worked out in closed form. Doing it this way instead
-    // of orthogonalising against world-up matters: at pitch = pi/2 the eye
-    // direction is world-up, so the cross product would be zero - and pitch =
-    // pi/2 is exactly the Classic preset that must be reproduced.
+    // Analytical cross product stays defined at the top-down pitch pi/2.
     const float sy = std::sin(yawRadians);
     const float cy = std::cos(yawRadians);
     const float sp = std::sin(pitchRadians);
@@ -102,16 +94,13 @@ void DepthRange(const RigParams& params, float& outNear, float& outFar)
     if (params.kind == ProjectionKind::Orthographic)
     {
         // No perspective divide, so depth precision is uniform and a symmetric
-        // slab about the focus is fine. Negative near is legal here.
+        // slab about the focus is fine. negative near is legal here.
         outNear = distance - radius;
         outFar = distance + radius;
         return;
     }
 
-    // Push the near plane out as the camera dollies back, the way Pokemon DS Map
-    // Studio does: at a long distance the first few units in front of the eye
-    // hold nothing, and spending depth precision on them costs precision where
-    // the map actually is.
+    // Move the near plane with the eye to retain depth precision around the map.
     outNear = std::max(0.5f, distance * 0.05f);
     outFar = distance + radius * 2.0f;
 }
@@ -132,8 +121,7 @@ glm::mat4 BuildProjection(const RigParams& params)
 
     if (params.kind == ProjectionKind::Orthographic)
     {
-        // visibleWorldSize already carries the window's aspect ratio (it comes
-        // from viewScaling::VisibleWorldSizeZoomed), so no separate aspect term.
+        // visibleWorldSize already includes the viewport aspect ratio.
         return glm::ortho(-half.x, half.x, -half.y, half.y, nearPlane, farPlane);
     }
 
@@ -182,14 +170,12 @@ std::optional<glm::vec2> IntersectGroundPlane(const Ray& ray, float planeHeight)
 {
     if (std::abs(ray.direction.y) < EPSILON)
     {
-        // Parallel to the plane: the cursor is exactly on the horizon.
         return std::nullopt;
     }
 
     const float t = (planeHeight - ray.origin.y) / ray.direction.y;
     if (t < 0.0f)
     {
-        // The plane is behind the near plane, i.e. the cursor points at the sky.
         return std::nullopt;
     }
 
@@ -223,8 +209,7 @@ GroundBounds GroundFootprintAabb(const RigParams& params, float planeHeight)
 {
     const glm::mat4 invViewProj = glm::inverse(BuildViewProjection(params));
 
-    // Any viewport size works: the rays are built from NDC, so only the corner
-    // fractions matter. Use a unit box and address its corners directly.
+    // Corner rays depend on NDC fractions, so a unit viewport suffices.
     const glm::vec2 viewport{1.0f, 1.0f};
     const std::array<glm::vec2, 4> corners{
         glm::vec2{0.0f, 0.0f},
@@ -252,9 +237,7 @@ GroundBounds GroundFootprintAabb(const RigParams& params, float planeHeight)
         }
         else
         {
-            // Looking at or above the horizon. Follow the ray a bounded distance
-            // and take where it got to, so the caller receives a finite box that
-            // is flagged incomplete rather than an infinite one.
+            // Bound horizon misses and mark the footprint incomplete.
             bounds.complete = false;
             hit = sceneMath::ToWorld(ray.origin + ray.direction * rayLimit);
         }
@@ -285,8 +268,7 @@ void ApplyPreset(RigParams& params, Preset preset)
             break;
 
         case Preset::Free:
-            // Keep whatever the user dragged to; only guarantee a projection
-            // that can show an orbit.
+
             params.kind = ProjectionKind::Perspective;
             params.pitchRadians = ClampPitch(params.pitchRadians);
             params.yawRadians = WrapYaw(params.yawRadians);
