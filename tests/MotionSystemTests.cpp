@@ -1,6 +1,5 @@
-// Pure kinematics tests for MotionSystem over a bare Motor component. No GL, no
-// collision, no tilemap. (Formerly PlayerMotorTests, which drove the same logic
-// through the retired PlayerMotor wrapper.)
+// a bare Motor isolates acceleration and grid settling from collision response.
+
 #include <gtest/gtest.h>
 
 #include <glm/glm.hpp>
@@ -14,7 +13,6 @@ constexpr float DT = 1.0f / 60.0f;
 constexpr float TILE = 16.0f;
 }  // namespace
 
-// Acceleration: from rest, the first frame moves far less than a full-speed frame.
 TEST(MotionSystem, AcceleratesFromRest)
 {
     Motor m;
@@ -27,7 +25,6 @@ TEST(MotionSystem, AcceleratesFromRest)
     EXPECT_LT(glm::length(disp), fullSpeedFrame);  // not instantly at full speed
 }
 
-// After enough frames of held input, velocity converges to target speed.
 TEST(MotionSystem, ConvergesToTargetSpeed)
 {
     Motor m;
@@ -40,12 +37,8 @@ TEST(MotionSystem, ConvergesToTargetSpeed)
     EXPECT_NEAR(m.velocity.y, 0.0f, 0.5f);
 }
 
-// Releasing input does not stop instantly: momentum carries a multi-frame glide.
-// Tested at a high (bicycle) speed so the glide spans several tiles and the
-// "gradual, not instant" property is unambiguous regardless of where in a tile
-// the release happens. (At walk speed a release a pixel from a tile center
-// legitimately settles in 1-2 frames - that is correct snappy behavior, not a
-// regression, so it would make a brittle threshold.)
+// bicycle speed makes release span several tiles. at walking speed, release
+// near a tile center can settle in only one or two frames.
 TEST(MotionSystem, DeceleratesGraduallyOnRelease)
 {
     constexpr float BIKE_SPEED = 112.5f;
@@ -68,7 +61,6 @@ TEST(MotionSystem, DeceleratesGraduallyOnRelease)
     EXPECT_FALSE(MotionSystem::IsMoving(m));
 }
 
-// ZeroAxisX drops only the X velocity component.
 TEST(MotionSystem, ZeroAxisXClearsXOnly)
 {
     Motor m;
@@ -84,7 +76,6 @@ TEST(MotionSystem, ZeroAxisXClearsXOnly)
     EXPECT_GT(std::abs(m.velocity.y), 1.0f);
 }
 
-// Reset zeroes velocity.
 TEST(MotionSystem, ResetStops)
 {
     Motor m;
@@ -102,19 +93,18 @@ TEST(MotionSystem, ResetStops)
 
 namespace
 {
-// Nearest horizontal tile center for an X coordinate.
+
 float AlignedCenterX(float x)
 {
     return std::round((x - TILE * 0.5f) / TILE) * TILE + TILE * 0.5f;
 }
-// Nearest feet-at-tile-bottom line for a Y coordinate (a multiple of TILE).
+
 float AlignedBottomY(float y)
 {
     return std::round(y / TILE) * TILE;
 }
 }  // namespace
 
-// A horizontal glide ends on a tile center (X) and settles the idle axis (Y) onto its line.
 TEST(MotionSystemGrid, HorizontalGlideLandsOnGrid)
 {
     Motor m;
@@ -139,7 +129,6 @@ TEST(MotionSystemGrid, HorizontalGlideLandsOnGrid)
     EXPECT_NEAR(pos.y, AlignedBottomY(pos.y), 0.6f);
 }
 
-// A diagonal glide lands aligned on BOTH axes.
 TEST(MotionSystemGrid, DiagonalGlideLandsOnGrid)
 {
     Motor m;
@@ -163,7 +152,6 @@ TEST(MotionSystemGrid, DiagonalGlideLandsOnGrid)
     EXPECT_NEAR(pos.y, AlignedBottomY(pos.y), 0.6f);
 }
 
-// Starting idle but off-grid, the player gently settles onto the grid with no input.
 TEST(MotionSystemGrid, IdleOffGridSettlesOntoGrid)
 {
     Motor m;
