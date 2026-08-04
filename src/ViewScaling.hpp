@@ -6,27 +6,20 @@
 #include <cmath>
 
 /**
- * @brief Renderer-free helpers mapping window pixels to the visible world extent
- *        and to proportional UI scale.
- * @author Alex (https://github.com/lextpf)
+ * @brief Shared visible-world and UI scaling math.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
- *
- * Pure and deliberately free of GL/Vulkan so they are unit-testable without a
- * graphics context (rift_tests constraint). Namespace style mirrors the sibling
- * math helper `sceneMath`.
  */
 namespace viewScaling
 {
 /**
- * @brief Visible world extent in world pixels at zoom 1.0.
+ * @fn glm::vec2 VisibleWorldSize(int screenWidth, int screenHeight, int pixelScale)
+ * @brief Unzoomed world pixels for framebuffer dimensions.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * The single source of truth the ortho projection in Game::Render already uses
- * (screenPixels / PIXEL_SCALE); every camera/particle consumer should match it.
- *
- * @param screenWidth  Window/framebuffer width in pixels.
- * @param screenHeight Window/framebuffer height in pixels.
- * @param pixelScale   Integer pixel-upscale factor (clamped to >= 1).
- * @return Visible world size in world pixels (screen / pixelScale).
+ * @param screenWidth Framebuffer width in pixels.
+ * @param screenHeight Framebuffer height in pixels.
+ * @param pixelScale Clamped to at least 1.
  */
 inline glm::vec2 VisibleWorldSize(int screenWidth, int screenHeight, int pixelScale)
 {
@@ -35,13 +28,12 @@ inline glm::vec2 VisibleWorldSize(int screenWidth, int screenHeight, int pixelSc
 }
 
 /**
- * @brief Visible world extent after camera zoom (>1 shows less world).
+ * @fn glm::vec2 VisibleWorldSizeZoomed(int screenWidth, int screenHeight, int pixelScale, float \
+ * zoom)
+ * @brief Zoomed world pixels; zoom above 1 reduces the visible extent.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @param screenWidth  Window/framebuffer width in pixels.
- * @param screenHeight Window/framebuffer height in pixels.
- * @param pixelScale   Integer pixel-upscale factor (clamped to >= 1).
- * @param zoom         Camera zoom factor (clamped to >= 0.001; >1 shows less world).
- * @return Visible world size at zoom 1.0 divided by the guarded zoom.
+ * pixelScale is clamped to 1 and zoom to 0.001.
  */
 inline glm::vec2 VisibleWorldSizeZoomed(int screenWidth,
                                         int screenHeight,
@@ -53,19 +45,12 @@ inline glm::vec2 VisibleWorldSizeZoomed(int screenWidth,
 }
 
 /**
- * @brief Uniform UI scale for menu metrics.
+ * @fn float MenuUiScale(int screenWidth, int screenHeight, float referenceWidth, float \
+ * referenceHeight)
+ * @brief Scales UI by the smaller window-to-reference ratio.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Scales with the window so the menu stays proportional, but is clamped by the
- * narrower axis so text never overflows a narrow window.
- *
- * @param screenWidth     Current window width in pixels.
- * @param screenHeight    Current window height in pixels.
- * @param referenceWidth  Design-resolution width the raw pixel constants were
- *                        authored against (the default window size).
- * @param referenceHeight Design-resolution height the raw pixel constants were
- *                        authored against.
- * @return Scale factor (the smaller of the width and height ratios); 1.0 at the
- *         design resolution.
+ * All dimensions are pixels. reference dimensions are clamped to at least 1.
  */
 inline float MenuUiScale(int screenWidth,
                          int screenHeight,
@@ -78,22 +63,15 @@ inline float MenuUiScale(int screenWidth,
 }
 
 /**
- * @brief Tile dimensions the title world needs to fully cover the viewport.
+ * @fn glm::ivec2 RequiredTitleWorldTiles(int screenWidth, int screenHeight, int pixelScale, int \
+ * tileWidth, int tileHeight, float zoom, int marginTiles, int minTilesWide, int minTilesTall)
+ * @brief Covers the viewport and margins without shrinking below the base map.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Sizes the title world to cover the visible viewport plus a margin, never
- * smaller than the base map, so the title grass + particle zones fill any
- * window instead of running past the finite map edge.
+ * Screen and tile dimensions are pixels. pixelScale and tile dimensions clamp to 1;
+ * Zoom clamps to 0.001. marginTiles applies on every side.
  *
- * @param screenWidth  Window/framebuffer width in pixels.
- * @param screenHeight Window/framebuffer height in pixels.
- * @param pixelScale   Integer pixel-upscale factor (clamped to >= 1).
- * @param tileWidth    Tile width in pixels (clamped to >= 1).
- * @param tileHeight   Tile height in pixels (clamped to >= 1).
- * @param zoom         Camera zoom factor (clamped to >= 0.001).
- * @param marginTiles  Extra tiles added on every side beyond the visible area.
- * @param minTilesWide Minimum width in tiles (never returns below this).
- * @param minTilesTall Minimum height in tiles (never returns below this).
- * @return Title-world size in tiles: max(min, ceil(visible / tile) + 2*margin).
+ * @return Tile counts bounded below by minTilesWide and minTilesTall.
  */
 inline glm::ivec2 RequiredTitleWorldTiles(int screenWidth,
                                           int screenHeight,
