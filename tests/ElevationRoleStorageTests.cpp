@@ -1,10 +1,5 @@
-// Storage guard for the per-layer elevation role.
-//
-// Separate from ElevationRoleTests.cpp on purpose: that file pins the pure height
-// rule and deliberately includes no Tilemap, which is what lets it stand as proof
-// the rule is reachable without a map or a renderer. This file is where the
-// storage decision - per LAYER, unlike elevation itself which is per CELL - gets
-// pinned instead.
+// height is shared per cell, while elevation participation is stored independently on each layer.
+
 #include "../src/ElevationRole.hpp"
 #include "../src/Tilemap.hpp"
 
@@ -12,8 +7,7 @@
 
 TEST(ElevationRoleStorageTest, RoleIsPerLayerNotPerCell)
 {
-    // The storage decision, pinned. One cell, two layers, two different roles -
-    // this is what keeps water under a bridge while the deck above it rises.
+    // roles are per layer so water can remain below a raised bridge deck.
     Tilemap tm;
     tm.SetTilemapSize(8, 8, false);
 
@@ -26,8 +20,7 @@ TEST(ElevationRoleStorageTest, RoleIsPerLayerNotPerCell)
 
 TEST(ElevationRoleStorageTest, ElevationItselfStaysPerCell)
 {
-    // The other half of the split: the HEIGHT is shared by every layer at a cell.
-    // Only participation is per layer.
+    // height is shared per cell; each layer chooses whether to use it.
     Tilemap tm;
     tm.SetTilemapSize(8, 8, false);
     tm.SetElevation(3, 3, 6);
@@ -53,10 +46,7 @@ TEST(ElevationRoleStorageTest, EveryCellStartsGround)
 
 TEST(ElevationRoleStorageTest, ResizeKeepsTheArrayAddressable)
 {
-    // Guards the five-place checklist: a field missing from the resize_all fold
-    // leaves a zero-length vector, and then every write is undefined behaviour on
-    // the undersized vector rather than a graceful no-op. Writing to the far corner
-    // of the last layer is what catches it.
+    // write the last cell of the last layer to catch arrays omitted from resize_all.
     Tilemap tm;
     tm.SetTilemapSize(16, 16, false);
     tm.SetLayerElevationRole(15, 15, 9, ElevationRole::Ramp);
@@ -65,7 +55,6 @@ TEST(ElevationRoleStorageTest, ResizeKeepsTheArrayAddressable)
 
 TEST(ElevationRoleStorageTest, ResizingAgainResetsToGround)
 {
-    // Guards the reset_all fold in TileLayer::Clear.
     Tilemap tm;
     tm.SetTilemapSize(8, 8, false);
     tm.SetLayerElevationRole(2, 2, 0, ElevationRole::Ramp);
