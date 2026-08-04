@@ -18,17 +18,11 @@ void SetElevationTarget(Elevation& elev, float offset)
     }
 }
 
-// Every production movement path uses SurfaceSystem::ResolveMove plus CommitSupport instead,
-// and nothing outside ElevationZTests calls this. Its axis test is deliberately looser than the
-// live one, because it accepts a diagonal step onto a ramp, so tightening it here would silently
-// change what those tests pin.
 void UpdatePlane(Elevation& elev, int destTileElev, ElevationAxis tileAxis, int moveDx, int moveDy)
 {
     if (tileAxis == ElevationAxis::None)
     {
-        // Ground / non-elevated tile: always engage so an entity stepping
-        // off an elevated region snaps back to ground regardless of drop
-        // height. The step gate only protects elevated entries.
+        // Ground entry bypasses the height gate.
         elev.plane = destTileElev;
         elev.surface = destTileElev == 0 ? SupportSurface::Ground : SupportSurface::Elevation;
         SetElevationTarget(elev, static_cast<float>(destTileElev));
@@ -39,15 +33,12 @@ void UpdatePlane(Elevation& elev, int destTileElev, ElevationAxis tileAxis, int 
                                (tileAxis == ElevationAxis::Y && moveDy != 0);
     if (!movementMatchesAxis)
     {
-        // Perpendicular crossing - entity passes underneath/over without
-        // engaging the elevation; logical plane stays where it was.
         return;
     }
 
     int delta = destTileElev - elev.plane;
     if (std::abs(delta) > CharacterConstants::MAX_STEP_HEIGHT)
     {
-        // No ramp connecting the two planes - reject the direct jump.
         return;
     }
 
