@@ -4,27 +4,15 @@
 
 /**
  * @enum ElevationAxis
- * @brief Direction along which a tile's elevation engages a traversing entity.
- * @author Alex (https://github.com/lextpf)
+ * @brief Axis along which a tile engages elevation support.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * Auto-derived from neighbor elevations by Tilemap::GetElevationAxisAt(x, y): the stronger
- * elevation gradient wins; on a tie the longer contiguous elevated span wins; a truly
- * symmetric platform defaults to X.
- *
- * The axis is the engagement rule of the support graph in @ref SurfaceSystem. Crossing a
- * tile boundary changes an entity's support only when the step is pure along that tile's
- * axis - X requires @c moveDx nonzero and @c moveDy zero, Y requires @c moveDy nonzero and
- * @c moveDx zero. A diagonal step is rejected: it crosses the connector instead of walking
- * along it. Movement perpendicular to the axis passes underneath/over without engaging, so
- * the entity keeps whatever support it already had.
- *
- * - **None** : elevation 0 (bare ground). Emitted only for a cell of height 0, so it is
- *              never a valid entry target; leaving an elevated region onto such a cell is
- *              gated by the source cell's axis instead.
- * - **X**    : horizontal-extending elevation (e.g. east-west bridge); engages on pure
- *              east/west movement, ignored on north/south traversal.
- * - **Y**    : vertical-extending elevation (north-south bridge); symmetric.
+ * Tilemap chooses the stronger elevation gradient, then the longer elevated span, then X.
+ * Ground connects to a ramp only through an axis-aligned low-end crossing. Diagonal or
+ * perpendicular ground crossings stay on ground beneath the elevation. An elevated actor
+ * can cross to adjacent elevation within the step limit without matching the ramp axis.
+ * None denotes height zero. Exits to ground use the source axis and must pass the step limit.
  *
  * @verbatim
  *   Top-down tile elevations for an east-west (X-axis) bridge; 0 = bare ground.
@@ -36,7 +24,7 @@
  *   v    +---+---+---+---+---+
  *   S    | 0 | 0 | 0 | 0 | 0 |   Every nonzero cell in that row reports axis X.
  *        +---+---+---+---+---+
- *              ramp deck ramp
+ *           ramp  top  ramp
  *
  *   Side view, west <-> east travel (moveDy == 0, so the axis does engage):
  *
@@ -47,12 +35,6 @@
  *              enter climb  descend exit
  *              0->4  4->8    8->4   4->0
  * @endverbatim
- *
- * Each of those four steps must also pass the height gate in
- * @ref CharacterConstants::MAX_STEP_HEIGHT; see @ref SurfaceSystem for which quantity each
- * edge kind compares against.
- *
- * @see Tilemap::GetElevationAxisAt, SurfaceSystem::ResolveMove, SupportState
  */
 enum class ElevationAxis : uint8_t
 {
