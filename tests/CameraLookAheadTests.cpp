@@ -1,4 +1,3 @@
-// Unit tests for camera look-ahead. CameraController is renderer-free.
 #include <gtest/gtest.h>
 
 #include <glm/glm.hpp>
@@ -21,7 +20,6 @@ CameraUpdateParams BaseParams()
 }
 }  // namespace
 
-// With rightward velocity, the follow target leads to the right of the raw target.
 TEST(CameraLookAheadTests, LeadsInVelocityDirection)
 {
     CameraController cam;
@@ -36,7 +34,6 @@ TEST(CameraLookAheadTests, LeadsInVelocityDirection)
     EXPECT_NEAR(cam.GetState().followTarget.y, p.playerFollowTarget.y, 1e-3f);
 }
 
-// Zero look-ahead distance disables the lead entirely.
 TEST(CameraLookAheadTests, ZeroDistanceDisablesLead)
 {
     CameraController cam;
