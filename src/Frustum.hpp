@@ -6,33 +6,18 @@
 #include <cmath>
 
 /**
- * @brief View-frustum extraction and containment tests for scene-space culling.
- * @author Alex (https://github.com/lextpf)
+ * @brief Scene-space frustum culling.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * The one cull test for the 3D path, meant to replace the five inflated-rectangle
- * checks the flat path spreads it across (renderer viewport expansion, world
- * render cull, particle cull, editor overlay cull, no-projection structure cull).
- * A rotating camera has no axis-aligned footprint, so there is nothing to inflate
- * and no pad factor to tune: the six clip planes are the honest test.
- *
- * Only the tile pass is ported so far - see @c Game::RenderFrame3D. Particles,
- * editor overlays and no-projection structures are still drawn by the flat
- * pipeline and have no frustum counterpart yet.
- *
- * Planes are extracted straight from a view-projection matrix by the standard
- * Gribb-Hartmann method: each clip-space inequality @f$ -w \le c \le w @f$
- * rearranges into a plane whose coefficients are a sum or difference of two rows
- * of the matrix. Stored as @c vec4(a,b,c,d) with the convention that
- * @f$ ax + by + cz + d \ge 0 @f$ means *inside*.
- *
- * All tests are conservative: they never reject something visible, but may
- * accept something just outside a corner. That is the correct bias for culling.
+ * Gribb-Hartmann extraction forms planes from matrix row sums and differences.
+ * Planes store (a, b, c, d); ax + by + cz + d >= 0 is inside. Tests may retain objects
+ * outside a corner. Sky, weather and ambient sheets use the flat rectangle cull.
  */
 namespace frustum
 {
 
-/// @brief Indices into a @c Frustum's plane array.
+/// Indices into a Frustum's plane array.
 enum PlaneIndex
 {
     PLANE_LEFT = 0,
@@ -44,20 +29,22 @@ enum PlaneIndex
     PLANE_COUNT = 6
 };
 
-/// @brief Six normalized clip planes, inside-positive.
+/// Six normalized clip planes, inside-positive.
 struct Frustum
 {
     std::array<glm::vec4, PLANE_COUNT> planes{};
 };
 
 /**
- * @brief Extract the six clip planes from a view-projection matrix.
+ * @fn Frustum FromViewProjection(const glm::mat4& viewProj)
+ * @brief Extracts normalized planes from an OpenGL clip volume.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Assumes an OpenGL-style clip volume with @f$ z \in [-w, w] @f$, which is what
- * GLM produces by default and what both Rift backends already consume (the
- * Vulkan path applies its own Y flip downstream of this).
+ * Supply the column-major projection * view matrix before backend clip correction.
+ * Clip Z must range from -w to w. A Vulkan-corrected zero-to-w matrix uses a different near plane.
+ * Nondegenerate normals are normalized so sphere radii use scene units.
  *
- * @param viewProj Combined view-projection matrix (column-major, as GLM builds).
+ * @pre The matrix must describe a finite, nondegenerate viewing volume.
  */
 inline Frustum FromViewProjection(const glm::mat4& viewProj)
 {
@@ -87,13 +74,23 @@ inline Frustum FromViewProjection(const glm::mat4& viewProj)
     return f;
 }
 
-/// @brief Signed distance from @p point to @p plane; positive is inside.
+/**
+ * @fn float SignedDistance(const glm::vec4& plane, glm::vec3 point)
+ * @brief Evaluate a point against an inside-positive plane.
+ * @author Alex (<https://github.com/lextpf>)
+ *
+ * The result is a distance in scene units only when the plane normal has unit length.
+ */
 inline float SignedDistance(const glm::vec4& plane, glm::vec3 point)
 {
     return plane.x * point.x + plane.y * point.y + plane.z * point.z + plane.w;
 }
 
-/// @brief Whether a point lies inside all six planes.
+/**
+ * @fn bool ContainsPoint(const Frustum& f, glm::vec3 point)
+ * @brief Whether a point lies inside all six planes.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 inline bool ContainsPoint(const Frustum& f, glm::vec3 point)
 {
     for (const glm::vec4& p : f.planes)
@@ -107,10 +104,17 @@ inline bool ContainsPoint(const Frustum& f, glm::vec3 point)
 }
 
 /**
+ * @fn bool IntersectsSphere(const Frustum& f, glm::vec3 center, float radius)
  * @brief Whether a sphere intersects the frustum.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Rejects only when the center is further outside a single plane than the
- * radius, so a sphere straddling a corner is conservatively kept.
+ * Reject only when the center is farther outside a plane than the radius.
+ * Tangency counts as intersection. A sphere outside a frustum corner can be retained.
+ *
+ * @param f Scene-space frustum with normalized inward-facing planes.
+ * @param center Sphere center in scene units, without a camera offset.
+ * @param radius Nonnegative sphere radius in scene units.
+ * @pre Plane normals have unit length.
  */
 inline bool IntersectsSphere(const Frustum& f, glm::vec3 center, float radius)
 {
@@ -125,11 +129,14 @@ inline bool IntersectsSphere(const Frustum& f, glm::vec3 center, float radius)
 }
 
 /**
+ * @fn bool IntersectsAabb(const Frustum& f, glm::vec3 minCorner, glm::vec3 maxCorner)
  * @brief Whether an axis-aligned box intersects the frustum.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Uses the positive-vertex test: for each plane, only the box corner furthest
- * along the plane normal can be inside, so if that corner is outside the whole
- * box is.
+ * Test the box corner farthest along each inward plane normal. If even that corner is
+ * outside the plane, the entire box is outside. Passing all planes is conservative near corners.
+ *
+ * @pre Each component of `minCorner` is no greater than the corresponding `maxCorner` component.
  */
 inline bool IntersectsAabb(const Frustum& f, glm::vec3 minCorner, glm::vec3 maxCorner)
 {
