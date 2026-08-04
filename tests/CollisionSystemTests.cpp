@@ -1,17 +1,5 @@
-// Tests for CollisionSystem, the corner-cut / slide logic that was carved out of
-// the former CollisionResolver class into stateless free functions. The collision
-// math is where a regression is most painful (player can walk through walls, gets
-// stuck on corners, etc.), so these tests focus on the public entry points:
-//
-//   - CollidesAt / CollidesWithTilesStrict
-//   - CalculateFollowAlpha (pure)
-//
-// We stand up a real `Tilemap` + a default `Hitbox` (the standard player box) and
-// drive collision tests through the CollisionSystem free functions.
-//
-// Hitbox is 16x16 pixels anchored at bottom-center. Tile size is 16x16. So
-// "player at feet (tx*16 + 8, ty*16 + 16)" centers the hitbox over tile
-// (tx, ty) with feet at its bottom edge.
+// the 16x16 hitbox sits at the feet. on a 16x16 tile, feet at
+// (tx * 16 + 8, ty * 16 + 16) place the box over that tile.
 
 #include <gtest/gtest.h>
 
@@ -25,13 +13,11 @@ namespace
 {
 constexpr float TILE = 16.0f;
 
-// Build a feet (bottom-center) position for the player at a given tile.
 glm::vec2 FeetAtTile(int tx, int ty)
 {
     return glm::vec2(tx * TILE + TILE * 0.5f, ty * TILE + TILE);
 }
 
-// Convenience: small, mostly-empty tilemap we can paint collision tiles onto.
 class CollisionSystemTest : public ::testing::Test
 {
 protected:
@@ -44,17 +30,14 @@ protected:
 };
 }  // namespace
 
-// --- CalculateFollowAlpha (pure) ---------------------------------------------
-
 TEST(CollisionSystemStatic, FollowAlpha_ZeroDelta_Yields_Zero)
 {
-    // Zero dt -> nothing should move, alpha should be 0.
     EXPECT_FLOAT_EQ(CollisionSystem::CalculateFollowAlpha(0.0f, 0.2f), 0.0f);
 }
 
 TEST(CollisionSystemStatic, FollowAlpha_ReachesEpsilon_At_SettleTime)
 {
-    // The formula should produce alpha = 1 - epsilon when dt == settleTime.
+    // the formula should produce alpha = 1 - epsilon when dt == settleTime.
     const float settle = 0.2f;
     const float eps = 0.01f;
     float a = CollisionSystem::CalculateFollowAlpha(settle, settle, eps);
@@ -63,14 +46,13 @@ TEST(CollisionSystemStatic, FollowAlpha_ReachesEpsilon_At_SettleTime)
 
 TEST(CollisionSystemStatic, FollowAlpha_Is_FrameRateIndependent)
 {
-    // Advancing by dt then another dt must reach the same state as advancing
-    // by 2*dt once. Follow = 1 - (1-alpha)^n equivalence.
+    // two dt steps must equal one 2*dt step: alpha = 1 - (1 - alphaStep)^n.
     const float settle = 0.2f;
     const float dt = 0.033f;
     float a1 = CollisionSystem::CalculateFollowAlpha(dt, settle);
     float a2 = CollisionSystem::CalculateFollowAlpha(2.0f * dt, settle);
 
-    // Remaining distance after two dt steps = (1-a1)^2; after one 2dt step = (1-a2).
+    // remaining distance after two dt steps = (1-a1)^2; after one 2dt step = (1-a2).
     float twoStep = (1.0f - a1) * (1.0f - a1);
     float oneStep = (1.0f - a2);
     EXPECT_NEAR(twoStep, oneStep, 1e-5f);
@@ -78,13 +60,10 @@ TEST(CollisionSystemStatic, FollowAlpha_Is_FrameRateIndependent)
 
 TEST(CollisionSystemStatic, FollowAlpha_ClampedToUnit)
 {
-    // Huge dt should not overshoot 1.0.
     float a = CollisionSystem::CalculateFollowAlpha(1000.0f, 0.2f);
     EXPECT_LE(a, 1.0f);
     EXPECT_GE(a, 0.0f);
 }
-
-// --- CollidesWithTilesStrict -------------------------------------------------
 
 TEST_F(CollisionSystemTest, Strict_Empty_NoCollision)
 {
@@ -101,17 +80,13 @@ TEST_F(CollisionSystemTest, Strict_CenteredOnSolidTile_IsBlocked)
 
 TEST_F(CollisionSystemTest, Strict_OffscreenTilesAreSkipped)
 {
-    // Strict mode skips out-of-bounds tiles rather than treating them as
-    // solid; map-edge containment must be enforced elsewhere (by callers
-    // checking dimensions or by a border of solid tiles). This test pins
-    // that behavior so a future change is visible.
+    // strict collision skips out-of-bounds tiles; callers enforce map boundaries.
     glm::vec2 pos = FeetAtTile(-1, 5);
     EXPECT_FALSE(CollisionSystem::CollidesWithTilesStrict(hitbox, pos, &tilemap, -1, 0, false));
 }
 
 TEST_F(CollisionSystemTest, Strict_WalkingIntoWall_IsBlocked)
 {
-    // Wall at (6, 5). Player with feet on that tile (hitbox fully overlaps).
     PaintSolid(6, 5);
     glm::vec2 pos = FeetAtTile(6, 5);  // feet dead-center of solid tile
     EXPECT_TRUE(CollisionSystem::CollidesWithTilesStrict(hitbox, pos, &tilemap, 1, 0, false));
@@ -119,14 +94,10 @@ TEST_F(CollisionSystemTest, Strict_WalkingIntoWall_IsBlocked)
 
 TEST_F(CollisionSystemTest, Strict_StandingInClearedAdjacentTile_NotBlocked)
 {
-    // Wall to the right. Player standing on clear tile to the left with the
-    // full hitbox on the clear side. No overlap with the wall tile.
     PaintSolid(6, 5);
     glm::vec2 pos = FeetAtTile(4, 5);  // two tiles away, safely clear
     EXPECT_FALSE(CollisionSystem::CollidesWithTilesStrict(hitbox, pos, &tilemap, 1, 0, false));
 }
-
-// --- CollidesAt: unified dispatch --------------------------------------------
 
 TEST_F(CollisionSystemTest, CollidesAt_ForwardsToStrict)
 {
@@ -137,7 +108,6 @@ TEST_F(CollisionSystemTest, CollidesAt_ForwardsToStrict)
 
 TEST_F(CollisionSystemTest, CollidesAt_NpcOverlap_IsBlocked)
 {
-    // An NPC at the player's tile should block, even if tiles are empty.
     std::vector<CharacterCollisionBody> npcs = {
         CharacterCollisionBody{FeetAtTile(5, 5), {SupportSurface::Ground, 0}}};
     glm::vec2 pos = FeetAtTile(5, 5);
