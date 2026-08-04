@@ -11,20 +11,21 @@
 #include <string_view>
 
 /**
- * @brief Orbit-camera geometry: view/projection construction, unprojection and
- *        ground-plane queries.
- * @author Alex (https://github.com/lextpf)
+ * @brief Orbit-camera matrices, unprojection and ground queries.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * Renderer-free by construction (no GL/Vulkan types, no @c IRenderer) so it is
- * unit-testable without a graphics context, matching the @c rift_tests rule.
- * Nothing here is stateful. @c Game owns the live orbit state (preset, yaw,
- * pitch) and rebuilds a @ref RigParams every frame in @c Game::BuildCameraRig,
- * which reinterprets the flat @ref CameraController position - a viewport
- * top-left - as a ground focus point.
+ * Game::BuildCameraRig converts the flat viewport corner to a ground focus each frame.
+ * Scene +X is east, +Z is south, and +Y is up. yaw is measured around +Y;
+ * Pitch is above the horizon. eye offsets are distance * cos(pitch) horizontally and
+ * distance * sin(pitch) vertically.
  *
- * @htmlonly
- * <pre class="mermaid">
+ * Orthographic yaw 0 and pitch pi/2 reproduce the flat view. ScreenToGround inverts the
+ * render transform. Picking uses framebuffer pixels with a top-left origin; convert window
+ * coordinates to that scale before calling when the framebuffer size differs.
+ * The editor still uses flat picking and is incorrect at nonzero yaw.
+ *
+ * ```mermaid
  * flowchart TD
  *     G["Game: m_CameraPreset, m_CameraYaw, m_CameraPitch"]
  *     C["CameraController: position, zoom"]
@@ -41,19 +42,8 @@
  *     GF --> TR["Tilemap::ComputeTileRange"]
  *     R --> OR["billboard::Orient"]
  *     OR --> DR["character and upright-tile quads"]
- * </pre>
- * @endhtmlonly
+ * ```
  *
- * Every transform is a matrix with an inverse, so a picking path built on
- * @ref ScreenToGround is guaranteed to agree with what @ref BuildViewProjection
- * drew.
- * @note The editor is not ported yet. It still picks through the flat
- * screen-to-world formula, so picking is wrong at any non-zero yaw.
- *
- * The camera looks at a focus point on the ground plane and orbits it at
- * @c distance, aimed by two angles. Yaw is the eye's compass bearing around the
- * focus - a rotation about scene +Y - shown here looking straight down, in the
- * `(-pi, pi]` range @ref WrapYaw maintains:
  * @verbatim
  *                       yaw = pi
  *                    north (map -Y)
@@ -65,115 +55,89 @@
  *                    south (map +Y)
  *                       yaw = 0
  * @endverbatim
- * So yaw 0 puts the eye due south of the focus, looking north. Along that
- * bearing the eye stands `distance * cos(pitch)` out from the focus and
- * `distance * sin(pitch)` above the plane, so pitch pi/2 is straight overhead.
- * Scene space is map space plus height: scene +X = map +X (east), scene +Z =
- * map +Y (south), scene +Y = up.
- *
- * At @c yaw 0, @c pitch pi/2 and @ref ProjectionKind::Orthographic the image is
- * the flat path's top-down view exactly: screen +X is world +X and screen +Y is
- * world +Y. That is the @ref Preset::Classic regression baseline.
- *
- * @see sceneMath, billboard, frustum, CameraController
  */
 namespace cameraRig
 {
 
-/// @brief Whether the projection converges (perspective) or not (orthographic).
+/// Whether the projection converges (perspective) or not (orthographic).
 enum class ProjectionKind
 {
     Orthographic = 0,
     Perspective = 1
 };
 
-/// @brief Named camera configurations.
+/// Named camera configurations.
 enum class Preset
 {
-    /// Flat top-down orthographic. Pixel-identical to the pre-overhaul view.
+    /// Flat top-down orthographic view.
     Classic = 0,
-    /// A long lens at a distance is very nearly orthographic, which is what
-    /// keeps tile artwork readable instead of visibly keystoning.
+    /// Long-distance perspective keeps tile distortion small.
     DS = 1,
     /// User-driven orbit; angles come from mouse drag rather than the preset.
     Free = 2
 };
 
-/// @brief Number of entries in @ref ProjectionKind.
 inline constexpr std::size_t PROJECTION_KIND_COUNT = 2;
-/// @brief Number of entries in @ref Preset.
+
 inline constexpr std::size_t PRESET_COUNT = 3;
 
-/// @name Angle and framing limits
-/// @{
-/**
- * @brief Shallowest elevation the camera may orbit to.
- *
- * Below this the ground plane is nearly edge-on: the visible footprint runs away
- * toward the horizon and ground-plane picking becomes numerically useless.
- */
+/// Minimum pitch in radians; avoids near-horizontal ground rays.
 inline constexpr float MIN_PITCH_RADIANS = 10.0f * rift::PiF / 180.0f;
-/// Straight overhead. Also the @ref Preset::Classic value.
+/// Straight overhead. also the Preset::Classic value.
 inline constexpr float MAX_PITCH_RADIANS = rift::PiF * 0.5f;
 /// Elevation of the real DS overworld camera: atan(35 / 28).
 inline constexpr float DS_PITCH_RADIANS = 51.34f * rift::PiF / 180.0f;
 /// Vertical FOV of the real DS overworld camera.
 inline constexpr float DS_FOV_RADIANS = 15.0f * rift::PiF / 180.0f;
-/**
- * @brief Wider FOV intended for the editor's 3D view, where seeing more context
- *        beats matching the game.
- *
- * @note Not wired up. No caller reads it, and @ref ApplyPreset overwrites
- * @c fovYRadians for @ref Preset::Classic and @ref Preset::DS.
- */
+/// Editor FOV in radians; ApplyPreset does not select this value.
 inline constexpr float EDITOR_FOV_RADIANS = 30.0f * rift::PiF / 180.0f;
-/// @}
 
 /**
  * @struct RigParams
  * @brief Everything needed to build a view and a projection.
+ * @author Alex (<https://github.com/lextpf>)
  */
 struct RigParams
 {
     /// Ground focus point in world pixels (look-at point).
     glm::vec2 target{0.0f};
-    float focusHeight = 0.0f;  ///< Scene height of the ground plane under the focus.
-    float yawRadians = 0.0f;   ///< 0 places the eye due map-south of the focus.
-    /// Elevation above the horizon; pi/2 is straight down. See @ref ClampPitch.
+    float focusHeight = 0.0f;
+    float yawRadians = 0.0f;  ///< 0 places the eye due map-south of the focus.
+    /// Elevation above the horizon; pi/2 is straight down. see ClampPitch.
     float pitchRadians = MAX_PITCH_RADIANS;
-    /// Vertical field of view. Also sets the orbit distance, and hence the depth slab,
-    /// under @ref ProjectionKind::Orthographic - where it has no effect on the image.
+    /// Vertical FOV in radians; also controls orbit distance under orthographic projection.
     float fovYRadians = DS_FOV_RADIANS;
     ProjectionKind kind = ProjectionKind::Orthographic;
     /**
-     * @brief Visible world extent in world pixels after zoom, i.e. what
-     *        `viewScaling::VisibleWorldSizeZoomed` already returns.
+     * @brief Zoom-adjusted visible extent in world pixels.
      *
-     * Drives the orthographic half-extents and, through
-     * @ref DistanceForVisibleHeight, the perspective orbit distance - so `zoom`
-     * keeps its existing meaning under both projections.
+     * Sets orthographic extents and the perspective distance at the focus.
      */
     glm::vec2 visibleWorldSize{320.0f, 180.0f};
-    /// Half-extent of scene content to keep inside the depth range, in world
-    /// pixels. Normally about the map diagonal.
+    /**
+     * @brief Half-extent of scene content to keep inside the depth range, in world pixels.
+     *
+     * normally about the map diagonal.
+     */
     float sceneRadius = 4096.0f;
 };
 
 /**
  * @struct Basis
  * @brief Derived camera frame in scene space.
+ * @author Alex (<https://github.com/lextpf>)
  */
 struct Basis
 {
-    glm::vec3 eye{0.0f};      ///< Camera position.
-    glm::vec3 focus{0.0f};    ///< Look-at point on the ground plane.
-    glm::vec3 forward{0.0f};  ///< Unit vector from @c eye toward @c focus.
-    glm::vec3 right{0.0f};    ///< Unit vector to the camera's right.
-    glm::vec3 up{0.0f};       ///< Unit vector up in the image.
-    float distance = 0.0f;    ///< Orbit distance from @c focus to @c eye.
+    glm::vec3 eye{0.0f};
+    glm::vec3 focus{0.0f};
+    glm::vec3 forward{0.0f};
+    glm::vec3 right{0.0f};
+    glm::vec3 up{0.0f};
+    float distance = 0.0f;
 };
 
-/// @brief A scene-space ray, used for picking.
+/// A scene-space ray, used for picking.
 struct Ray
 {
     glm::vec3 origin{0.0f};
@@ -183,139 +147,154 @@ struct Ray
 /**
  * @struct GroundBounds
  * @brief Axis-aligned world-pixel bounds of the camera's ground footprint.
+ * @author Alex (<https://github.com/lextpf>)
  */
 struct GroundBounds
 {
     glm::vec2 min{0.0f};
     glm::vec2 max{0.0f};
     /**
-     * @brief Whether @c min / @c max are the true footprint or a stand-in.
+     * @brief Whether min / max are the true footprint or a stand-in.
      *
      * The function must return a finite box, but with the horizon on screen the
-     * visible ground genuinely runs to infinity, so corner rays that miss the
+     * visible ground runs to infinity, so corner rays that miss the
      * plane are cut off.
      */
     bool complete = true;
 };
 
-/// @brief Orbit angles a drag produces.
+/// Orbit angles a drag produces.
 struct OrbitAngles
 {
     float yawRadians = 0.0f;
     float pitchRadians = MAX_PITCH_RADIANS;
 };
 
-/**
- * @brief How far a full-window mouse sweep rotates the camera.
- *
- * A drag across the whole window turns 100 degrees on either axis, matching the
- * orbit feel of established tile-map editors: slow enough to frame a shot
- * precisely without needing a modifier key for fine control.
- */
+/// Rotation in radians for a full-window drag; 100 degrees per axis.
 inline constexpr float DRAG_SWEEP_RADIANS = 100.0f * rift::PiF / 180.0f;
 
 /**
- * @brief Apply a mouse drag to the orbit angles.
+ * @fn OrbitAngles ApplyOrbitDrag(OrbitAngles current, glm::vec2 dragPixels, glm::vec2 \
+ * viewportSize)
+ * @brief Dragging right moves the eye west; dragging down raises it.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Dragging right swings the camera west so the ground appears to follow the
- * cursor, and dragging down lifts the camera toward top-down as though pulling
- * the ground toward you. Pitch is clamped and yaw wrapped, so repeated dragging
- * cannot walk the camera under the map or drift the angle unbounded.
- *
- * @param current      Angles before the drag.
- * @param dragPixels   Cursor delta this frame, in framebuffer pixels (Y down).
- * @param viewportSize Framebuffer size, so the sweep is resolution independent.
+ * Wraps yaw and clamps pitch. dragPixels and viewportSize are framebuffer pixels, with Y down.
  */
 OrbitAngles ApplyOrbitDrag(OrbitAngles current, glm::vec2 dragPixels, glm::vec2 viewportSize);
 
-/// @brief Clamp an elevation into `[MIN_PITCH_RADIANS, MAX_PITCH_RADIANS]`.
+/**
+ * @fn float ClampPitch(float pitchRadians)
+ * @brief Clamps pitch to MIN_PITCH_RADIANS through MAX_PITCH_RADIANS, inclusive.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 float ClampPitch(float pitchRadians);
 
-/// @brief Wrap a yaw into `(-pi, pi]` so it stays finite under repeated dragging.
+/**
+ * @fn float WrapYaw(float yawRadians)
+ * @brief Wraps radians above -pi through +pi, inclusive at +pi.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 float WrapYaw(float yawRadians);
 
 /**
- * @brief Orbit distance that frames @p visibleWorldHeight at the focus depth.
+ * @fn float DistanceForVisibleHeight(float visibleWorldHeight, float fovYRadians)
+ * @brief Distance that frames the visible height at the focus.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @f[ d = \frac{h/2}{\tan(fov_y/2)} @f]
+ * Height and distance are world pixels; fovYRadians is radians.
  *
- * Measured perpendicular to the view ray at the focus, so at @c pitch pi/2 it is
- * exactly the visible ground height and the perspective and orthographic images
- * agree at the center of the screen. At shallower elevations the ground
- * footprint stretches away from the camera, which is the intended effect.
+ * $$
+ * d = (h / 2) / \tan(fov_y / 2)
+ * $$
  */
 float DistanceForVisibleHeight(float visibleWorldHeight, float fovYRadians);
 
-/// @brief Unit vector from the focus toward the eye.
+/**
+ * @fn glm::vec3 EyeDirection(float yawRadians, float pitchRadians)
+ * @brief Unit vector from the focus toward the eye.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 glm::vec3 EyeDirection(float yawRadians, float pitchRadians);
 
 /**
- * @brief Camera up vector for the given angles.
- *
- * Derived analytically rather than by orthogonalising against world-up, which
- * would be degenerate at @c pitch pi/2 - precisely the @ref Preset::Classic case.
+ * @fn glm::vec3 UpVector(float yawRadians, float pitchRadians)
+ * @brief Analytical up vector, defined even at pitch pi/2.
+ * @author Alex (<https://github.com/lextpf>)
  */
 glm::vec3 UpVector(float yawRadians, float pitchRadians);
 
-/// @brief Resolve the full camera frame.
+/**
+ * @fn Basis MakeBasis(const RigParams& params)
+ * @brief Resolve the full camera frame.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 Basis MakeBasis(const RigParams& params);
 
 /**
- * @brief Near and far plane distances for @p params.
+ * @fn void DepthRange(const RigParams& params, float& outNear, float& outFar)
+ * @brief Depth range in scene units.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Two branches with different contracts. Orthographic returns a symmetric slab
- * about the orbit distance, so @p outNear may be negative - legal without a
- * perspective divide, where depth precision is uniform. Perspective instead
- * returns `max(0.5, 0.05 * distance)` and `distance + 2 * sceneRadius`, which
- * spends precision where the map is rather than on the empty space in front of a
- * dollied-back eye.
- *
- * @param params   Rig to measure. Orbit distance comes from @c visibleWorldSize.y
- *                 and @c fovYRadians under both projections.
- * @param outNear  Receives the near plane distance.
- * @param outFar   Receives the far plane distance.
+ * Orthographic projection uses a symmetric slab around the orbit distance and can have
+ * a negative near plane. perspective uses max(0.5, 0.05 * distance) through
+ * distance + 2 * sceneRadius. Both derive distance from visibleWorldSize.y and fovYRadians.
  */
 void DepthRange(const RigParams& params, float& outNear, float& outFar);
 
-/// @brief View matrix (scene space -> camera space).
+/**
+ * @fn glm::mat4 BuildView(const RigParams& params)
+ * @brief View matrix (scene space -> camera space).
+ * @author Alex (<https://github.com/lextpf>)
+ */
 glm::mat4 BuildView(const RigParams& params);
 
-/// @brief Projection matrix, orthographic or perspective per @c params.kind.
+/**
+ * @fn glm::mat4 BuildProjection(const RigParams& params)
+ * @brief Projection matrix, orthographic or perspective per params.kind.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 glm::mat4 BuildProjection(const RigParams& params);
 
-/// @brief Combined `projection * view`.
+/**
+ * @fn glm::mat4 BuildViewProjection(const RigParams& params)
+ * @brief Combined projection * view.
+ * @author Alex (<https://github.com/lextpf>)
+ */
 glm::mat4 BuildViewProjection(const RigParams& params);
 
 /**
- * @brief Build a picking ray through a viewport pixel.
+ * @fn Ray ScreenToRay(glm::vec2 pixel, glm::vec2 viewportSize, const glm::mat4& invViewProj)
+ * @brief Unprojects a framebuffer pixel to a normalized scene-space ray.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @warning A singular @p invViewProj, or a degenerate near-to-far delta, yields
- * the default @ref Ray: origin at the scene origin, pointing straight down. That
- * is indistinguishable from a real ray, and @ref IntersectGroundPlane then reports
- * a confident hit at world (0,0). Validate the matrix before calling rather than
- * testing the result.
+ * Pixel Y increases downward. Supply the inverse of the rig's projection * view matrix,
+ * before backend clip correction. Each viewport dimension is clamped to at least one pixel.
+ * The ray starts on the near plane; its direction points toward the far plane.
  *
- * @param pixel        Cursor position in framebuffer pixels, Y measured down
- *                     from the top (GLFW's convention).
- * @param viewportSize Framebuffer size in pixels.
- * @param invViewProj  Inverse of @ref BuildViewProjection.
- * @return             Scene-space ray with a normalized direction.
+ * A near-zero homogeneous divisor or near-to-far distance returns the default downward ray
+ * at the origin. This can produce a valid-looking ground hit at world (0, 0).
+ * Singular matrices are not detected reliably; callers must supply a valid inverse.
  */
 Ray ScreenToRay(glm::vec2 pixel, glm::vec2 viewportSize, const glm::mat4& invViewProj);
 
 /**
- * @brief Intersect a ray with the horizontal plane at @p planeHeight.
- * @return World-pixel hit position, or @c nullopt when the ray is parallel to
- *         the plane or would only meet it behind the camera (i.e. the cursor is
- *         on or above the horizon).
+ * @fn std::optional<glm::vec2> IntersectGroundPlane(const Ray& ray, float planeHeight)
+ * @brief Intersect a ray with the horizontal plane at planeHeight.
+ * @author Alex (<https://github.com/lextpf>)
+ *
+ * @param ray Ray in scene units; the intersection must lie at or ahead of its origin.
+ * @param planeHeight Height in scene units, independent of the terrain elevation map.
+ * @return World-pixel hit position, or `nullopt` when the ray is parallel to the plane
+ *         or the intersection lies behind the ray origin.
  */
 std::optional<glm::vec2> IntersectGroundPlane(const Ray& ray, float planeHeight);
 
 /**
- * @brief Unproject a viewport pixel onto the ground plane.
- *
- * The one screen-to-world inverse for the 3D path. Every caller must handle the
- * empty result: a cursor pointing at the sky genuinely has no world position.
+ * @fn std::optional<glm::vec2> ScreenToGround(glm::vec2 pixel, glm::vec2 viewportSize, const \
+ * glm::mat4& invViewProj, float planeHeight = 0.0f)
+ * @brief Returns no position when the cursor ray misses the ground.
+ * @author Alex (<https://github.com/lextpf>)
  */
 std::optional<glm::vec2> ScreenToGround(glm::vec2 pixel,
                                         glm::vec2 viewportSize,
@@ -323,56 +302,53 @@ std::optional<glm::vec2> ScreenToGround(glm::vec2 pixel,
                                         float planeHeight = 0.0f);
 
 /**
+ * @fn std::optional<glm::vec2> WorldToScreen(glm::vec3 scenePoint, const glm::mat4& viewProj, \
+ * glm::vec2 viewportSize)
  * @brief Project a scene point to framebuffer pixels.
- * @return Pixel position with Y measured down, or @c nullopt when the point is
- *         behind the camera.
+ * @author Alex (<https://github.com/lextpf>)
+ *
+ * This does not test the viewport or near/far planes. Points outside the visible frame can return
+ * coordinates outside the viewport.
+ *
+ * @return Framebuffer pixels with Y measured down, or `nullopt` for nonpositive or near-zero
+ *         clip W. For perspective projection, this rejects points at or behind the eye.
  */
 std::optional<glm::vec2> WorldToScreen(glm::vec3 scenePoint,
                                        const glm::mat4& viewProj,
                                        glm::vec2 viewportSize);
 
 /**
- * @brief Axis-aligned world bounds of the ground area the camera can see.
+ * @fn GroundBounds GroundFootprintAabb(const RigParams& params, float planeHeight = 0.0f)
+ * @brief Bound the ground footprint of the four viewport corner rays.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Casts rays through the four viewport corners. Particle spawning, tile range
- * computation and overlay culling all need a world-space extent, and once the
- * camera can yaw that extent is a rotated trapezoid - so it is measured here
- * rather than assumed to be a camera-aligned rectangle.
+ * The bounds always include the focus point. A ray that misses the plane uses a finite sample
+ * at four times the scene radius and clears `complete`; this bounds the estimate near the horizon.
+ * The result is in world pixels and is not clamped to the map.
  */
 GroundBounds GroundFootprintAabb(const RigParams& params, float planeHeight = 0.0f);
 
 /**
- * @brief Apply a preset's angles, projection kind and field of view to @p params.
+ * @fn void ApplyPreset(RigParams& params, Preset preset)
+ * @brief Applies preset angles, projection and FOV while retaining framing.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Framing (@c target, @c focusHeight, @c visibleWorldSize, @c sceneRadius) is left
- * untouched. @ref Preset::Free leaves the angles alone as well - it only re-clamps
- * the pitch and re-wraps the yaw - so switching to it keeps whatever the user last
- * dragged to.
- *
- * @warning @ref Preset::Classic and @ref Preset::DS overwrite @c fovYRadians with
- * @ref DS_FOV_RADIANS. Only @ref Preset::Free preserves a caller-set FOV.
+ * Classic and DS overwrite fovYRadians with DS_FOV_RADIANS. Free retains FOV and angles,
+ * only wrapping yaw and clamping pitch.
  */
 void ApplyPreset(RigParams& params, Preset preset);
 
 /**
- * @brief Clamp the ground focus so the camera stays over the map.
+ * @fn glm::vec2 ClampFocusToMap(glm::vec2 focus, glm::vec2 mapPixelSize)
+ * @brief Clamps the focus point to map bounds in world pixels.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * The flat pipeline clamped a viewport rectangle into `[0, mapSize - viewSize]`,
- * which has no meaning once the visible footprint is a rotated trapezoid, so this
- * clamps the focus point instead.
- *
- * @note Not on the live path yet. @c Game::BuildCameraRig derives its focus from
- * the flat camera, which @ref CameraController::ClampToMapBounds has already
- * clamped with the old viewport rule.
- *
- * @param focus         Desired focus in world pixels.
- * @param mapPixelSize  Map size in world pixels.
+ * Game::BuildCameraRig instead derives the focus from the clamped flat camera.
  */
 glm::vec2 ClampFocusToMap(glm::vec2 focus, glm::vec2 mapPixelSize);
 
 }  // namespace cameraRig
 
-/// @brief Reflection for @ref cameraRig::ProjectionKind.
 template <>
 struct EnumTraits<cameraRig::ProjectionKind>
     : EnumTraitsBase<cameraRig::ProjectionKind, EnumTraits<cameraRig::ProjectionKind>>
@@ -381,7 +357,6 @@ struct EnumTraits<cameraRig::ProjectionKind>
     static constexpr std::string_view Names[] = {"Orthographic", "Perspective"};
 };
 
-/// @brief Reflection for @ref cameraRig::Preset (the `cam.preset` command).
 template <>
 struct EnumTraits<cameraRig::Preset>
     : EnumTraitsBase<cameraRig::Preset, EnumTraits<cameraRig::Preset>>
