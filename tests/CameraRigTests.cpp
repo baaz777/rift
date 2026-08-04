@@ -1,11 +1,5 @@
-// Pure-math guard for the orbit camera: view/projection construction,
-// unprojection, and ground-plane queries. No GL/Vulkan context is created here
-// (see the rift_tests constraint in CMakeLists.txt).
-//
-// The load-bearing test in this file is ClassicPresetReproducesTheFlatMapping:
-// it pins that yaw 0 + pitch 90 + orthographic is exactly the pre-overhaul
-// `(worldPos - cameraTopLeft) * screen / visibleWorld` mapping, which is the
-// regression baseline every later phase of the 3D overhaul is checked against.
+// the Classic preset must reproduce the flat mapping:
+// (worldPos - cameraTopLeft) * screen / visibleWorld.
 #include "../src/CameraRig.hpp"
 #include "../src/MathConstants.hpp"
 #include "../src/SceneMath.hpp"
@@ -36,8 +30,6 @@ cameraRig::RigParams MakeParams(cameraRig::Preset preset)
 }
 }  // namespace
 
-// --- Angles and framing ---------------------------------------------------
-
 TEST(CameraRigTest, ClampPitchHoldsTheOrbitAboveTheHorizon)
 {
     EXPECT_NEAR(cameraRig::ClampPitch(Degrees(-30.0f)), cameraRig::MIN_PITCH_RADIANS, kAngleTol);
@@ -49,7 +41,7 @@ TEST(CameraRigTest, WrapYawKeepsDraggingFinite)
 {
     EXPECT_NEAR(cameraRig::WrapYaw(Degrees(370.0f)), Degrees(10.0f), 1e-4f);
     EXPECT_NEAR(cameraRig::WrapYaw(Degrees(-370.0f)), Degrees(-10.0f), 1e-4f);
-    // A full turn collapses to zero rather than accumulating.
+
     EXPECT_NEAR(cameraRig::WrapYaw(Degrees(720.0f)), 0.0f, 1e-4f);
     EXPECT_NEAR(cameraRig::WrapYaw(Degrees(180.0f)), rift::PiF, 1e-4f);
 }
@@ -59,8 +51,7 @@ TEST(CameraRigTest, DistanceFramesTheRequestedHeight)
     // tan(45 deg) == 1, so a 90 degree FOV frames a height equal to twice the
     // distance.
     EXPECT_NEAR(cameraRig::DistanceForVisibleHeight(180.0f, Degrees(90.0f)), 90.0f, kTol);
-    // Narrowing the lens pushes the camera back for the same framing, which is
-    // what makes the 15 degree DS camera read as nearly orthographic.
+    // a narrow FOV moves the camera back to preserve framing.
     EXPECT_GT(cameraRig::DistanceForVisibleHeight(180.0f, cameraRig::DS_FOV_RADIANS), 600.0f);
 }
 
@@ -80,8 +71,7 @@ TEST(CameraRigTest, EyeDirectionPlacesTheCameraSouthAtYawZero)
 
 TEST(CameraRigTest, UpVectorIsWellDefinedLookingStraightDown)
 {
-    // Orthogonalising against world-up would be degenerate here, which is
-    // exactly the Classic preset - hence the closed-form derivation.
+    // the Classic preset points along world-up, which makes a cross-product basis degenerate.
     const glm::vec3 up = cameraRig::UpVector(0.0f, cameraRig::MAX_PITCH_RADIANS);
     EXPECT_NEAR(glm::length(up), 1.0f, kTol);
     EXPECT_NEAR(up.z, -1.0f, kTol);  // map north is up on screen
@@ -113,8 +103,6 @@ TEST(CameraRigTest, BasisIsOrthonormalAndOrbitsTheFocus)
     EXPECT_NEAR(b.focus.z, params.target.y, kTol);
     EXPECT_GT(b.eye.y, b.focus.y);  // the camera is always above the ground
 }
-
-// --- Presets --------------------------------------------------------------
 
 TEST(CameraRigTest, PresetsSelectTheDocumentedAngles)
 {
@@ -161,12 +149,9 @@ TEST(CameraRigTest, PresetNamesRoundTrip)
         "Perspective");
 }
 
-// --- The Classic baseline -------------------------------------------------
-
 TEST(CameraRigTest, ClassicPresetReproducesTheFlatMapping)
 {
-    // The pre-overhaul pipeline drew at (worldPos - cameraTopLeft), then applied
-    // ortho(0, visibleW, visibleH, 0). The 3D rig must land on the same pixel.
+    // the flat mapping subtracts cameraTopLeft, then applies ortho(0, visibleW, visibleH, 0).
     const cameraRig::RigParams params = MakeParams(cameraRig::Preset::Classic);
     const glm::mat4 viewProj = cameraRig::BuildViewProjection(params);
     const glm::vec2 screen{1520.0f, 855.0f};
@@ -206,8 +191,7 @@ TEST(CameraRigTest, ClassicPresetKeepsScreenAxesAlignedWithWorldAxes)
     const glm::vec2 south = *cameraRig::WorldToScreen(
         sceneMath::ToScene(params.target + glm::vec2(0.0f, 16.0f)), viewProj, screen);
 
-    // World +X moves right on screen, world +Y moves DOWN - the Y-down world
-    // convention survives the trip through a Y-up scene.
+    // world +X maps right and world +Y maps down, despite the scene using Y for height.
     EXPECT_GT(east.x, centre.x);
     EXPECT_NEAR(east.y, centre.y, kTol);
     EXPECT_GT(south.y, centre.y);
@@ -227,13 +211,9 @@ TEST(CameraRigTest, ClassicGroundFootprintIsExactlyTheVisibleRect)
     EXPECT_NEAR(bounds.max.y, topLeft.y + params.visibleWorldSize.y, kTol);
 }
 
-// --- Picking --------------------------------------------------------------
-
 TEST(CameraRigTest, ScreenToGroundInvertsWorldToScreen)
 {
-    // Round-tripping under a yawed, pitched perspective camera is the property
-    // the flat pipeline could never offer: it had no inverse of its warp at all,
-    // which is why editor painting silently disagreed with what was drawn.
+    // editor picking must invert projection under perspective and camera rotation.
     cameraRig::RigParams params = MakeParams(cameraRig::Preset::DS);
     params.yawRadians = Degrees(41.0f);
     params.pitchRadians = Degrees(55.0f);
@@ -268,8 +248,7 @@ TEST(CameraRigTest, ScreenToGroundRoundTripsUnderTheClassicPreset)
     const glm::mat4 invViewProj = glm::inverse(cameraRig::BuildViewProjection(params));
     const glm::vec2 screen{1520.0f, 855.0f};
 
-    // Top-left pixel maps to the top-left of the visible world rect, matching
-    // what Editor::ScreenToTileCoords used to compute linearly.
+    // the top-left pixel maps to the visible world rectangle's top-left corner.
     const std::optional<glm::vec2> hit =
         cameraRig::ScreenToGround({0.0f, 0.0f}, screen, invViewProj);
     ASSERT_TRUE(hit.has_value());
@@ -284,7 +263,6 @@ TEST(CameraRigTest, ScreenToGroundRespectsAnElevatedPlane)
     const glm::mat4 invViewProj = glm::inverse(cameraRig::BuildViewProjection(params));
     const glm::vec2 screen{1520.0f, 855.0f};
 
-    // Straight down: raising the plane must not shift the hit sideways.
     const std::optional<glm::vec2> hit =
         cameraRig::ScreenToGround({760.0f, 427.5f}, screen, invViewProj, 32.0f);
     ASSERT_TRUE(hit.has_value());
@@ -294,8 +272,7 @@ TEST(CameraRigTest, ScreenToGroundRespectsAnElevatedPlane)
 
 TEST(CameraRigTest, ScreenToGroundReturnsNothingAboveTheHorizon)
 {
-    // Every caller has to handle this: unlike the old linear formula, a cursor
-    // pointing at the sky genuinely has no world position.
+    // a ray toward the sky has no ground intersection.
     cameraRig::RigParams params = MakeParams(cameraRig::Preset::DS);
     params.pitchRadians = cameraRig::MIN_PITCH_RADIANS;
     params.fovYRadians = Degrees(60.0f);
@@ -314,18 +291,14 @@ TEST(CameraRigTest, WorldToScreenRejectsPointsBehindTheCamera)
     const glm::mat4 viewProj = cameraRig::BuildViewProjection(params);
     const cameraRig::Basis basis = cameraRig::MakeBasis(params);
 
-    // A point well behind the eye, along the reverse view direction.
     const glm::vec3 behind = basis.eye - basis.forward * 1000.0f;
     EXPECT_FALSE(cameraRig::WorldToScreen(behind, viewProj, {1520.0f, 855.0f}).has_value());
 }
 
-// --- Ground footprint -----------------------------------------------------
-
 TEST(CameraRigTest, YawedFootprintCoversTheRotatedDiagonal)
 {
-    // A 45 degree yaw makes the visible ground a rotated trapezoid, so the AABB
-    // must grow past the un-rotated window - the failure mode that would thin
-    // weather out on the rotated-away side if spawn rects stayed axis-aligned.
+    // a 45 degree yaw expands the ground AABB beyond the unrotated view; weather
+    // spawning must cover the expanded region.
     cameraRig::RigParams params = MakeParams(cameraRig::Preset::Classic);
     const cameraRig::GroundBounds straight = cameraRig::GroundFootprintAabb(params);
 
@@ -345,7 +318,7 @@ TEST(CameraRigTest, FootprintIsFlaggedIncompleteWhenTheHorizonIsVisible)
 
     const cameraRig::GroundBounds bounds = cameraRig::GroundFootprintAabb(params);
     EXPECT_FALSE(bounds.complete);
-    // Still finite and still contains the focus, so spawn/cull callers can use it.
+
     EXPECT_TRUE(std::isfinite(bounds.min.x));
     EXPECT_TRUE(std::isfinite(bounds.max.y));
     EXPECT_LE(bounds.min.x, params.target.x);
@@ -371,8 +344,6 @@ TEST(CameraRigTest, FootprintAlwaysContainsTheFocus)
     }
 }
 
-// --- Depth range and clamping ---------------------------------------------
-
 TEST(CameraRigTest, PerspectiveDepthRangeBracketsTheFocus)
 {
     const cameraRig::RigParams params = MakeParams(cameraRig::Preset::DS);
@@ -389,10 +360,7 @@ TEST(CameraRigTest, PerspectiveDepthRangeBracketsTheFocus)
 
 TEST(CameraRigTest, PerspectiveNearPlaneGrowsWithDistance)
 {
-    // Depth precision is not spent on the empty space in front of a dollied-out
-    // camera (the trick Pokemon DS Map Studio uses).
-    // Note: `near` and `far` are macros in the Windows headers - never use them
-    // as identifiers anywhere in this codebase.
+    // the near plane excludes empty space in front of the camera to preserve depth precision.
     const cameraRig::RigParams close = MakeParams(cameraRig::Preset::DS);
     cameraRig::RigParams distant = close;
     distant.visibleWorldSize *= 8.0f;
