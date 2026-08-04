@@ -79,8 +79,7 @@ void UpdateAnimation(AnimationState& anim,
 {
     anim.animationTime += dt;
 
-    // Frame cadence scales with actual speed: legs slow during accel/decel ramps and
-    // quicken at sprint. The base walk speed is the 1.0x cadence reference.
+    // Base walk speed defines normal animation cadence.
     constexpr float ANIM_REF_SPEED = CharacterConstants::PLAYER_BASE_SPEED;
     float speed = glm::length(motor.velocity);
     float animScale = std::clamp(ANIM_REF_SPEED / std::max(speed, 1.0f), 0.4f, 2.5f);
@@ -118,7 +117,7 @@ glm::vec2 CurrentTileCenter(glm::vec2 position, float tileSize)
         return glm::vec2(0.0f);
     }
 
-    constexpr float EPS = 0.001f;  // Small epsilon to handle edge cases
+    constexpr float EPS = 0.001f;  // nudge boundary feet into the tile above.
 
     const int tileX = TileMath::TileIndex(position.x, tileSize);
     const int tileY = TileMath::AnchorTileRow(position.y, tileSize, EPS);
@@ -140,7 +139,6 @@ void Step(Transform& xf,
           const Tilemap* tilemap,
           const std::vector<CharacterCollisionBody>* npcBodies)
 {
-    // Fallback tile size when there is no tilemap; matches PlayerSystem::SetTilePosition.
     constexpr float TILE_SIZE = 16.0f;
 
     auto signWithDeadzone = [](float v, float dz = 0.2f) -> int
@@ -169,12 +167,11 @@ void Step(Transform& xf,
     }
     else
     {
-        // Clear axis tracking so the next key-down is a rising edge.
+        // Clear edges so the next key press can change facing.
         input.prevAxisXActive = false;
         input.prevAxisYActive = false;
     }
 
-    // Target speed from the active mode (bicycle > running > walking).
     float targetSpeed = speed.value;
     if (modes.isBicycling)
     {
@@ -188,11 +185,10 @@ void Step(Transform& xf,
 
     const float tileSize = tilemap ? static_cast<float>(tilemap->GetTileWidth()) : TILE_SIZE;
 
-    // Kinematics: the motor owns velocity, accel/decel, and the grid-resolved stop.
     glm::vec2 disp =
         MotionSystem::ComputeDisplacement(motor, xf.position, inputDir, targetSpeed, tileSize, dt);
 
-    // Animation is driven by actual velocity, not raw input, so glide frames animate.
+    // Use velocity so glide frames continue animating.
     const bool moving = MotionSystem::IsMoving(motor);
     const AnimationType targetAnim =
         (modes.isRunning || modes.isBicycling) ? AnimationType::RUN : AnimationType::WALK;
@@ -216,7 +212,6 @@ void Step(Transform& xf,
         anim.animationTime = 0.0f;
     }
 
-    // No collision world (no-clip / null tilemap): integrate raw displacement.
     if (!tilemap)
     {
         xf.position += disp;
@@ -225,14 +220,12 @@ void Step(Transform& xf,
 
     const SupportState support = CharacterKinematics::GetSupport(elev);
 
-    // Track the last safe position whenever the box is not embedded in a solid tile.
     if (!CollisionSystem::CollidesWithTilesStrict(
             hitbox, xf.position, tilemap, 0, 0, false, support))
     {
         movement.lastSafeTileCenter = CurrentTileCenter(xf.position, tileSize);
     }
 
-    // Fully settled and idle: stuck-recovery only, then bail.
     if (glm::length(disp) < 1e-4f)
     {
         if (auto teleport =
@@ -244,13 +237,8 @@ void Step(Transform& xf,
                                                      tilemap,
                                                      npcBodies))
         {
-            // Re-snap the feet to a tile's bottom-center and reset the motor, the way
-            // PlayerSystem::SetTilePosition does. Use the resolved tileSize (not the 16px
-            // fallback) so non-16px maps snap correctly.
-            // TODO: teleport already sits at a tile's bottom edge, so the bare
-            // TileMath::TileIndex row floors to the next row down and the snap lands one tile
-            // south of the tile FindClosestSafeTileCenter validated. Use TileMath::AnchorTileRow
-            // for the row, or assign *teleport directly.
+            // TODO: use AnchorTileRow or assign *teleport; TileIndex snaps bottom-edge feet one
+            // tile south.
             const int tileX = TileMath::TileIndex(teleport->x, tileSize);
             const int tileY = TileMath::TileIndex(teleport->y, tileSize);
             xf.position = TileMath::TileFeetCenter(tileX, tileY, tileSize);
@@ -259,7 +247,6 @@ void Step(Transform& xf,
         return;
     }
 
-    // Decay hysteresis timers while there is movement to resolve.
     if (movement.slideTimer > 0.0f)
     {
         movement.slideTimer -= dt;
@@ -271,7 +258,6 @@ void Step(Transform& xf,
 
     glm::vec2 normalizedDir = (glm::length(disp) > 1e-5f) ? glm::normalize(disp) : glm::vec2(0.0f);
 
-    // Reset slide hysteresis when the dominant axis flips.
     bool curHorizontal = std::abs(normalizedDir.x) > std::abs(normalizedDir.y);
     bool lastHorizontal =
         std::abs(input.lastMovementDirection.x) > std::abs(input.lastMovementDirection.y);
@@ -350,7 +336,6 @@ void Step(Transform& xf,
         }
     }
 
-    // Lane snapping (gentle), only for non-diagonal motion that isn't blocked/sliding.
     int effDx = signStep(desiredMovement.x);
     int effDy = signStep(desiredMovement.y);
     bool effDiagonal = (effDx != 0 && effDy != 0);
@@ -370,9 +355,7 @@ void Step(Transform& xf,
                                                effDy);
     }
 
-    // Final collision check with axis-separated fallback. Keep the exact probe
-    // that accepted the resolved movement: its direction flags describe player
-    // intent, while a tiny lane-snap correction is not diagonal input.
+    // Retain the accepted probe; lane correction must not count as diagonal input.
     CollisionSystem::MovementProbeResult acceptedProbe =
         probeMovement(xf.position + desiredMovement, effDx, effDy, effDiagonal);
     if (acceptedProbe.IsBlocked())
@@ -436,15 +419,7 @@ void Step(Transform& xf,
         }
     }
 
-    // Blocked-axis velocity kill: when an axis was wanted but produced almost no motion,
-    // drop that velocity component so speed cannot build invisibly against a wall.
-    //
-    // Exception: a corner slide redirects the blocked axis into a productive perpendicular
-    // move, so the forward momentum is not wasted against a wall - keep it. Zeroing it here
-    // makes the next frame ramp the forward speed from zero, the player drifts slowly back
-    // into the corner, slides again, and re-zeros: the climb stutters to ~1/3 speed ("jelly").
-    // Preserving the velocity lets a held input round the corner at full speed, matching the
-    // pre-momentum behavior where desiredMovement was always normalizedDir * speed * dt.
+    // Clear blocked-axis velocity except after a corner slide, which redirects momentum.
     if (!didCornerSlide)
     {
         if (std::abs(disp.x) > 1e-4f && std::abs(desiredMovement.x) < 1e-4f)
