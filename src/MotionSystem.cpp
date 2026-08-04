@@ -5,7 +5,7 @@
 
 namespace
 {
-// Move value toward target by at most maxDelta.
+
 float ApproachScalar(float value, float target, float maxDelta)
 {
     float diff = target - value;
@@ -16,30 +16,23 @@ float ApproachScalar(float value, float target, float maxDelta)
     return value + (diff > 0.0f ? maxDelta : -maxDelta);
 }
 
-// The two rest families are deliberately different because the anchor is bottom-center:
-// X lands on tile centers (8, 24, 40, ...), Y on tile bottom edges (0, 16, 32, ...).
-// Making them match would put the feet off-center horizontally or half a tile above the
-// floor vertically.
+// Bottom-center feet rest at X tile centers (8, 24, 40, ...) and Y bottom edges (0, 16, 32, ...).
 
-// Nearest horizontal tile center for an X coordinate.
 float AlignedRestX(float x, float tileSize)
 {
     return std::round((x - tileSize * 0.5f) / tileSize) * tileSize + tileSize * 0.5f;
 }
 
-// Nearest feet-at-tile-bottom line for a Y coordinate (a multiple of tileSize).
 float AlignedRestY(float y, float tileSize)
 {
     return std::round(y / tileSize) * tileSize;
 }
 
-// Decelerate one axis to land exactly on target. Updates vel in place and
-// returns this frame's displacement for the axis.
+// Integrate one axis to its grid target; update velocity and return displacement.
 float ResolveAxisStop(float pos, float target, float& vel, const MotorParams& p, float dt)
 {
     float toTarget = target - pos;
 
-    // (Near-)stationary axis: ease gently onto its grid line, then hold.
     if (std::abs(vel) <= p.speedEpsilon)
     {
         vel = 0.0f;
@@ -52,23 +45,21 @@ float ResolveAxisStop(float pos, float target, float& vel, const MotorParams& p,
     }
 
     float dir = (vel > 0.0f) ? 1.0f : -1.0f;
-    float remaining = toTarget * dir;  // signed distance still to travel along heading
+    float remaining = toTarget * dir;
 
-    // Target reached or already passed: land exactly on it and stop.
     if (remaining <= p.stopEpsilon)
     {
         vel = 0.0f;
         return toTarget;
     }
 
-    // Deceleration needed to stop exactly at the target, clamped to a sane band.
+    // Solve v^2 / 2d, bounded by the configured deceleration limits.
     float speed = std::abs(vel);
     float effDecel =
         std::clamp((speed * speed) / (2.0f * remaining), p.minResolvedDecel, p.maxResolvedDecel);
     float newSpeed = std::max(0.0f, speed - effDecel * dt);
-    float disp = (speed + newSpeed) * 0.5f * dt * dir;  // trapezoidal
+    float disp = (speed + newSpeed) * 0.5f * dt * dir;
 
-    // Never overshoot the aligned target.
     if (disp * dir > remaining)
     {
         disp = toTarget;
@@ -106,16 +97,12 @@ glm::vec2 ComputeDisplacement(Motor& motor,
         return motor.velocity * dt;
     }
 
-    // No input: decelerate, resolving the stop onto the tile grid per axis. targetSpeed is
-    // deliberately unused here - how fast the player wanted to go says nothing about how
-    // they should stop; deceleration is solved from the remaining distance and MotorParams.
+    // Stopping uses remaining distance and MotorParams, independent of targetSpeed.
     (void)targetSpeed;
 
     if (!motor.hasStopTarget)
     {
-        // Latch a per-axis tile-aligned stop point from the predicted free stop. Latched
-        // once and held: re-deriving it each frame would chase a shrinking prediction and
-        // never converge.
+        // Latch once; recalculating the free-stop prediction each frame would prevent convergence.
         if (std::abs(motor.velocity.x) > motor.params.speedEpsilon)
         {
             float dir = (motor.velocity.x > 0.0f) ? 1.0f : -1.0f;
@@ -145,7 +132,6 @@ glm::vec2 ComputeDisplacement(Motor& motor,
     disp.x = ResolveAxisStop(position.x, motor.stopTarget.x, motor.velocity.x, motor.params, dt);
     disp.y = ResolveAxisStop(position.y, motor.stopTarget.y, motor.velocity.y, motor.params, dt);
 
-    // Fully aligned and stopped: clear the latch so the next stop re-latches afresh.
     if (!IsMoving(motor) && glm::length(disp) < 1e-4f)
     {
         motor.hasStopTarget = false;
