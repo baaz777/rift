@@ -11,8 +11,7 @@ namespace
 {
 bool MovementMatchesAxis(ElevationAxis axis, int moveDx, int moveDy)
 {
-    // A ramp connector is an edge in the support graph, not a loose directional
-    // hint. Crossing its side or its diagonal corner must not engage it.
+    // Only axis-aligned crossings engage a ramp connector.
     return (axis == ElevationAxis::X && moveDx != 0 && moveDy == 0) ||
            (axis == ElevationAxis::Y && moveDy != 0 && moveDx == 0);
 }
@@ -41,9 +40,7 @@ SurfaceTransition ResolveBoundary(SupportState current,
 
     if (current.surface == SupportSurface::Ground)
     {
-        // Ground is continuous underneath every elevated footprint. Enter the
-        // elevation surface only from a genuinely ground-only source cell into
-        // the low end of a ramp along its authored/derived run.
+        // Enter elevation from bare ground at the ramp's low end; ground continues underneath.
         const bool entersFromBareGround = sourceHeight == 0 && destinationHeight != 0;
         const bool stepIsReachable =
             std::abs(destinationHeight) <= CharacterConstants::MAX_STEP_HEIGHT;
@@ -60,8 +57,7 @@ SurfaceTransition ResolveBoundary(SupportState current,
 
     if (destinationHeight != 0)
     {
-        // Once supported by elevation, adjacency supplies the topology. Height
-        // may vary along a ramp, but an abrupt change is not a connected edge.
+        // Elevated neighbours connect only within the step-height limit.
         if (std::abs(destinationHeight - current.height) > CharacterConstants::MAX_STEP_HEIGHT)
         {
             return {current, false};
@@ -69,8 +65,7 @@ SurfaceTransition ResolveBoundary(SupportState current,
         return {{SupportSurface::Elevation, destinationHeight}, true};
     }
 
-    // Leave elevation only through the low end of its ramp. Deck edges without
-    // a ramp are disconnected instead of silently dropping the character.
+    // Leave elevation through a ramp low end; an unconnected deck edge blocks the move.
     const bool exitIsReachable = std::abs(sourceHeight) <= CharacterConstants::MAX_STEP_HEIGHT;
     const bool exitsAlongRamp =
         MovementMatchesAxis(tilemap.GetElevationAxisAt(sourceX, sourceY), moveDx, moveDy);
