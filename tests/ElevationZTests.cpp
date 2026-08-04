@@ -1,7 +1,5 @@
-// Tests for the z-axis elevation system: auto-derived elevation axis,
-// CharacterKinematics plane update with axis-engagement + step-gate, and the
-// z-aware skip in CollisionSystem. Pure data paths - no GL/Vulkan
-// context is created (per CMakeLists.txt:352-355).
+// feet positions use bottom-center anchors on 16x16 tiles; movement and collision share the plane
+// state.
 
 #include <gtest/gtest.h>
 
@@ -21,13 +19,11 @@ namespace
 {
 constexpr float TILE = 16.0f;
 
-// Build a feet (bottom-center) position for the player at a given tile.
 glm::vec2 FeetAtTile(int tx, int ty)
 {
     return glm::vec2(tx * TILE + TILE * 0.5f, ty * TILE + TILE);
 }
 
-// Small helper: stand up an empty tilemap we can paint elevation onto.
 Tilemap MakeTilemap(int w = 20, int h = 20)
 {
     Tilemap tm;
@@ -36,11 +32,9 @@ Tilemap MakeTilemap(int w = 20, int h = 20)
 }
 }  // namespace
 
-// --- Tilemap::GetElevationAxisAt -------------------------------------------
-
 TEST(ElevationAxisDerive, DeckCenterReturnsX)
 {
-    // Horizontal bridge: deck spans X with elevation 10, ground (0) to N/S.
+    // horizontal bridge: deck spans X with elevation 10, ground (0) to N/S.
     //   . . . . .   <- N row (elev 0)
     //   . D D D .   <- deck row (elev 10)
     //   . . . . .   <- S row (elev 0)
@@ -53,7 +47,7 @@ TEST(ElevationAxisDerive, DeckCenterReturnsX)
 
 TEST(ElevationAxisDerive, VerticalDeckReturnsY)
 {
-    // Vertical bridge: deck spans Y at elev 10.
+    // vertical bridge: deck spans Y at elev 10.
     Tilemap tm = MakeTilemap();
     tm.SetElevation(5, 4, 10);
     tm.SetElevation(5, 5, 10);
@@ -64,20 +58,18 @@ TEST(ElevationAxisDerive, VerticalDeckReturnsY)
 TEST(ElevationAxisDerive, RampTipResolvesByGradient)
 {
     // Ramp at (5,5) with elev 6, ground (0) to W, deck (10) to E, ground N/S.
-    // Gradient |dE_x|=10 > |dE_y|=0 -> X.
+    // gradient |dE_x|=10 > |dE_y|=0 -> X.
     Tilemap tm = MakeTilemap();
     tm.SetElevation(5, 5, 6);
     tm.SetElevation(6, 5, 10);  // deck east
-    // (4,5) stays at 0 (ground west)
+
     EXPECT_EQ(tm.GetElevationAxisAt(5, 5), ElevationAxis::X);
 }
 
 TEST(ElevationAxisDerive, MultiRowRampGradientWinsOverContinuity)
 {
-    // Three-row-tall horizontal ramp column: ground W, deck E, more ramp N/S
-    // sharing this cell's elevation. A continuity-first rule would mistakenly
-    // pick Y because eN == eS == z; the gradient |dE_x|=10 > |dE_y|=0 forces
-    // the correct X axis so pure A/D engages the climb.
+    // three ramp rows share the same height. the gradient |dE_x|=10 > |dE_y|=0
+    // selects X even though the north and south neighbors match this cell.
     Tilemap tm = MakeTilemap();
     tm.SetElevation(5, 4, 6);   // ramp above
     tm.SetElevation(5, 5, 6);   // ramp center (under test)
@@ -90,10 +82,8 @@ TEST(ElevationAxisDerive, MultiRowRampGradientWinsOverContinuity)
 
 TEST(ElevationAxisDerive, MultiRowDeckCenterReturnsXViaExtentScan)
 {
-    // 3-row-tall, 5-column-wide horizontal deck at elev 10. Deck-center has
-    // all four neighbors at elev 10 so both gradients are zero. The bounded
-    // extent scan walks +/-X (long bridge axis) further than +/-Y (3 rows tall),
-    // so the axis must resolve to X.
+    // at the center of a 5x3 deck both gradients are zero. the extent scan must
+    // select the longer X axis.
     Tilemap tm = MakeTilemap();
     for (int dy = -1; dy <= 1; ++dy)
     {
@@ -107,7 +97,6 @@ TEST(ElevationAxisDerive, MultiRowDeckCenterReturnsXViaExtentScan)
 
 TEST(ElevationAxisDerive, MultiColumnDeckCenterReturnsYViaExtentScan)
 {
-    // Same idea, rotated: 5-row-tall, 3-column-wide vertical deck.
     Tilemap tm = MakeTilemap();
     for (int dy = -2; dy <= 2; ++dy)
     {
@@ -121,15 +110,14 @@ TEST(ElevationAxisDerive, MultiColumnDeckCenterReturnsYViaExtentScan)
 
 TEST(ElevationAxisDerive, GroundReturnsNone)
 {
-    // Elevation 0 always returns None so the axis-engagement rule allows
-    // entities to fall back to ground from any direction.
+    // height zero returns None so entities can descend from any direction.
     Tilemap tm = MakeTilemap();
     EXPECT_EQ(tm.GetElevationAxisAt(5, 5), ElevationAxis::None);
 }
 
 TEST(ElevationAxisDerive, OutOfBoundsTreatedAsGround)
 {
-    // GetElevation returns 0 for OOB; axis derivation should match.
+    // out-of-bounds elevation is zero; axis derivation must agree.
     Tilemap tm = MakeTilemap();
     EXPECT_EQ(tm.GetElevationAxisAt(-1, -1), ElevationAxis::None);
     EXPECT_EQ(tm.GetElevationAxisAt(9999, 9999), ElevationAxis::None);
@@ -137,34 +125,26 @@ TEST(ElevationAxisDerive, OutOfBoundsTreatedAsGround)
 
 TEST(ElevationAxisDerive, IsolatedPlatformDefaultsX)
 {
-    // Single elevated cell with all neighbors at 0: dx == dy == 0, falls
-    // through to the documented X default. This is the truly-ambiguous
-    // "square platform" case from the spec.
+    // an isolated elevated cell has dx == dy == 0 and defaults to X.
     Tilemap tm = MakeTilemap();
     tm.SetElevation(5, 5, 10);
     EXPECT_EQ(tm.GetElevationAxisAt(5, 5), ElevationAxis::X);
 }
 
-// --- GameCharacter::UpdatePlane -------------------------------------------
-
 TEST(UpdatePlane, PerpendicularToAxisLeavesPlane)
 {
-    // Player at plane 0 walking N->S into a horizontal-bridge deck cell.
-    // Movement is on Y, tile axis is X -> perpendicular -> no engagement.
+    // player at plane 0 walking N->S into a horizontal-bridge deck cell.
+    // movement is on Y, tile axis is X -> perpendicular -> no engagement.
     Elevation elev;
     EXPECT_EQ(elev.plane, 0);
 
-    CharacterKinematics::UpdatePlane(elev,
-                                     /*destTileElev=*/10,
-                                     ElevationAxis::X,
-                                     /*moveDx=*/0,
-                                     /*moveDy=*/1);
+    CharacterKinematics::UpdatePlane(elev, 10, ElevationAxis::X, 0, 1);
     EXPECT_EQ(elev.plane, 0);
 }
 
 TEST(UpdatePlane, AxisMatchWithinStepGateEngages)
 {
-    // Player at plane 6 (mid-ramp) walking +X onto deck (10). Delta = 4
+    // player at plane 6 (mid-ramp) walking +X onto deck (10). delta = 4
     // which is within MAX_STEP_HEIGHT (8) -> engages.
     Elevation elev;
     CharacterKinematics::UpdatePlane(elev, 6, ElevationAxis::X, 1, 0);  // bring plane up to 6
@@ -176,7 +156,7 @@ TEST(UpdatePlane, AxisMatchWithinStepGateEngages)
 
 TEST(UpdatePlane, DirectGroundToDeckJumpRejected)
 {
-    // No ramp authored: stepping from plane 0 directly onto a deck (elev 10)
+    // no ramp authored: stepping from plane 0 directly onto a deck (elev 10)
     // exceeds MAX_STEP_HEIGHT (8). Plane must stay 0 (player walks under).
     Elevation elev;
     EXPECT_EQ(elev.plane, 0);
@@ -187,11 +167,9 @@ TEST(UpdatePlane, DirectGroundToDeckJumpRejected)
 
 TEST(UpdatePlane, GroundTileAlwaysEngages)
 {
-    // Player at plane 10 (on deck) steps onto axis=None ground. The step
-    // gate must not block this - falling-off-bridge needs to work even
-    // when the drop exceeds MAX_STEP_HEIGHT.
+    // descending to axis None bypasses the step gate even when the drop exceeds MAX_STEP_HEIGHT.
     Elevation elev;
-    // Bring plane up: small ramp (4) then deck (10).
+
     CharacterKinematics::UpdatePlane(elev, 4, ElevationAxis::X, 1, 0);
     CharacterKinematics::UpdatePlane(elev, 10, ElevationAxis::X, 1, 0);
     EXPECT_EQ(elev.plane, 10);
@@ -202,8 +180,7 @@ TEST(UpdatePlane, GroundTileAlwaysEngages)
 
 TEST(UpdatePlane, ZeroMovementOnAxisTileDoesNotEngage)
 {
-    // No movement (dx=dy=0) onto an X-axis tile: matchesAxis is false
-    // because moveDx != 0 is required. Plane stays.
+    // zero displacement does not engage an axis because matchesAxis requires movement.
     Elevation elev;
     EXPECT_EQ(elev.plane, 0);
 
@@ -211,13 +188,9 @@ TEST(UpdatePlane, ZeroMovementOnAxisTileDoesNotEngage)
     EXPECT_EQ(elev.plane, 0);
 }
 
-// --- CollisionResolver z-aware skip ---------------------------------------
-
 TEST(CollisionZSkip, TileAbovePlayerPlaneDoesNotBlock)
 {
-    // Bridge railing at (5,5) with collision and elevation 10. Player at
-    // ground (plane 0) standing on the same tile -> resolver should skip
-    // the railing entirely and report no collision.
+    // at plane 0, collision ignores the railing at height 10 on this cell.
     Tilemap tm = MakeTilemap();
     tm.SetTileCollision(5, 5, true);
     tm.SetElevation(5, 5, 10);
@@ -226,38 +199,27 @@ TEST(CollisionZSkip, TileAbovePlayerPlaneDoesNotBlock)
     Hitbox hitbox;
     EXPECT_EQ(elev.plane, 0);
 
-    bool blocked = CollisionSystem::CollidesWithTilesStrict(hitbox,
-                                                            FeetAtTile(5, 5),
-                                                            &tm,
-                                                            /*moveDx=*/0,
-                                                            /*moveDy=*/0,
-                                                            /*diagonalInput=*/false,
-                                                            CharacterKinematics::GetSupport(elev));
+    bool blocked = CollisionSystem::CollidesWithTilesStrict(
+        hitbox, FeetAtTile(5, 5), &tm, 0, 0, false, CharacterKinematics::GetSupport(elev));
     EXPECT_FALSE(blocked);
 }
 
 TEST(CollisionZSkip, TileAtPlayerPlaneStillBlocks)
 {
-    // Same setup but the player is on the deck (plane 10). Now the railing
-    // is at-or-below the player's plane and must block.
+    // at plane 10, the same railing blocks movement.
     Tilemap tm = MakeTilemap();
     tm.SetTileCollision(5, 5, true);
     tm.SetElevation(5, 5, 10);
 
     Elevation elev;
     Hitbox hitbox;
-    // Climb to plane 10 via a small ramp step that respects the gate.
+
     CharacterKinematics::UpdatePlane(elev, 4, ElevationAxis::X, 1, 0);
     CharacterKinematics::UpdatePlane(elev, 10, ElevationAxis::X, 1, 0);
     ASSERT_EQ(elev.plane, 10);
 
-    bool blocked = CollisionSystem::CollidesWithTilesStrict(hitbox,
-                                                            FeetAtTile(5, 5),
-                                                            &tm,
-                                                            /*moveDx=*/0,
-                                                            /*moveDy=*/0,
-                                                            /*diagonalInput=*/false,
-                                                            CharacterKinematics::GetSupport(elev));
+    bool blocked = CollisionSystem::CollidesWithTilesStrict(
+        hitbox, FeetAtTile(5, 5), &tm, 0, 0, false, CharacterKinematics::GetSupport(elev));
     EXPECT_TRUE(blocked);
 }
 
@@ -281,9 +243,8 @@ TEST(CollisionZSkip, DifferentElevationHeightDoesNotCloseCornerEscape)
     tm.SetTileCollision(6, 4, true);
     tm.SetCornerCutBlocked(6, 4, Tilemap::CORNER_BL, true);
 
-    // A shallow diagonal overlap with the 10px railing is a real collision on
-    // the deck, but must be invisible while the player is still on the 6px
-    // ramp. Collapsing both heights to "Elevation" closes this escape route.
+    // the railing at 10 px blocks a shallow deck overlap but must not block the
+    // player while it is on the 6 px ramp.
     const glm::vec2 cornerOverlap(90.0f, 92.0f);
     Hitbox hitbox;
     EXPECT_FALSE(CollisionSystem::CollidesWithTilesStrict(
@@ -291,8 +252,6 @@ TEST(CollisionZSkip, DifferentElevationHeightDoesNotCloseCornerEscape)
     EXPECT_TRUE(CollisionSystem::CollidesWithTilesStrict(
         hitbox, cornerOverlap, &tm, 1, 1, true, {SupportSurface::Elevation, 10}));
 }
-
-// --- Support graph ---------------------------------------------------------
 
 TEST(SurfaceTransition, RampEntryCommitsElevation)
 {
@@ -410,8 +369,6 @@ TEST(SurfaceCollision, ElevatedCollisionDoesNotBlockUnderpassProbe)
     EXPECT_EQ(probe.transition.support.surface, SupportSurface::Ground);
 }
 
-// --- Elevated render ownership --------------------------------------------
-
 TEST(ElevationRegions, ConnectedFootprintIsLocalAndGroundBesideItHasNoRegion)
 {
     Tilemap tm = MakeTilemap(5, 5);
@@ -459,9 +416,8 @@ TEST(DepthSortedTiles, StructureArtworkInheritsElevationOutsideWalkableFootprint
     tm.SetLayerYSortPlus(1, 1, layer, true);
     tm.SetTileStructureId(1, 1, oneBasedLayer, structureId);
 
-    // Diagonal artwork has no elevation of its own and is not in the same
-    // vertical Y-sort stack. Explicit structure membership is what associates
-    // it with the elevated surface.
+    // explicit structure membership attaches diagonal artwork outside the vertical
+    // Y-sort stack to its elevated surface.
     tm.SetLayerTile(0, 0, layer, 10);
     tm.SetLayerYSortPlus(0, 0, layer, true);
     tm.SetTileStructureId(0, 0, oneBasedLayer, structureId);
@@ -502,8 +458,7 @@ TEST(DepthSortedTiles, ForegroundRampStackRetainsExplicitYSortPhase)
     tm.SetElevation(1, 1, 10);
     tm.SetElevation(1, 2, 10);
 
-    // Mirrors the real bridge ramp: a foreground Y-sort column extends one
-    // ground cell below its elevated footprint.
+    // the bridge's foreground Y-sort column extends one ground cell below its footprint.
     constexpr size_t foregroundLayer = 5;
     for (int y = 1; y <= 3; ++y)
     {
