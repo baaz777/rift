@@ -6,96 +6,64 @@
 
 /**
  * @enum SupportSurface
- * @brief Logical walk surface supporting a character at a world position.
- * @author Alex (https://github.com/lextpf)
+ * @brief Distinguishes ground from a ramp or deck in the same footprint.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * Height and surface identity are deliberately separate. Ground continues underneath authored
- * elevation, while Elevation is a ramp or deck surface occupying the same X and Y footprint.
+ * Surface identity and physical height are separate. Ground exists beneath elevated cells.
+ * A collision cell blocks only actors on its support surface and exact authored height.
  *
- * @see SurfaceSystem, SupportState, Elevation, ElevationAxis
+ * | Surface   | Height in pixels   | Blocking cell elevation |
+ * |-----------|--------------------|-------------------------|
+ * | Ground    | Always zero.       | Zero.                   |
+ * | Elevation | Authored, nonzero. | Equal to actor height.  |
  */
 enum class SupportSurface : std::uint8_t
 {
-    /// Implicit ground plane. Present under every cell, including elevated ones, and always
-    /// paired with height 0. Only collision tiles whose authored elevation is 0 can block it.
-    Ground = 0,
-    /// An authored ramp/deck surface, paired with that cell's exact non-zero elevation. Only
-    /// collision tiles at the same exact elevation can block it.
-    Elevation = 1,
+    Ground = 0,     ///< Implicit ground beneath every cell.
+    Elevation = 1,  ///< Authored ramp or deck support.
 };
 
 /**
  * @struct SupportState
- * @brief Persistent topology state used by movement, collision, and rendering.
- * @author Alex (https://github.com/lextpf)
+ * @brief Pairs support identity with its exact height.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * The two fields mean nothing apart. @ref SurfaceSystem::CollisionBelongsTo matches a collision
- * cell against both, and @ref SupportSurface::Ground always carries height 0. On an entity they
- * live as Elevation::surface and Elevation::plane, and CharacterKinematics::CommitSupport is the
- * only function that may write them together.
- *
- * @see SurfaceSystem::ResolveMove, CharacterKinematics::CommitSupport
+ * Ground requires height 0. Entity state lives in Elevation::surface and Elevation::plane;
+ * CharacterKinematics::CommitSupport writes them together.
  */
 struct SupportState
 {
     SupportSurface surface{SupportSurface::Ground};  ///< Ground vs. authored-elevation topology.
-    /**
-     * @brief Height of the supporting surface, in the same pixel units as
-     *        Tilemap::GetElevation (0 = ground).
-     *
-     * A collision cell must carry exactly this elevation to block a character standing here,
-     * so a 6px ramp never snags on an adjacent 10px railing.
-     */
-    int height{0};
+    int height{0};  ///< Exact support height in pixels; zero for ground.
 
     bool operator==(const SupportState&) const = default;
 };
 
 /**
  * @struct SurfaceTransition
- * @brief Result of resolving a movement probe through the support graph.
- * @author Alex (https://github.com/lextpf)
+ * @brief Candidate support from a movement probe.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * Resolving a probe mutates nothing, so a caller may discard the result and try a different
- * candidate position.
- *
- * @see SurfaceSystem::ResolveMove, CollisionSystem::MovementProbeResult
+ * A disconnected result rejects the entire move. Its support can differ from the initial
+ * support when an earlier sub-step succeeded; do not commit that partial result.
  */
 struct SurfaceTransition
 {
-    /**
-     * @brief Support the character would stand on after the move.
-     *
-     * Meaningful only when @ref connected is true. A rejected probe reports the last connected
-     * support reached before the failing boundary, which equals the caller's current support only
-     * when the first sub-step failed.
-     */
-    SupportState support{};
-    /**
-     * @brief False means "unsupported step/drop": the support graph has no edge for this move.
-     *
-     * The caller must block the entire movement transaction and commit nothing - neither a
-     * clamped nor a partial (single-axis) application of it.
-     */
-    bool connected{true};
+    SupportState support{};  ///< Last connected support reached by the probe.
+    bool connected{true};    ///< True only when every crossed boundary connects.
 };
 
 /**
  * @struct CharacterCollisionBody
- * @brief Feet anchor plus exact support for character-vs-character collision.
- * @author Alex (https://github.com/lextpf)
+ * @brief Per-frame character collision snapshot.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * A per-frame snapshot rebuilt from live components, never stored on an entity. Both directions
- * of the same symmetric test produce one: EntityStore::BuildNpcCollisionBodies rebuilds the NPC
- * vector for player movement, and Game builds a single player body each frame for NPC AI.
- * Characters whose support differs never collide, which is what lets one character walk under a
- * bridge while another walks across its deck.
- *
- * @see CollisionSystem::CollidesWithNPC, NpcAiSystem
+ * Characters collide only when support identity and height both match.
+ * Rebuild from live components; do not store on entities.
  */
 struct CharacterCollisionBody
 {
