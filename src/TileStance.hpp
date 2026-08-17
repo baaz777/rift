@@ -8,18 +8,12 @@
 #include <string_view>
 
 /**
- * @brief Whether a tile's artwork lies on the ground or stands up, and how.
- * @author Alex (https://github.com/lextpf)
+ * @brief Authored geometry role, independent of per-tile sorting flags.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * One authored value per map cell per layer, deliberately independent of the
- * per-tile sorting flags. Deriving uprightness from those flags instead - say
- * `noProjection || ySortPlus || ySortMinus` - stands every flat decal an author
- * tagged for sorting on its edge. In the flat path the two y-sort flags change
- * draw order only and never reach a geometry branch, so they carry no claim about
- * geometry, and neither does the 3D path let them.
+ * Props turn around their cell anchor. Walls keep grid yaw so their endpoints stay fixed.
  *
- * @par The four stances
  * @verbatim
  *   Flat        Prop          Wall            Structure
  *   grass       lantern       fence panel     house facade
@@ -30,18 +24,6 @@
  *   the         turns to      locked to       tile of a taller body
  *   ground      the camera    the grid        anchored on its base row
  * @endverbatim
- *
- * @par Pole versus surface
- * Billboarding is a cheat that only holds for artwork with no real extent across
- * its pivot. A lantern is effectively a pole: turning it to face the camera
- * spins it in place and it never leaves the cell it was authored on. A fence
- * panel or a facade is a surface with a genuine orientation in the world, and
- * turning it drags its far end through world space - and a run of individually
- * turning cards fans open like venetian blinds. @ref TileStance::Prop and
- * @ref TileStance::Wall are that distinction, authored rather than guessed from
- * whether a tile happened to touch a neighbor.
- *
- * @see tileRole, Tilemap::RenderWorld3D
  */
 enum class TileStance : std::uint8_t
 {
@@ -51,10 +33,8 @@ enum class TileStance : std::uint8_t
     Structure  ///< Upright surface: one tile of a multi-tile-tall body on its base row.
 };
 
-/// @brief Number of entries in @ref TileStance.
 inline constexpr std::size_t TILE_STANCE_COUNT = 4;
 
-/// @brief Reflection for @ref TileStance, used by the editor HUD and map I/O.
 template <>
 struct EnumTraits<TileStance> : EnumTraitsBase<TileStance, EnumTraits<TileStance>>
 {
