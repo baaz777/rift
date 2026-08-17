@@ -3,26 +3,19 @@
 #include <GLFW/glfw3.h>
 
 /**
- * @brief Debounced key-press detector for one-shot toggle actions.
- * @author Alex (https://github.com/lextpf)
+ * @brief Detect one press edge for a group of alternative keys.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Input
- * @tparam Keys One or more GLFW key codes (int NTTP).
  *
- * Detects the first frame any specified key is pressed, then suppresses
- * repeat detection until all keys are released. Uses variadic NTTP
- * and fold expressions for multi-key support.
+ * Poll after GLFW events, once per frame while the input handler is active. Any pressed key
+ * latches the group until a poll observes all keys released. Pressing a second key while another
+ * remains held does not produce a new edge. Skipped polls do not update the latch.
  *
- * JustPressed is a per-frame poll: the latch only clears on a frame that sees
- * every key released. The function-local `static` idiom below shares one latch
- * between all callers of that function, across every window.
- *
- * @par Single key
  * @code{.cpp}
  * static KeyToggle<GLFW_KEY_E> eKey;
  * if (eKey.JustPressed(window)) { ... }
  * @endcode
  *
- * @par Multi-key (OR press, AND release)
  * @code{.cpp}
  * static KeyToggle<GLFW_KEY_UP, GLFW_KEY_W> upKey;
  * if (upKey.JustPressed(window)) { ... }
@@ -31,28 +24,21 @@
 template <int... Keys>
 struct KeyToggle
 {
-    bool pressed = false;  ///< Latched while any key stays down; cleared when all read RELEASE.
+    bool pressed = false;
 
     /**
-     * @brief Returns true on the first frame any key is pressed.
-     *
-     * Press triggers when any key is down and the toggle is not already pressed.
-     * Release resets when all keys are released.
-     *
-     * @param window GLFW window to query.
-     * @return true on the transition from released to pressed.
+     * @fn bool KeyToggle::JustPressed(GLFWwindow* window)
+     * @brief Update the shared latch and report a press edge; window must be valid.
+     * @author Alex (<https://github.com/lextpf>)
      */
     bool JustPressed(GLFWwindow* window)
     {
-        // Unary left fold (... || expr): expands to (expr(K1) || expr(K2) || ...).
-        // True when any key in the pack is pressed.
         if ((... || (glfwGetKey(window, Keys) == GLFW_PRESS)) && !pressed)
         {
             pressed = true;
             return true;
         }
-        // Unary left fold (... && expr): expands to (expr(K1) && expr(K2) && ...).
-        // True only when all keys in the pack are released.
+
         if ((... && (glfwGetKey(window, Keys) == GLFW_RELEASE)))
             pressed = false;
         return false;
