@@ -1,7 +1,3 @@
-// Tests for ConsoleBuffer: the developer-console scrollback ring, input line,
-// cursor, history, and scroll-offset state. Pure data layer - no GLFW or
-// renderer involvement.
-
 #include <gtest/gtest.h>
 
 #include "../src/Console.hpp"
@@ -10,7 +6,7 @@
 
 namespace
 {
-// Drive the buffer with a literal string, one codepoint at a time.
+
 void TypeString(ConsoleBuffer& buf, std::string_view text)
 {
     for (char c : text)
@@ -36,7 +32,7 @@ TEST(ConsoleBufferTests, RingBufferDropsOldestPastCapacity)
         buf.Print("line " + std::to_string(i));
     }
     EXPECT_EQ(buf.Lines().size(), ConsoleBuffer::MAX_LINES);
-    // Oldest 5 should have been evicted; the front line should be "line 5".
+
     EXPECT_EQ(buf.Lines().front().text, "line 5");
     EXPECT_EQ(buf.Lines().back().text, "line " + std::to_string(ConsoleBuffer::MAX_LINES + 4));
 }
@@ -84,8 +80,7 @@ TEST(ConsoleBufferTests, OnBackspaceWordDeletesLastWordKeepingPrecedingSpace)
     ConsoleBuffer buf;
     TypeString(buf, "time.weather clear");
     buf.OnBackspaceWord();
-    // First press eats "clear" and stops at the space - matching the user's
-    // example: "time.weather clear" -> "time.weather ".
+    // first deletion: "time.weather clear" -> "time.weather ".
     EXPECT_EQ(buf.Input(), "time.weather ");
     EXPECT_EQ(buf.CursorPos(), 13u);
 }
@@ -95,11 +90,11 @@ TEST(ConsoleBufferTests, OnBackspaceWordWalksDotSegments)
     ConsoleBuffer buf;
     TypeString(buf, "npc.freeze");
     buf.OnBackspaceWord();
-    // Dots are word boundaries: "npc.freeze" -> "npc.".
+    // dots are word boundaries: "npc.freeze" -> "npc.".
     EXPECT_EQ(buf.Input(), "npc.");
     EXPECT_EQ(buf.CursorPos(), 4u);
     buf.OnBackspaceWord();
-    // Next press eats the dot and the preceding segment.
+    // the next deletion removes the dot and the preceding segment.
     EXPECT_EQ(buf.Input(), "");
     EXPECT_EQ(buf.CursorPos(), 0u);
 }
@@ -144,7 +139,7 @@ TEST(ConsoleBufferTests, OnBackspaceWordOperatesAtCursorNotEnd)
     buf.OnLeft();  // cursor between space and 'g' -> position 11
     EXPECT_EQ(buf.CursorPos(), 11u);
     buf.OnBackspaceWord();
-    // Eats the space at index 10, then "beta" -> "alpha gamma".
+    // eats the space at index 10, then "beta" -> "alpha gamma".
     EXPECT_EQ(buf.Input(), "alpha gamma");
     EXPECT_EQ(buf.CursorPos(), 6u);
 }
@@ -214,7 +209,6 @@ TEST(ConsoleBufferTests, HistoryPrevWalksBackwards)
     ASSERT_TRUE(c.has_value());
     EXPECT_EQ(*c, "first");
 
-    // Past the oldest entry is a stable nullopt.
     EXPECT_FALSE(buf.HistoryPrev().has_value());
     EXPECT_FALSE(buf.HistoryPrev().has_value());
 }
