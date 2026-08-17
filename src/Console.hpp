@@ -20,35 +20,24 @@ class Console;
 
 /**
  * @class ConsoleBuffer
- * @brief Owns the developer console's scrollback ring, input line, and command history.
- * @author Alex (https://github.com/lextpf)
+ * @brief Console scrollback, ASCII input and command history.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
- *
- * Pure data layer with no GLFW or renderer dependencies, so unit tests can
- * exercise it without a graphics context. The Console class composes one of
- * these and threads input/output through it.
  */
 class ConsoleBuffer
 {
 public:
     /**
-     * @brief Maximum number of scrollback lines retained. Older lines are dropped.
+     * @brief Retained scrollback limit; adding lines evicts the oldest.
      *
-     * Sized to hold a normal per-frame draw-call trace dump
-     * (`renderer.trace dump`) without the head being evicted as later events
-     * scroll in. A dump covers only the most recent frame
-     * (DrawTracer::LastFrameEvents) and prints one line per traced event.
-     * DrawTracer caps a frame at 50000 events, so a pathological frame can
-     * still overflow this and evict the head; 8192 covers a normal frame with
-     * margin. Under ~1 MB when full at ~50 characters per line (Line struct
-     * plus heap text); fine for desktop.
+     * A draw trace can exceed this limit.
      */
     static constexpr std::size_t MAX_LINES = 8192;
 
-    /// @brief Maximum number of submitted commands retained for Up/Down recall.
+    /// Maximum number of submitted commands retained for up/down recall.
     static constexpr std::size_t MAX_HISTORY = 64;
 
-    /// @brief One scrollback line: text + display color.
+    /// One scrollback line: text + display color.
     struct Line
     {
         std::string text;
@@ -56,147 +45,181 @@ public:
     };
 
     /**
-     * @brief Append a line and snap the view to the newest line.
-     *
-     * The scroll offset is reset to 0 on every call, so printed output always
-     * pulls a scrolled-back view down to the bottom. A caller that wants a
-     * different view position must re-scroll after printing (see
-     * @ref Console::ScrollToOutputTop, which `help` uses).
-     *
-     * @param text   Line content.
-     * @param color  RGB display color; the default is white.
+     * @fn void ConsoleBuffer::Print(std::string text, glm::vec3 color = glm::vec3(1.0f))
+     * @brief Appends output and resets scrolling to the newest line.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void Print(std::string text, glm::vec3 color = glm::vec3(1.0f));
 
-    /// @brief Append a red error line.
+    /**
+     * @fn void ConsoleBuffer::PrintError(std::string text)
+     * @brief Append a red error line.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void PrintError(std::string text);
 
-    /// @brief Drop all scrollback (does not clear input or history).
+    /**
+     * @fn void ConsoleBuffer::Clear()
+     * @brief Drop all scrollback (does not clear input or history).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void Clear();
 
     /**
-     * @brief Insert one printable ASCII character at the cursor.
+     * @fn void ConsoleBuffer::OnChar(std::uint32_t codepoint)
+     * @brief Inserts U+0020 through U+007E and resets history navigation.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Codepoints outside U+0020..U+007E (non-ASCII glyphs, IME composition,
-     * control codes, tab) are dropped without a diagnostic. Also forgets the
-     * history navigation index.
-     *
-     * @param codepoint Unicode codepoint from the GLFW char callback.
+     * Other codepoints are ignored.
      */
     void OnChar(std::uint32_t codepoint);
 
-    /// @brief Erase the character before the cursor (no-op if at start).
+    /**
+     * @fn void ConsoleBuffer::OnBackspace()
+     * @brief Erase the character before the cursor (no-op if at start).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnBackspace();
 
     /**
-     * @brief Delete the word before the cursor.
+     * @fn void ConsoleBuffer::OnBackspaceWord()
+     * @brief Deletes the preceding space/dot boundaries, then one word.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Space and dot are both boundary characters. First eat any contiguous
-     * boundary characters immediately preceding the cursor, then eat one
-     * contiguous run of non-boundary characters. Repeated calls walk back
-     * segment-by-segment until the line is empty, so a dotted verb collapses
-     * one segment at a time:
-     * `time.weather clear` -> `time.weather ` -> `time.` -> ``.
-     * Bound to Ctrl+Backspace.
+     * Ctrl+backspace repeats this sequence:
+     * `time.weather clear` -> `time.weather ` -> `time.` -> `""`.
      */
     void OnBackspaceWord();
 
-    /// @brief Erase the character at the cursor (no-op if at end).
+    /**
+     * @fn void ConsoleBuffer::OnDelete()
+     * @brief Erase the character at the cursor (no-op if at end).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnDelete();
 
-    /// @brief Move cursor one position left (clamped at 0).
+    /**
+     * @fn void ConsoleBuffer::OnLeft()
+     * @brief Move cursor one position left (clamped at 0).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnLeft();
 
-    /// @brief Move cursor one position right (clamped at length).
+    /**
+     * @fn void ConsoleBuffer::OnRight()
+     * @brief Move cursor one position right (clamped at length).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnRight();
 
-    /// @brief Move cursor to start of input.
+    /**
+     * @fn void ConsoleBuffer::OnHome()
+     * @brief Move cursor to start of input.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnHome();
 
-    /// @brief Move cursor to end of input.
+    /**
+     * @fn void ConsoleBuffer::OnEnd()
+     * @brief Move cursor to end of input.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnEnd();
 
     /**
-     * @brief Submit and clear the input line.
-     *
-     * Returns the submitted text and resets the history navigation index.
+     * @fn std::string ConsoleBuffer::OnEnter()
+     * @brief Returns and clears input; resets history navigation.
+     * @author Alex (<https://github.com/lextpf>)
      */
     std::string OnEnter();
 
     /**
-     * @brief Replace the input line with @p text, cursor at end.
-     *
-     * Used by history navigation and tab completion.
+     * @fn void ConsoleBuffer::SetInputLine(std::string text)
+     * @brief Replaces input and places the cursor at the end.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void SetInputLine(std::string text);
 
     /**
-     * @brief Record a submitted command into history (capped at MAX_HISTORY).
-     *
-     * Empty commands and exact duplicates of the most recent entry are skipped.
+     * @fn void ConsoleBuffer::RecordHistory(std::string command)
+     * @brief Records history, skipping empty input and the immediately previous duplicate.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void RecordHistory(std::string command);
 
     /**
-     * @brief Walk one step back through history.
-     *
-     * Returns the recalled string, or std::nullopt if there is nothing further
-     * back.
+     * @fn std::optional<std::string> ConsoleBuffer::HistoryPrev()
+     * @brief Returns the preceding history entry, or nullopt at the oldest entry.
+     * @author Alex (<https://github.com/lextpf>)
      */
     std::optional<std::string> HistoryPrev();
 
     /**
-     * @brief Walk one step forward through history.
+     * @fn std::optional<std::string> ConsoleBuffer::HistoryNext()
+     * @brief Returns the next history entry, or an empty string when leaving history.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Returns the next entry, an empty string when leaving history (back to a
-     * fresh prompt), or std::nullopt if not currently navigating history.
+     * Returns nullopt when history navigation is inactive.
      */
     std::optional<std::string> HistoryNext();
 
     /**
-     * @brief Forget the current history navigation index.
-     *
-     * Call when input is modified by typing or by submitting.
+     * @fn void ConsoleBuffer::ResetHistoryIndex()
+     * @brief Clears history navigation after input edits or submission.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void ResetHistoryIndex();
 
     /**
-     * @brief Adjust scroll offset by @p deltaLines.
+     * @fn void ConsoleBuffer::Scroll(int deltaLines)
+     * @brief Moves the scroll offset by signed lines; positive means older.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Positive scrolls toward older lines, negative toward newer. Clamped to
-     * [0, Lines().size()]. The upper bound is the full line count, not
-     * count-minus-visible-rows, so the view can be scrolled until only the
-     * oldest line remains on the bottom row.
+     * Clamps to [0, Lines().size()], so scrolling can leave only the oldest line visible.
      */
     void Scroll(int deltaLines);
 
-    /// @brief Pin scroll to the bottom of the buffer.
+    /**
+     * @fn void ConsoleBuffer::ResetScroll()
+     * @brief Pin scroll to the bottom of the buffer.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void ResetScroll();
 
     /**
-     * @brief Set the absolute scroll offset (lines up from the bottom), clamped
-     * to [0, line count].
-     *
-     * Lets callers position the view at a specific point, e.g. the top of a
-     * freshly printed block.
+     * @fn void ConsoleBuffer::ScrollTo(int offsetFromBottom)
+     * @brief Sets lines above the bottom, clamped to the line count.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void ScrollTo(int offsetFromBottom);
 
-    /// @name Observers
-    /// @{
-    /// @brief Scrollback lines, oldest first.
     [[nodiscard]] const std::deque<Line>& Lines() const { return m_Lines; }
-    /// @brief Current (unsubmitted) input line.
+
     [[nodiscard]] const std::string& Input() const { return m_Input; }
-    /// @brief Cursor position as a byte index into @ref Input, in [0, size()].
+    /**
+     * @fn std::size_t ConsoleBuffer::CursorPos() const
+     * @brief Cursor byte index from zero through Input.size(), inclusive.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::size_t CursorPos() const { return m_CursorPos; }
-    /// @brief Lines scrolled up from the newest line; 0 means pinned to the bottom.
+    /**
+     * @fn int ConsoleBuffer::ScrollOffset() const
+     * @brief Lines scrolled up from the newest line; 0 means pinned to the bottom.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] int ScrollOffset() const { return m_ScrollOffset; }
-    /// @brief Recorded command history, oldest first.
+    /**
+     * @fn const std::vector<std::string>& ConsoleBuffer::History() const
+     * @brief Recorded command history, oldest first.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] const std::vector<std::string>& History() const { return m_History; }
-    /// @brief Index into @ref History being walked, or nullopt when not navigating history.
+    /**
+     * @fn std::optional<std::size_t> ConsoleBuffer::HistoryIndex() const
+     * @brief Index into History being walked, or nullopt when not navigating history.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::optional<std::size_t> HistoryIndex() const { return m_HistoryIdx; }
-    /// @}
 
 private:
     std::deque<Line> m_Lines;
@@ -209,13 +232,9 @@ private:
 
 /**
  * @class ConsoleCommandRegistry
- * @brief Maps command names to handler functions for the developer console.
- * @author Alex (https://github.com/lextpf)
+ * @brief Named handlers in alphabetical order for help and completion.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
- *
- * Names are stored in a std::map for stable alphabetical ordering, which
- * gives `help` a predictable listing and the autocomplete dropdown a stable
- * row order.
  */
 class ConsoleCommandRegistry
 {
@@ -223,57 +242,34 @@ public:
     using Handler = std::function<void(std::span<const std::string_view> args, Console& console)>;
 
     /**
-     * @brief Returns the set of valid values for the @p argIndex'th positional
-     * argument (0 = first arg after the verb).
+     * @brief Completion callback for a zero-based argument index after the verb.
      *
-     * Used by the autocomplete dropdown to suggest parameter values; return an
-     * empty vector when no completion is available for that slot. The callback
-     * is invoked with arbitrary indices as the user types, so it must handle
-     * out-of-range indices gracefully.
-     *
-     * @warning Called from @ref Console::Render once per frame for as long as
-     * the dropdown is open (plus once per Tab / Up / Down), and it returns a
-     * freshly built vector each time, so keep it cheap. The registry stores the
-     * callable for the Console's lifetime; anything it captures must outlive
-     * the Console.
+     * Return an empty vector for unsupported indices. Render calls this each frame while the
+     * dropdown is open; keep it cheap. Captured state must outlive Console.
      */
     using ArgCompletionProvider = std::function<std::vector<std::string>(std::size_t argIndex)>;
 
-    /// @brief One registered command: canonical name, help text, handler, and optional extras.
+    /// One registered command: canonical name, help text, handler, and optional extras.
     struct Command
     {
-        std::string name;  ///< Canonical verb; also the map key.
-        /**
-         * @brief User-visible help text, by convention `<grammar> - summary`.
-         *
-         * `help` prints it verbatim after `name (aliases) - `, so it carries
-         * the argument grammar for the command.
-         */
+        std::string name;
+        /// Printed verbatim after the command name; use argument grammar followed by a summary.
         std::string description;
-        Handler handler;  ///< Invoked with the argument tokens after the verb.
-        /**
-         * @brief Optional shorter / alternate spellings that resolve to this
-         * same handler.
-         *
-         * Lookup checks aliases when the canonical name doesn't match, and
-         * tab-completion offers them alongside canonical names.
-         */
+        Handler handler;
+        /// Alternate names included in lookup and completion.
         std::vector<std::string> aliases;
-        /**
-         * @brief Optional callback that supplies dropdown suggestions for
-         * positional arguments (e.g. enum values). May be null.
-         */
+        /// Argument completion provider; may be null.
         ArgCompletionProvider argCompletions;
     };
 
     /**
-     * @brief Register or replace a command. Empty names are rejected.
+     * @fn void ConsoleCommandRegistry::Register(std::string name, std::string description, \
+     *     Handler handler, std::vector<std::string> aliases = {}, ArgCompletionProvider \
+     *     argCompletions = nullptr)
+     * @brief Registers or replaces a command; rejects empty names.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * @p aliases are alternate names that resolve to the same handler. Aliases
-     * are not stored as separate commands in the map; they're kept on the
-     * canonical entry so `help` can show them inline. @p argCompletions
-     * provides per-arg autocomplete values; pass nullptr (the default) when
-     * arguments have no canned completions.
+     * Aliases belong to the canonical entry. argCompletions may be null.
      */
     void Register(std::string name,
                   std::string description,
@@ -282,46 +278,43 @@ public:
                   ArgCompletionProvider argCompletions = nullptr);
 
     /**
-     * @brief Attach (or replace) the argument-completion provider on an
-     * already-registered command, looked up by canonical @p name.
-     *
-     * No-op if @p name isn't registered. Lets the default command set wire
-     * completions for many commands in one place after registration instead of
-     * threading a provider through every @ref Register call.
+     * @fn void ConsoleCommandRegistry::SetArgCompletions(std::string_view name, \
+     *     ArgCompletionProvider argCompletions)
+     * @brief Sets argument completion by canonical name; unknown names are ignored.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void SetArgCompletions(std::string_view name, ArgCompletionProvider argCompletions);
 
     /**
-     * @brief Look up a command by canonical name or by alias.
+     * @fn const Command* ConsoleCommandRegistry::Lookup(std::string_view name) const
+     * @brief Exact-case lookup by canonical name, then alias; returns nullptr if absent.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Returns nullptr if no match. Canonical names are O(log n); aliases are a
-     * linear fallback. Matching is exact-case, unlike @ref MatchPrefix, so a
-     * mixed-case verb that the dropdown suggested still fails to dispatch.
+     * Canonical lookup is O(log n); aliases use a linear scan. If aliases collide,
+     * the command with the alphabetically first canonical name wins.
+     *
+     * @return A borrowed command, or nullptr if absent. Registering the same canonical
+     * name replaces its contents.
      */
     [[nodiscard]] const Command* Lookup(std::string_view name) const;
 
     /**
-     * @brief All command names (canonical + aliases) whose key starts with
-     * @p prefix, in alphabetical order.
+     * @fn std::vector<std::string> ConsoleCommandRegistry::MatchPrefix( std::string_view prefix, \
+     *     std::size_t maxCount = (std::numeric_limits<std::size_t>::max)()) const
+     * @brief ASCII case-insensitive prefix matches in bytewise alphabetical order.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Empty prefix returns every name. @p maxCount caps the result length (the
-     * alphabetically-earliest matches are kept). Used by the autocomplete
-     * dropdown to fetch up to N hints. Prefix matching is ASCII
-     * case-insensitive (`PA` matches `particles`) while the ordering is
-     * byte-wise on the matched name; @ref Lookup, by contrast, is exact-case.
+     * Includes aliases. An empty prefix matches all names; maxCount keeps the earliest matches.
+     * Lookup still requires exact case.
      */
     [[nodiscard]] std::vector<std::string> MatchPrefix(
         std::string_view prefix,
         std::size_t maxCount = (std::numeric_limits<std::size_t>::max)()) const;
 
     /**
-     * @brief One entry returned by @ref MatchPrefixDetailed - the matched name
-     * paired with the canonical command it resolves to.
+     * @brief Matched name and its canonical command.
      *
-     * The matched @c name may be either a canonical command name or one of its
-     * aliases. @c canonical is empty when @c name is itself the canonical name;
-     * non-empty when @c name is an alias, in which case it holds the canonical
-     * to which the alias resolves.
+     * The canonical field is empty for a canonical name; an alias stores its target name.
      */
     struct MatchEntry
     {
@@ -330,17 +323,15 @@ public:
     };
 
     /**
-     * @brief Like @ref MatchPrefix but tags each returned name with its
-     * canonical command.
-     *
-     * Used by the autocomplete dropdown to render `alias -> canonical` hints so
-     * the originating command for an alias is always visible.
+     * @fn std::vector<MatchEntry> ConsoleCommandRegistry::MatchPrefixDetailed( std::string_view \
+     *     prefix, std::size_t maxCount = (std::numeric_limits<std::size_t>::max)()) const
+     * @brief Prefix matches with canonical targets for alias display.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] std::vector<MatchEntry> MatchPrefixDetailed(
         std::string_view prefix,
         std::size_t maxCount = (std::numeric_limits<std::size_t>::max)()) const;
 
-    /// @brief Read access to the underlying ordered map.
     [[nodiscard]] const std::map<std::string, Command>& All() const { return m_Commands; }
 
 private:
@@ -349,34 +340,15 @@ private:
 
 /**
  * @class Console
- * @brief In-game developer REPL toggled with F12.
- * @author Alex (https://github.com/lextpf)
+ * @brief Developer console overlay and command dispatch.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * The Console binds a ConsoleBuffer + ConsoleCommandRegistry to a Game and
- * provides input event hooks and an overlay renderer. Command handlers
- * receive a Console& so they can read game state via GetGame() and emit
- * output via Buffer().Print(...).
+ * RegisterDefaultCommands builds a fresh CommandContext for each invocation.
+ * F12 opens Half or closes either open state. Tab on empty input swaps Half and Full.
+ * Up/down prefer suggestions over history; Enter submits without accepting a suggestion.
  *
- * Console is an authorised mutator of Game state and is declared a friend
- * of Game so handlers (defined in ConsoleCommands.cpp) can directly reach
- * private members like m_PlayerEntity, m_GameState, m_TimeManager, m_Tilemap
- * and m_World (the ECS world registry holding the player and every NPC)
- * without forcing those onto Game's public API. RegisterDefaultCommands is the
- * only function that reaches into Game this way; it packs the per-command set
- * into a fresh @ref CommandContext on every invocation.
- *
- * @par Visibility state machine
- * Two independent hotkeys drive the state, and neither one cycles all three
- * values. F12 (@ref Toggle) is open-or-close only: from `Closed` it always
- * lands in `Half`, and from `Half` or `Full` it goes straight to `Closed`, so
- * F12 can never reach `Full`. Tab (@ref ToggleFullscreen, only when the input
- * line is empty) swaps `Half` and `Full` and is a no-op while closed. `Half`
- * overlays the top 50% of the screen so the world is still visible; `Full`
- * covers the entire framebuffer for long ops sessions:
- *
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * stateDiagram-v2
  *     classDef closed fill:#1e3a5f,stroke:#3b82f6,color:#e2e8f0
  *     classDef half   fill:#4a3520,stroke:#f59e0b,color:#e2e8f0
@@ -392,24 +364,9 @@ private:
  *     F --> C: F12 (Toggle) / Close / Esc
  *     H --> F: Tab (ToggleFullscreen)
  *     F --> H: Tab (ToggleFullscreen) / Open
- * </pre>
- * @endhtmlonly
+ * ```
  *
- * @par Submission flow
- * Each input event hook (OnChar, OnBackspace, ...) mutates the ConsoleBuffer,
- * then OnEnter splits the line into tokens, looks up the verb in the
- * registry, and dispatches to its handler. Handlers print success/error
- * messages back through Buffer().Print() / Buffer().PrintError().
- *
- * @par Key routing
- * Three keys are overloaded, and two of the gates sit outside this class. Tab
- * is dispatched by Game::PumpConsoleKeys on whether the input line is empty;
- * Up/Down prefer the suggestion dropdown over history recall, so history is
- * reachable only when the input produces no suggestions; Enter never applies
- * the highlighted suggestion; Esc closes without touching dropdown state:
- *
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * flowchart TD
  *     TAB["Tab"] --> TG{"input line empty?<br/>(Game::PumpConsoleKeys)"}
  *     TG -->|yes| TFS["ToggleFullscreen (Half &lt;-&gt; Full)"]
@@ -419,22 +376,12 @@ private:
  *     UG -->|no| HIST["HistoryPrev / HistoryNext"]
  *     ENT["Enter"] --> SUB["RecordHistory then Submit<br/>(suggestion ignored)"]
  *     ESC["Esc"] --> CL["Close (dropdown state kept)"]
- * </pre>
- * @endhtmlonly
- *
- * @see ConsoleBuffer, ConsoleCommandRegistry, ConsoleCommands.hpp
+ * ```
  */
 class Console
 {
 public:
-    /**
-     * @brief Visibility / size state.
-     *
-     * `Half` is the legacy top-50% overlay (world visible underneath); `Full`
-     * covers the entire framebuffer for longer ops sessions. The enum order is
-     * not a hotkey cycle: F12 (@ref Toggle) only moves between `Closed` and
-     * `Half`, and Tab (@ref ToggleFullscreen) only swaps `Half` and `Full`.
-     */
+    /// Half covers the top 50%; Full covers the framebuffer.
     enum class State : std::uint8_t
     {
         Closed,
@@ -442,157 +389,204 @@ public:
         Full
     };
 
-    /// @brief Construct, take a Game reference, and register the default command set.
     explicit Console(Game& game);
 
-    /// @brief True when the overlay is in Half or Full state.
+    /**
+     * @fn bool Console::IsOpen() const
+     * @brief True when the overlay is in Half or Full state.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] bool IsOpen() const { return m_State != State::Closed; }
-    /// @brief True when the overlay covers the full framebuffer.
+    /**
+     * @fn bool Console::IsFullscreen() const
+     * @brief True when the overlay covers the full framebuffer.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] bool IsFullscreen() const { return m_State == State::Full; }
-    /// @brief Current visibility/size state.
+
     [[nodiscard]] State GetState() const { return m_State; }
     /**
-     * @brief F12 hotkey: open the console (to Half) if closed, otherwise close it.
-     *
-     * Does not cycle through Full - that's @ref ToggleFullscreen via Tab.
+     * @fn void Console::Toggle()
+     * @brief Opens Half when closed; otherwise closes the overlay.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void Toggle();
     /**
-     * @brief Tab hotkey when the console is open and the input line is empty:
-     * toggle between Half and Full.
-     *
-     * No-op when closed.
+     * @fn void Console::ToggleFullscreen()
+     * @brief Swaps Half and Full; does nothing while closed.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void ToggleFullscreen();
     /**
-     * @brief Force the console to `Half` from any state and pin the scrollback
-     * to the newest line.
-     *
-     * Called while `Full` this demotes the overlay to `Half`. No production or
-     * test code calls it today; F12 opens the console through @ref Toggle.
+     * @fn void Console::Open()
+     * @brief Sets Half from any state and scrolls to the newest line.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void Open();
-    /// @brief Close the overlay and stop consuming console input.
+    /**
+     * @fn void Console::Close()
+     * @brief Close the overlay and stop consuming console input.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void Close();
 
     /**
-     * @brief GLFW char callback path.
-     *
-     * Inserts the typed glyph into the input buffer while the console is open;
-     * no-op otherwise.
+     * @fn void Console::OnChar(std::uint32_t codepoint)
+     * @brief Forwards typed characters only while open.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void OnChar(std::uint32_t codepoint);
 
     /**
-     * @brief Submit the current input line; the highlighted suggestion is not
-     * applied.
+     * @fn void Console::OnEnter()
+     * @brief Records and submits input, then resets suggestion selection.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Records the line in history and hands it to @ref Submit, then resets the
-     * dropdown selection to the top. Only Tab (@ref OnTab) and a dropdown click
-     * (@ref OnMouseClick) splice a suggestion into the input.
+     * Only Tab or a dropdown click inserts a suggestion.
      */
     void OnEnter();
-    /// @brief Delete one code unit before the cursor.
+    /**
+     * @fn void Console::OnBackspace()
+     * @brief Delete one code unit before the cursor.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnBackspace();
-    /// @brief Delete the word before the cursor.
+    /**
+     * @fn void Console::OnBackspaceWord()
+     * @brief Deletes the preceding space/dot boundaries, then one word.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * Ctrl+backspace repeats this sequence:
+     * `time.weather clear` -> `time.weather ` -> `time.` -> `""`.
+     */
     void OnBackspaceWord();
-    /// @brief Delete one code unit at the cursor.
+    /**
+     * @fn void Console::OnDelete()
+     * @brief Delete one code unit at the cursor.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnDelete();
     /**
-     * @brief Splice the highlighted suggestion into the input line.
-     *
-     * Does not cycle: the selection resets to the top afterwards, so repeated
-     * Tab presses re-pick the first item of the recomputed list. Move the
-     * selection with Up/Down or the mouse.
+     * @fn void Console::OnTab()
+     * @brief Inserts the selected suggestion and resets selection to the first row.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void OnTab();
     /**
-     * @brief Move the dropdown selection up, or recall the previous history
-     * entry.
-     *
-     * Suggestions take precedence: history recall applies only when the
-     * dropdown has no items (empty input, or no prefix match).
+     * @fn void Console::OnUp()
+     * @brief Selects the previous suggestion; recalls history only when no suggestions exist.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void OnUp();
     /**
-     * @brief Move the dropdown selection down, or recall the next history
-     * entry.
-     *
-     * Same precedence as @ref OnUp - the dropdown wins whenever it has items.
+     * @fn void Console::OnDown()
+     * @brief Selects the next suggestion; recalls history only when no suggestions exist.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void OnDown();
-    /// @brief Move the cursor left.
+    /**
+     * @fn void Console::OnLeft()
+     * @brief Move the cursor left.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnLeft();
-    /// @brief Move the cursor right.
+    /**
+     * @fn void Console::OnRight()
+     * @brief Move the cursor right.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnRight();
-    /// @brief Move the cursor to the start of the line.
+    /**
+     * @fn void Console::OnHome()
+     * @brief Move the cursor to the start of the line.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnHome();
-    /// @brief Move the cursor to the end of the line.
+    /**
+     * @fn void Console::OnEnd()
+     * @brief Move the cursor to the end of the line.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnEnd();
-    /// @brief Close the console. Does not dismiss the dropdown or reset its selection.
+    /**
+     * @fn void Console::OnEscape()
+     * @brief Close the console. Does not dismiss the dropdown or reset its selection.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnEscape();
-    /// @brief Scroll console history by the wheel delta.
+    /**
+     * @fn void Console::OnScroll(double yoffset)
+     * @brief Scroll console history by the wheel delta.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void OnScroll(double yoffset);
 
     /**
-     * @brief Parse and execute a complete command line. Public for testability.
+     * @fn void Console::Submit(std::string_view line)
+     * @brief Echoes input, tokenizes it and dispatches the command.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Every call first echoes the line into the scrollback, which also pins the
-     * view to the bottom, so a blank or whitespace-only line still adds a line.
-     * Dispatch is skipped when the line tokenizes to nothing. Unknown verbs
-     * print an error.
+     * Empty input still adds a scrollback line. Unknown verbs print an error.
+     * Dispatch is synchronous; handlers must not retain argument views into line.
+     * Submit does not record command history; OnEnter records it before calling Submit.
      */
     void Submit(std::string_view line);
 
     /**
-     * @brief Render the translucent overlay.
+     * @fn void Console::Render(IRenderer& renderer, int screenWidth, int screenHeight)
+     * @brief Draws the overlay and caches rows and dropdown geometry.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Caller passes the framebuffer size; this method installs an orthographic
-     * projection internally (origin top-left, y increasing downward).
-     *
-     * Not a pure draw: it is the sole writer of the cached scrollback row count
-     * and dropdown rectangle. @ref ScrollToOutputTop and the three mouse
-     * handlers read that cache, so they are inert before the first Render and
-     * always hit-test the previous frame's layout.
+     * Installs a top-left orthographic projection from framebuffer dimensions. Mouse handlers
+     * and ScrollToOutputTop use the previous rendered layout and are inactive before the first
+     * draw.
      */
     void Render(IRenderer& renderer, int screenWidth, int screenHeight);
 
     /**
-     * @brief Split @p line on runs of spaces and tabs into views into @p line.
+     * @fn std::vector<std::string_view> Console::Tokenize(std::string_view line)
+     * @brief Splits on runs of spaces and tabs into borrowed views.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Other whitespace (newline, carriage return, vertical tab, form feed) is
-     * ordinary token content, so a multi-line string yields a single token.
-     *
-     * The caller must keep @p line alive for the views' lifetime. Public and
-     * static so unit tests can exercise tokenization directly.
+     * Other whitespace stays inside tokens. Quotes and escapes have no special meaning.
+     * The input storage must remain valid while any returned view is used.
      */
     [[nodiscard]] static std::vector<std::string_view> Tokenize(std::string_view line);
 
-    /// @brief Mutable output/input buffer used by command handlers.
+    /**
+     * @fn ConsoleBuffer& Console::Buffer()
+     * @brief Mutable output/input buffer used by command handlers.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] ConsoleBuffer& Buffer() { return m_Buffer; }
-    /// @brief Read-only output/input buffer for render and inspection paths.
+
     [[nodiscard]] const ConsoleBuffer& Buffer() const { return m_Buffer; }
-    /// @brief Game instance that owns this console.
+    /**
+     * @fn Game& Console::GetGame()
+     * @brief Game instance that owns this console.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] Game& GetGame() { return m_Game; }
-    /// @brief Registered command table.
+    /**
+     * @fn const ConsoleCommandRegistry& Console::Registry() const
+     * @brief Registered command table.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] const ConsoleCommandRegistry& Registry() const { return m_Registry; }
 
     /**
-     * @brief Position the scrollback so the first line of the most recently
-     * printed block of @p outputLineCount lines sits at the top of the visible
-     * window; the rest fills downward (scroll down to reveal more).
+     * @fn void Console::ScrollToOutputTop(std::size_t outputLineCount)
+     * @brief Scrolls to the first line of the latest output block.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Used by `help` so the listing reads from the top instead of pinning to
-     * the newest line. Falls back to the bottom before the first Render()
-     * (visible rows unknown).
+     * outputLineCount is the block length in lines. Before the first Render, scrolls to bottom.
      */
     void ScrollToOutputTop(std::size_t outputLineCount);
 
     /**
-     * @brief Session-scoped player-position bookmarks driven by `bookmark.set` /
-     * `bookmark.tp` / `bookmark.list`.
-     *
-     * Cleared on Console destruction; not persisted to disk.
+     * @fn std::unordered_map<std::string, glm::ivec2>& Console::Bookmarks()
+     * @brief Session bookmarks; discarded on Console destruction.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] std::unordered_map<std::string, glm::ivec2>& Bookmarks() { return m_Bookmarks; }
     [[nodiscard]] const std::unordered_map<std::string, glm::ivec2>& Bookmarks() const
@@ -601,16 +595,11 @@ public:
     }
 
     /**
-     * @brief One round of suggestion computation.
+     * @brief Suggestions and the input span they replace.
      *
-     * `items` holds the prefix-matched candidates (alphabetical, capped to the
-     * requested count). `wordStart` is the index in the input where the partial
-     * word begins, so callers can splice a chosen suggestion in:
-     * `input.substr(0, wordStart) + items[i]`. `canonicals` is parallel to
-     * `items`: empty entries denote canonical command matches; non-empty entries
-     * hold the canonical command that the corresponding alias resolves to.
-     * Argument-completion items always have an empty canonical (alias semantics
-     * don't apply to arg values).
+     * Suggestions are alphabetical and capped. wordStart is a byte index; insertion uses
+     * `input.substr(0, wordStart) + items[i]`. The canonicals vector parallels items: aliases
+     * contain the target command; canonical names and argument values have empty entries.
      */
     struct SuggestionResult
     {
@@ -620,39 +609,45 @@ public:
     };
 
     /**
+     * @fn void Console::OnMouseHover(double mouseX, double mouseY)
      * @brief Mouse cursor moved over the suggestion dropdown.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * If the cursor is inside the box, snap @c m_SuggestionIndex to the row
+     * If the cursor is inside the box, snap `m_SuggestionIndex` to the row
      * under the cursor so hover-to-highlight matches what a click would commit.
      *
-     * @param mouseX Cursor x in the pixel space passed to @ref Render.
+     * @param mouseX Cursor x in the pixel space passed to `Render`.
      * @param mouseY Cursor y in the same space: origin top-left, y downward.
      */
     void OnMouseHover(double mouseX, double mouseY);
 
     /**
-     * @brief Left-click at @p mouseX,mouseY.
+     * @fn bool Console::OnMouseClick(double mouseX, double mouseY)
+     * @brief Left-click at mouseX,mouseY.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * If the click landed inside the dropdown box, splice the clicked
      * suggestion into the input (same path as Tab) and return true so the
      * caller can swallow the click.
      *
-     * @param mouseX Cursor x in the pixel space passed to @ref Render.
+     * @param mouseX Cursor x in the pixel space passed to `Render`.
      * @param mouseY Cursor y in the same space: origin top-left, y downward.
      * @return       True when the click was consumed by the dropdown.
      */
     bool OnMouseClick(double mouseX, double mouseY);
 
     /**
+     * @fn bool Console::TryScrollDropdown(double mouseX, double mouseY, double yoffset)
      * @brief Mouse wheel hit-routing.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Returns true whenever the cursor is inside the last-drawn dropdown,
      * consuming the wheel event; the rows only move when the list overflows the
      * visible window, at 2 rows per notch (the scrollback moves 3, see
-     * @ref OnScroll). Returns false otherwise, so the caller scrolls the
+     * `OnScroll)`. Returns false otherwise, so the caller scrolls the
      * scrollback instead.
      *
-     * @param mouseX  Cursor x in the pixel space passed to @ref Render.
+     * @param mouseX  Cursor x in the pixel space passed to `Render`.
      * @param mouseY  Cursor y in the same space: origin top-left, y downward.
      * @param yoffset Wheel delta in notches; positive reveals earlier rows.
      * @return        True when the wheel event was consumed by the dropdown.
@@ -660,12 +655,17 @@ public:
     bool TryScrollDropdown(double mouseX, double mouseY, double yoffset);
 
 private:
-    /// @brief Wire the built-in command set. Defined in ConsoleCommands.cpp.
+    /**
+     * @fn void Console::RegisterDefaultCommands()
+     * @brief Wire the built-in command set. Defined in ConsoleCommands.cpp.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     void RegisterDefaultCommands();
 
     /**
-     * @brief Compute the up-to-@p maxCount autocomplete suggestions for the
-     * current input line.
+     * @fn SuggestionResult Console::ComputeSuggestions(std::size_t maxCount) const
+     * @brief Compute the up-to-maxCount autocomplete suggestions for the current input line.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Suggests command names while typing the verb, and falls back to the
      * verb's `argCompletions` callback when typing positional arguments. Used
@@ -675,8 +675,10 @@ private:
     [[nodiscard]] SuggestionResult ComputeSuggestions(std::size_t maxCount) const;
 
     /**
-     * @brief Slide @c m_SuggestionScroll so @c m_SuggestionIndex stays inside
-     * the visible window, then clamp the scroll to a valid range.
+     * @fn void Console::ClampSuggestionScroll(std::size_t itemCount)
+     * @brief Slide m_SuggestionScroll so m_SuggestionIndex stays inside the visible window, then
+     * clamp the scroll to a valid range.
+     * @author Alex (<https://github.com/lextpf>)
      *
      * Called any time the index or item count changes.
      */
@@ -726,7 +728,7 @@ private:
      * click, wheel) can hit-test the dropdown without their own copy of the
      * layout math.
      *
-     * Refreshed every frame; @c visible is false when the dropdown isn't drawn
+     * Refreshed every frame; `visible` is false when the dropdown isn't drawn
      * this frame.
      */
     struct DropdownRect
@@ -737,9 +739,9 @@ private:
         float h = 0.0f;
         float rowH = 0.0f;
         float padTop = 0.0f;
-        std::size_t topRow = 0;       ///< First visible item index.
-        std::size_t visibleRows = 0;  ///< Rows currently drawn.
-        std::size_t totalItems = 0;   ///< Full suggestion count.
+        std::size_t topRow = 0;  ///< First visible item index.
+        std::size_t visibleRows = 0;
+        std::size_t totalItems = 0;
         bool visible = false;
     };
     DropdownRect m_LastDropdown;
@@ -755,7 +757,9 @@ private:
 };
 
 /**
- * @brief Pure `Closed -> Half -> Full -> Closed` rotation over Console::State.
+ * @fn constexpr Console::State NextConsoleState(Console::State s) noexcept
+ * @brief Pure Closed -> Half -> Full -> Closed rotation over Console::State.
+ * @author Alex (<https://github.com/lextpf>)
  *
  * Exposed as a free function (and made `constexpr`) so it can be validated
  * without constructing a Console + Game pair, which would require a GL context
@@ -763,8 +767,8 @@ private:
  *
  * @warning This is not the hotkey behavior. No production code calls it - the
  * only callers are tests/ConsoleStateTests.cpp. The real transitions live in
- * @ref Console::Toggle (F12, which only moves between `Closed` and `Half`) and
- * @ref Console::ToggleFullscreen (Tab, which only swaps `Half` and `Full`), so
+ * `Console::Toggle` (F12, which only moves between `Closed` and `Half`) and
+ * `Console::ToggleFullscreen` (Tab, which only swaps `Half` and `Full`), so
  * this three-step rotation is reachable from no input path.
  *
  * @param s Current state.
