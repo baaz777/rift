@@ -1,6 +1,3 @@
-// Tests for Console::Tokenize: ASCII whitespace splitting used by command
-// parsing. No GLFW or renderer involvement.
-
 #include <gtest/gtest.h>
 
 #include "../src/Console.hpp"
@@ -50,8 +47,7 @@ TEST(ConsoleParseTests, SingleTokenReturnsSingleView)
 
 TEST(ConsoleParseTests, ViewsPointIntoOriginalBuffer)
 {
-    // Sanity: the returned views are not separately allocated copies. They
-    // are slices of the input. (Caller-of-Tokenize must keep input alive.)
+    // tokens borrow the input buffer; they must not allocate separate strings.
     std::string source = "alpha beta";
     auto t = Console::Tokenize(source);
     ASSERT_EQ(t.size(), 2u);
