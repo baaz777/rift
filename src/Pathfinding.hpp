@@ -7,60 +7,39 @@
 class Tilemap;
 
 /**
- * @brief Pure BFS utilities over a Tilemap's NPC navigation grid.
- * @author Fable 5 (https://github.com/claude)
+ * @brief Four-connected BFS over NPC navigation, without collision checks.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * @ref FindPath and @ref FloodReachable both read the tilemap's `GetNavigation(x, y)` grid, which
- * is NPC walkability, not the player collision grid. Both treat an out-of-bounds tile as
- * non-navigable and move in cardinal directions only, so connectivity is 4-way.
- *
- * Both allocate a bit-packed visited mask of `W * H` entries. @ref FindPath allocates a second
- * whole-map array on top of it, a predecessor index per cell at 8 bytes each, so its per-call
- * cost scales with the map and not with the path length. Neither allocation happens before the
- * endpoint navigability check rejects a bad call.
- *
- * @warning Navigation is the only test applied here, and collision is deliberately ignored.
- * PatrolRoute::IsValidTile also rejects any tile carrying a collision flag, which makes these
- * functions more permissive than the patrol generator: a path reported here may cross a tile no
- * NPC can patrol. Treat a result as connectivity of the navigation grid, not as a walkable NPC
- * route.
- *
- * The developer-console commands `nav.path` and `nav.reachable` are the callers.
- *
- * @see PatrolRoute
+ * Patrol routes also reject collision, so these paths do not guarantee NPC traversal.
+ * Searches allocate a whole-map visited mask; FindPath also allocates one predecessor
+ * index per cell. Invalid endpoints and a valid equal start/goal return before allocation.
  */
 namespace Pathfinding
 {
 /**
- * @brief Find the BFS shortest path from @p start to @p goal.
+ * @fn std::vector<glm::ivec2> FindPath(const Tilemap& tilemap, glm::ivec2 start, glm::ivec2 goal)
+ * @brief Find a shortest path through cardinally adjacent navigation cells.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Several paths of equal length usually exist on a grid. The one returned is deterministic,
- * decided by the fixed neighbor expansion order +X, -X, +Y, -Y, so the same map and the same
- * endpoints always yield the same sequence.
+ * Ties use +X, -X, +Y, -Y order. The returned path includes both endpoints.
+ * An empty result means an invalid endpoint or no route.
  *
- * @param tilemap  Supplies the navigation grid.
- * @param start    Starting tile coordinate.
- * @param goal     Destination tile coordinate.
- * @return         The inclusive sequence from @p start to @p goal. Empty when either endpoint
- *                 is out of bounds or non-navigable, or when no 4-connected navigable route
- *                 exists, so an empty result does not single out @p goal. Exactly one element
- *                 when @p start equals @p goal.
+ * Start and goal are tile coordinates on the NPC navigation grid. Start == goal returns one
+ * coordinate when that tile is navigable. Out-of-bounds coordinates count as non-navigable.
  */
 [[nodiscard]] std::vector<glm::ivec2> FindPath(const Tilemap& tilemap,
                                                glm::ivec2 start,
                                                glm::ivec2 goal);
 
 /**
- * @brief Count the navigable tiles reachable from @p start.
+ * @fn std::size_t FloodReachable(const Tilemap& tilemap, glm::ivec2 start, glm::ivec2& \
+ *     outBoundsMin, glm::ivec2& outBoundsMax)
+ * @brief Count the four-connected navigable region from start.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * @param tilemap        Supplies the navigation grid.
- * @param start          Tile to flood from.
- * @param outBoundsMin   Receives the inclusive minimum tile coordinate of the reachable set.
- *                       Written only when the count is greater than 0.
- * @param outBoundsMax   Receives the inclusive maximum tile coordinate of the reachable set.
- *                       Written only when the count is greater than 0.
- * @return               Number of reachable navigable tiles.
+ * Write inclusive minimum and maximum tile bounds only when the count is nonzero. An invalid start
+ * returns zero and leaves both output arguments unchanged.
  */
 [[nodiscard]] std::size_t FloodReachable(const Tilemap& tilemap,
                                          glm::ivec2 start,
