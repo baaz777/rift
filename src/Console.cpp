@@ -16,7 +16,7 @@ void ConsoleBuffer::Print(std::string text, glm::vec3 color)
     {
         m_Lines.pop_front();
     }
-    // Auto-snap to bottom whenever new output arrives.
+
     m_ScrollOffset = 0;
 }
 
@@ -33,8 +33,7 @@ void ConsoleBuffer::Clear()
 
 void ConsoleBuffer::OnChar(std::uint32_t codepoint)
 {
-    // ASCII printable range only for the MVP. Non-ASCII typing (accented
-    // glyphs, IME composition) is out of scope for a developer console.
+    // Accept printable ASCII so cursor movement and deletion can use byte offsets.
     if (codepoint < 0x20 || codepoint > 0x7E)
     {
         return;
@@ -61,20 +60,20 @@ void ConsoleBuffer::OnBackspaceWord()
     {
         return;
     }
-    // Spaces and dots are both word boundaries, so Ctrl+Backspace walks back
+    // Spaces and dots are both word boundaries, so Ctrl+backspace walks back
     // segment-by-segment:
     // "time.weather clear" -> "time.weather " -> "time." -> "".
     auto isBoundary = [](char c) { return c == ' ' || c == '.'; };
 
     // First eat any boundary chars immediately before the cursor, so a press
-    // with the cursor just after a boundary (e.g. a trailing space left by a
-    // prior Ctrl+Backspace) removes that boundary and the preceding word too.
+    // with the cursor just after a boundary (e.g. A trailing space left by a
+    // prior Ctrl+backspace) removes that boundary and the preceding word too.
     while (m_CursorPos > 0 && isBoundary(m_Input[m_CursorPos - 1]))
     {
         m_Input.erase(m_CursorPos - 1, 1);
         --m_CursorPos;
     }
-    // Then eat one contiguous run of non-boundary characters (the word).
+
     while (m_CursorPos > 0 && !isBoundary(m_Input[m_CursorPos - 1]))
     {
         m_Input.erase(m_CursorPos - 1, 1);
@@ -164,7 +163,7 @@ std::optional<std::string> ConsoleBuffer::HistoryPrev()
     }
     if (*m_HistoryIdx == 0)
     {
-        return std::nullopt;  // already at oldest
+        return std::nullopt;
     }
     --*m_HistoryIdx;
     return m_History[*m_HistoryIdx];
@@ -178,7 +177,6 @@ std::optional<std::string> ConsoleBuffer::HistoryNext()
     }
     if (*m_HistoryIdx + 1 >= m_History.size())
     {
-        // Stepping past the newest entry returns to a fresh empty prompt.
         m_HistoryIdx.reset();
         return std::string{};
     }
@@ -291,7 +289,6 @@ std::vector<ConsoleCommandRegistry::MatchEntry> ConsoleCommandRegistry::MatchPre
     {
         if (startsWith(name))
         {
-            // Canonical match: empty canonical signals "this is the canonical".
             out.push_back(MatchEntry{name, ""});
         }
         for (const auto& alias : cmd.aliases)
@@ -394,7 +391,7 @@ Console::SuggestionResult Console::ComputeSuggestions(std::size_t maxCount) cons
     {
         return result;
     }
-    // tokens[0] is the verb; positional args follow. The cursor sits at arg index
+    // Tokens[0] is the verb; positional args follow. The cursor sits at arg index
     // `tokens.size() - 1` (zero for the first arg after the verb).
     const std::size_t argIndex = tokens.size() - 1;
     auto candidates = cmd->argCompletions(argIndex);
@@ -671,7 +668,7 @@ void Console::OnScroll(double yoffset)
 {
     if (m_State == State::Closed)
         return;
-    // Wheel up (positive yoffset) reveals older lines.
+
     constexpr int LINES_PER_NOTCH = 3;
     m_Buffer.Scroll(static_cast<int>(yoffset) * LINES_PER_NOTCH);
 }
@@ -712,7 +709,7 @@ void Console::Submit(std::string_view line)
 }
 
 // Overlay layout. The projection installed below is glm::ortho(0, w, h, 0):
-// the origin is the top-left corner and y grows DOWNWARD, and DrawText takes y
+// The origin is the top-left corner and y grows DOWNWARD, and DrawText takes y
 // as the glyph baseline, not the top edge of the row.
 //
 //  y=0  +-------------------------------------------+ <- overlay top
@@ -749,7 +746,7 @@ void Console::Render(IRenderer& renderer, int screenWidth, int screenHeight)
 
     // Translucent backdrop.
     // Half mode: top 50% of the screen, world visible underneath. Full mode:
-    // covers the entire framebuffer for an immersive ops session.
+    // Covers the entire framebuffer for an immersive ops session.
     const float overlayH = (m_State == State::Full) ? h : h * 0.5f;
     renderer.DrawColoredRect(
         glm::vec2(0.0f, 0.0f), glm::vec2(w, overlayH), glm::vec4(0.05f, 0.05f, 0.08f, 0.85f));
@@ -772,9 +769,6 @@ void Console::Render(IRenderer& renderer, int screenWidth, int screenHeight)
     const float ascent = renderer.GetTextAscent(TEXT_SCALE);
     const float lineH = ascent * LINE_GAP_FACTOR;
 
-    // IRenderer::DrawText takes y as the glyph baseline (see IRenderer.hpp).
-
-    // Prompt + input + cursor at the bottom of the overlay.
     const float promptBaseline = overlayH - BOTTOM_PAD;
     const std::string prompt = "> " + m_Buffer.Input();
     renderer.DrawText(prompt, glm::vec2(LEFT_PAD, promptBaseline), TEXT_SCALE, glm::vec3(1.0f));
@@ -808,7 +802,7 @@ void Console::Render(IRenderer& renderer, int screenWidth, int screenHeight)
     if (!lines.empty() && visibleLines > 0)
     {
         const int total = static_cast<int>(lines.size());
-        // The newest line that's visible after scroll offset.
+
         const int newestVisible = std::max(0, total - 1 - m_Buffer.ScrollOffset());
         for (int i = 0; i < visibleLines; ++i)
         {
@@ -941,7 +935,6 @@ void Console::Render(IRenderer& renderer, int screenWidth, int screenHeight)
                                          glm::vec4(0.55f, 0.62f, 0.80f, 0.85f));
             }
 
-            // Cache geometry for the next frame's mouse hit tests.
             m_LastDropdown.x = boxX;
             m_LastDropdown.y = boxY;
             m_LastDropdown.w = boxW;
@@ -1033,7 +1026,7 @@ bool Console::TryScrollDropdown(double mouseX, double mouseY, double yoffset)
         return true;
     }
     constexpr int LINES_PER_NOTCH = 2;
-    const int delta = -static_cast<int>(yoffset) * LINES_PER_NOTCH;  // wheel up -> earlier rows
+    const int delta = -static_cast<int>(yoffset) * LINES_PER_NOTCH;  // Wheel up -> earlier rows
     const std::size_t maxScroll = m_LastDropdown.totalItems - m_LastDropdown.visibleRows;
     if (delta < 0)
     {
