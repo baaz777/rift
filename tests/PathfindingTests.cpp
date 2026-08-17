@@ -7,11 +7,11 @@
 
 namespace
 {
-// Build a tilemap with the given size where every tile is navigable.
+
 Tilemap MakeOpenMap(int width, int height)
 {
     Tilemap m;
-    m.SetTilemapSize(width, height, /*generateMap=*/false);
+    m.SetTilemapSize(width, height, false);
     for (int y = 0; y < height; ++y)
     {
         for (int x = 0; x < width; ++x)
@@ -35,7 +35,7 @@ TEST(PathfindingTests, FindPathStraightLine)
 TEST(PathfindingTests, FindPathRoutesAroundObstacle)
 {
     Tilemap m = MakeOpenMap(5, 5);
-    // Wall at column 2 except for a gap at row 0.
+
     for (int y = 1; y < 5; ++y)
     {
         m.SetNavigation(2, y, false);
@@ -76,7 +76,7 @@ TEST(PathfindingTests, FindPathRejectsOutOfBoundsStart)
 TEST(PathfindingTests, FloodReachableCountsAndBounds)
 {
     Tilemap m;
-    m.SetTilemapSize(10, 10, /*generateMap=*/false);
+    m.SetTilemapSize(10, 10, false);
     for (int y = 3; y < 8; ++y)
     {
         for (int x = 2; x < 7; ++x)
@@ -94,7 +94,7 @@ TEST(PathfindingTests, FloodReachableCountsAndBounds)
 TEST(PathfindingTests, FloodReachableNonNavigableStartReturnsZero)
 {
     Tilemap m;
-    m.SetTilemapSize(5, 5, /*generateMap=*/false);
+    m.SetTilemapSize(5, 5, false);
     glm::ivec2 mn{}, mx{};
     auto count = Pathfinding::FloodReachable(m, {0, 0}, mn, mx);
     EXPECT_EQ(count, 0u);
