@@ -1,6 +1,3 @@
-// Tests for ConsoleCommandRegistry: name registration, lookup, and prefix
-// matching used by tab completion. No GLFW or renderer involvement.
-
 #include <gtest/gtest.h>
 
 #include "../src/Console.hpp"
@@ -80,8 +77,7 @@ TEST(ConsoleCommandRegistryTests, MatchPrefixIsCaseInsensitive)
 {
     ConsoleCommandRegistry r;
     r.Register("Time", "", NoOp());
-    // Both casings must match - autocomplete shouldn't care whether the user
-    // typed with shift held or not.
+
     EXPECT_EQ(r.MatchPrefix("time").size(), 1u);
     EXPECT_EQ(r.MatchPrefix("Time").size(), 1u);
     EXPECT_EQ(r.MatchPrefix("TIME").size(), 1u);
@@ -108,7 +104,7 @@ TEST(ConsoleCommandRegistryTests, MatchPrefixIncludesAliases)
     r.Register("gizmo.intensity", "", NoOp(), {"glb.i", "gizmo.i", "gi"});
     r.Register("gizmo.radius", "", NoOp(), {"glb.r", "gizmo.r", "gr"});
 
-    // All canonical + alias names starting with 'g':
+    // all canonical + alias names starting with 'g':
     //   gizmo.intensity, gizmo.radius (canonical x2)
     //   gizmo.i, gi, gizmo.r, gr (aliases x4)
     //   glb.i, glb.r (aliases x2)
@@ -162,7 +158,7 @@ TEST(ConsoleCommandRegistryTests, MatchPrefixDefaultMaxIsUnlimited)
     {
         r.Register("cmd" + std::to_string(i), "", NoOp());
     }
-    // Default argument should not truncate.
+
     EXPECT_EQ(r.MatchPrefix("cmd").size(), 50u);
 }
 
@@ -223,9 +219,6 @@ TEST(ConsoleCommandRegistryTests, MatchPrefixDetailedHonoursMaxCount)
 
 TEST(ConsoleCommandRegistryTests, MatchPrefixStillReturnsNamesOnly)
 {
-    // Legacy MatchPrefix must keep returning plain names so existing
-    // callers (and existing tests above) are unaffected by the new
-    // detailed variant.
     ConsoleCommandRegistry r;
     r.Register("time.freeze", "", NoOp(), {"tfz"});
 
@@ -296,8 +289,7 @@ TEST(ConsoleCommandRegistryTests, SetArgCompletionsAttachesProviderByName)
 
 TEST(ConsoleCommandRegistryTests, SetArgCompletionsResolvesCanonicalForAliasLookup)
 {
-    // Completions attach to the canonical command, so a lookup via an alias
-    // (how the dropdown resolves a typed alias) sees the same provider.
+    // aliases resolve to the canonical command's completion provider.
     ConsoleCommandRegistry r;
     r.Register("renderer.set", "", NoOp(), {"gfx"});
     r.SetArgCompletions("renderer.set",
@@ -314,7 +306,7 @@ TEST(ConsoleCommandRegistryTests, SetArgCompletionsUnknownNameIsNoOp)
 {
     ConsoleCommandRegistry r;
     r.Register("known", "", NoOp());
-    // Unknown name must not crash or create a phantom command.
+
     r.SetArgCompletions("unknown", [](std::size_t) -> std::vector<std::string> { return {"x"}; });
     EXPECT_EQ(r.Lookup("unknown"), nullptr);
     EXPECT_EQ(r.All().size(), 1u);
