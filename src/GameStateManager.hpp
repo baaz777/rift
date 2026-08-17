@@ -6,63 +6,15 @@
 
 /**
  * @class GameStateManager
- * @brief Session-scoped store for dialogue and quest flags.
- * @author Alex (https://github.com/lextpf)
+ * @brief Session-only dialogue and quest flags; map saves do not serialize them.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * Central storage for all game flags that dialogue conditions can check
- * and consequences can modify. Flags are stored as string key-value pairs.
+ * New Game clears the store. FLAG_SET and FLAG_NOT_SET test key presence;
+ * FLAG_EQUALS compares values. Quest APIs use accepted_ and completed_ prefixes.
+ * The trace uses k = accepted_x, with no completed_x unless shown.
  *
- * @note Flags live in memory only. Nothing serializes them: the map save written by
- * @c Tilemap::SaveMapToJSON never sees this class, and @c ResetWorldToDefaults clears the
- * store on New Game. Quest progress therefore does not survive "Continue".
- *
- * @note Condition checks are presence-based by default:
- * - `FLAG_SET` means the key exists, regardless of stored value.
- * - `FLAG_NOT_SET` means the key does not exist.
- * Use `FLAG_EQUALS` for value-based checks (e.g., `key == "true"`).
- *
- * @par Flag types
- * |    Type |     Method     | Storage         | Example            |
- * |---------|----------------|-----------------|--------------------|
- * | Boolean |   SetFlag()    | "true" / erased | talked_to_elder    |
- * |  String | SetFlagValue() | Any string      | accepted_ufo_quest |
- *
- * @par Presence vs. value
- * `SetFlag(key, false)` does not store `"false"`: it calls @ref ClearFlag, which
- * erases the key. Nothing in this class ever writes the literal string `"false"` -
- * only @ref SetFlagValue can. The readers then disagree about what counts as "set",
- * because some test presence and others test the stored value. For a quest `"x"`
- * with flag key `k` = `accepted_x`, and no `completed_x` unless a row says so:
- *
- * | Write                      | HasFlag | GetFlag | Active? | Listed? | Description |
- * |----------------------------|---------|---------|---------|---------|-------------|
- * | SetFlag(k)                 | true    | true    | yes     | yes     | "" (!)      |
- * | SetFlag(k, false)          | false   | false   | no      | no      | ""          |
- * | SetFlagValue(k, "d")       | true    | false   | yes     | yes     | "d"         |
- * | SetFlagValue(k, "false")   | true    | false   | yes     | no  (!) | ""          |
- * | AcceptQuest("x", "d")      | true    | false   | yes     | yes     | "d"         |
- * | ...then CompleteQuest("x") | true    | false   | no      | no      | "d"         |
- *
- * Columns are `HasFlag(k)`, `GetFlag(k)`, `IsQuestActive("x")`, whether `"x"` appears
- * in `GetActiveQuests()`, and `GetQuestDescription("x")`.
- *
- * The two `(!)` cells are the traps:
- * - Row 1: a quest accepted with plain @ref SetFlag stores `"true"`, and
- *   @ref GetQuestDescription treats `"true"`/`"false"` as "no description", so the
- *   journal text comes back empty. Use @ref AcceptQuest or @ref SetFlagValue.
- * - Row 4: @ref IsQuestActive only asks whether the key exists, while
- *   @ref GetActiveQuests additionally rejects values that are empty, `"false"` or
- *   `"0"`. The same flag is "active" to one API and not to the other.
- *
- * The completion side splits the same way: @ref IsQuestActive treats any
- * `completed_x` key as completed, while @ref GetActiveQuests only counts it completed
- * when the value is exactly `"true"`. So `SetFlagValue("completed_x", "pending")`
- * makes `IsQuestActive("x")` false while `GetActiveQuests()` still lists `"x"`.
- *
- * @par Quest lifecycle
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * stateDiagram-v2
  *     classDef available fill:#164e54,stroke:#06b6d4,color:#e2e8f0
  *     classDef active fill:#4a3520,stroke:#f59e0b,color:#e2e8f0
@@ -80,12 +32,9 @@
  *     note right of Available: FLAG_NOT_SET accepted_X_quest
  *     note right of Active: FLAG_SET accepted_X_quest
  *     note right of Completed: FLAG_SET completed_X_quest
- * </pre>
- * @endhtmlonly
+ * ```
  *
- * @par Condition evaluation flow
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * flowchart LR
  *     classDef core fill:#1e3a5f,stroke:#3b82f6,color:#e2e8f0
  *     classDef good fill:#134e3a,stroke:#10b981,color:#e2e8f0
@@ -96,23 +45,13 @@
  *     B -->|Yes| D{All conditions pass?}
  *     D -->|Yes| C
  *     D -->|No| E[Hide option]:::bad
- * </pre>
- * @endhtmlonly
+ * ```
  *
- * @par Condition types
- * |         Type |     Check      | Use Case                    |
- * |--------------|----------------|-----------------------------|
- * |     FLAG_SET |   HasFlag()    | Show if quest accepted      |
- * | FLAG_NOT_SET |  !HasFlag()    | Show if quest not yet taken |
- * |  FLAG_EQUALS | GetFlagValue() | Check specific state        |
- *
- * @par Quest flag naming
  * @verbatim
  * accepted_<name>_quest  -> "Quest description here"
  * completed_<name>_quest -> "true"
  * @endverbatim
  *
- * @par Example: UFO quest
  * @code{.cpp}
  * // Accept quest with description
  * stateManager.SetFlagValue("accepted_ufo_quest", "Find Anna's brother!");
@@ -126,6 +65,18 @@
  * // Complete quest
  * stateManager.SetFlag("completed_ufo_quest", true);
  * @endcode
+ *
+ * | Write                      | HasFlag | GetFlag | Active? | Listed? | Description |
+ * |----------------------------|---------|---------|---------|---------|-------------|
+ * | SetFlag(k)                 | true    | true    | yes     | yes     | "" (!)      |
+ * | SetFlag(k, false)          | false   | false   | no      | no      | ""          |
+ * | SetFlagValue(k, "d")       | true    | false   | yes     | yes     | "d"         |
+ * | SetFlagValue(k, "false")   | true    | false   | yes     | no  (!) | ""          |
+ * | AcceptQuest("x", "d")      | true    | false   | yes     | yes     | "d"         |
+ * | ...then CompleteQuest("x") | true    | false   | no      | no      | "d"         |
+ *
+ * Columns: HasFlag(k), GetFlag(k), IsQuestActive(x), GetActiveQuests membership,
+ * and GetQuestDescription(x).
  */
 class GameStateManager
 {
@@ -133,14 +84,9 @@ public:
     GameStateManager() = default;
 
     /**
-     * @brief Set a boolean flag: store `"true"`, or erase the key entirely.
-     *
-     * There is no stored `false`. @p value == false delegates to @ref ClearFlag, so
-     * the key disappears and @ref HasFlag reports it as unset. See "Presence vs. value" above
-     * for the reader-by-reader consequences.
-     *
-     * @param key Flag name.
-     * @param value True stores `"true"`; false erases the key.
+     * @fn void GameStateManager::SetFlag(const std::string& key, bool value = true)
+     * @brief True stores the string true; false erases the key.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void SetFlag(const std::string& key, bool value = true)
     {
@@ -151,13 +97,9 @@ public:
     }
 
     /**
-     * @brief Get a boolean flag value.
-     *
-     * Value-based, so a key written with @ref SetFlagValue (a quest description, a
-     * visit counter, ...) reads back as false here even though @ref HasFlag is true.
-     *
-     * @param key Flag name.
-     * @return True if flag is set and equals "true", false otherwise.
+     * @fn bool GameStateManager::GetFlag(const std::string& key) const
+     * @brief True only when the stored string is true.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] bool GetFlag(const std::string& key) const
     {
@@ -169,23 +111,14 @@ public:
         return it->second == "true";
     }
 
-    /**
-     * @brief Clear/unset a flag by removing its key.
-     * @param key Flag name.
-     */
     void ClearFlag(const std::string& key) { m_Flags.erase(key); }
 
-    /**
-     * @brief Set a flag to a string value.
-     * @param key Flag name.
-     * @param value String value.
-     */
     void SetFlagValue(const std::string& key, const std::string& value) { m_Flags[key] = value; }
 
     /**
-     * @brief Get a flag's string value.
-     * @param key Flag name.
-     * @return The value, or empty string if not set.
+     * @fn std::string GameStateManager::GetFlagValue(const std::string& key) const
+     * @brief Return an empty string when the key is absent.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] std::string GetFlagValue(const std::string& key) const
     {
@@ -194,40 +127,22 @@ public:
     }
 
     /**
-     * @brief Check if a flag exists, whatever its value.
-     *
-     * The stored value can be the string `"false"` and this still returns true - but
-     * only @ref SetFlagValue can create that state, since @ref SetFlag erases instead
-     * of storing `"false"`.
-     *
-     * @param key Flag name.
-     * @return True if the flag key exists.
+     * @fn bool GameStateManager::HasFlag(const std::string& key) const
+     * @brief Test key presence regardless of the stored value.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] bool HasFlag(const std::string& key) const
     {
         return m_Flags.find(key) != m_Flags.end();
     }
 
-    /// @brief Clear all state.
     void Clear() { m_Flags.clear(); }
 
     /**
-     * @name Typed quest API
-     * @brief Structured quest operations that enforce the naming convention.
-     *
-     * These methods use the same underlying flag storage as SetFlag/HasFlag
-     * but encode the `accepted_`/`completed_` prefix convention so callers
-     * cannot mistype flag names.
-     */
-    /// @{
-
-    /**
-     * @brief Accept a quest and store its description.
-     *
-     * Sets `"accepted_<questName>"` to the given description string.
-     *
-     * @param questName Quest identifier (e.g., "ufo_quest").
-     * @param description Human-readable quest objective text.
+     * @fn void GameStateManager::AcceptQuest(const std::string& questName, const std::string& \
+     *     description)
+     * @brief Store description under accepted_<questName>.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void AcceptQuest(const std::string& questName, const std::string& description)
     {
@@ -235,24 +150,16 @@ public:
     }
 
     /**
-     * @brief Mark a quest as completed.
-     *
-     * Sets `"completed_<questName>"` to `"true"`.
-     *
-     * @param questName Quest identifier (e.g., "ufo_quest").
+     * @fn void GameStateManager::CompleteQuest(const std::string& questName)
+     * @brief Store true under completed_<questName>.
+     * @author Alex (<https://github.com/lextpf>)
      */
     void CompleteQuest(const std::string& questName) { m_Flags["completed_" + questName] = "true"; }
 
     /**
-     * @brief Check if a quest is currently active (accepted but not completed).
-     *
-     * Presence-based on both keys: any `accepted_<name>` counts as accepted whatever
-     * its value, and any `completed_<name>` counts as completed whatever its value.
-     * @ref GetActiveQuests answers the same question by value and can disagree; see
-     * "Presence vs. value" in the class documentation.
-     *
-     * @param questName Quest identifier (e.g., "ufo_quest").
-     * @return True if accepted and not yet completed.
+     * @fn bool GameStateManager::IsQuestActive(const std::string& questName) const
+     * @brief Active when accepted_ exists and completed_ is absent, regardless of either value.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] bool IsQuestActive(const std::string& questName) const
     {
@@ -260,54 +167,32 @@ public:
     }
 
     /**
-     * @brief Check if a quest has been completed.
-     * @param questName Quest identifier (e.g., "ufo_quest").
-     * @return True if the completed flag exists.
+     * @fn bool GameStateManager::IsQuestCompleted(const std::string& questName) const
+     * @brief Test presence of completed_<questName>, regardless of value.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] bool IsQuestCompleted(const std::string& questName) const
     {
         return HasFlag("completed_" + questName);
     }
 
-    /// @}
-
     /**
-     * @brief Get list of active quest names.
+     * @fn std::vector<std::string> GameStateManager::GetActiveQuests() const
+     * @brief List quest names in unspecified order, with accepted_ removed.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Value-based, unlike @ref IsQuestActive, which is presence-based. An
-     * `accepted_*` key is skipped when its value is empty, `"false"` or `"0"`, and a
-     * quest counts as completed only when `completed_<name>` is exactly `"true"`.
-     * The two APIs therefore disagree on both halves of that test; see
-     * "Presence vs. value" in the class documentation.
-     *
-     * @return Vector of quest names (without "accepted_" prefix), in unspecified
-     *         order (it walks an unordered_map).
+     * Skip accepted values that are empty, false or 0. Completion requires the string true,
+     * so this can disagree with the presence-based IsQuestActive.
      */
     [[nodiscard]] std::vector<std::string> GetActiveQuests() const;
 
     /**
-     * @brief Get a quest's description from its `accepted_<name>` flag value.
-     *
-     * @note The values `"true"` and `"false"` are treated as "no description" and
-     * yield `""`. A quest accepted with `SetFlag("accepted_x")` stores `"true"` and
-     * therefore has no description; store the text with @ref AcceptQuest or
-     * @ref SetFlagValue instead.
-     *
-     * @param questName Quest identifier (e.g., "ufo_quest").
-     * @return The quest description; `""` when unset, or when the stored value is
-     *         `"true"` or `"false"`.
+     * @fn std::string GameStateManager::GetQuestDescription(const std::string& questName) const
+     * @brief Return an empty string for an absent description or the stored strings true and false.
+     * @author Alex (<https://github.com/lextpf>)
      */
     [[nodiscard]] std::string GetQuestDescription(const std::string& questName) const;
 
-    /**
-     * @brief Get read-only view of every stored flag.
-     *
-     * Exposed primarily for the developer console's `flag.list` command so it
-     * can iterate flags without mutating storage. The returned reference is
-     * stable until the next call that mutates `m_Flags`.
-     *
-     * @return Const reference to the underlying key/value flag map.
-     */
     [[nodiscard]] const std::unordered_map<std::string, std::string>& GetAllFlags() const
     {
         return m_Flags;
@@ -319,5 +204,5 @@ public:
     GameStateManager& operator=(GameStateManager&&) = default;
 
 private:
-    std::unordered_map<std::string, std::string> m_Flags;  ///< All flags as strings.
+    std::unordered_map<std::string, std::string> m_Flags;
 };
