@@ -1,8 +1,4 @@
-// Tests for menu navigation logic used by the title screen and pause overlay.
-// Pure data tests - no GL/Vulkan context, no GLFW window.
-//
-// Verifies cursor wrap-around, disabled-item skipping, and the
-// confirm-overwrite prompt's two-state toggle.
+// disabled menu entries must be skipped in both directions without losing wrap-around.
 
 #include <gtest/gtest.h>
 
@@ -21,8 +17,6 @@ MenuLogic::ItemList MakeAllEnabled(int count, int initialSelection = 0)
 
 }  // namespace
 
-// ----- NavigateDown / NavigateUp basics -----
-
 TEST(MenuLogic, NavigateDownAdvancesByOne)
 {
     auto list = MakeAllEnabled(4);
@@ -32,30 +26,27 @@ TEST(MenuLogic, NavigateDownAdvancesByOne)
 
 TEST(MenuLogic, NavigateUpRetreatsByOne)
 {
-    auto list = MakeAllEnabled(4, /*initial=*/2);
+    auto list = MakeAllEnabled(4, 2);
     MenuLogic::NavigateUp(list);
     EXPECT_EQ(list.selected, 1);
 }
 
 TEST(MenuLogic, NavigateDownWrapsFromLastToFirst)
 {
-    auto list = MakeAllEnabled(4, /*initial=*/3);
+    auto list = MakeAllEnabled(4, 3);
     MenuLogic::NavigateDown(list);
     EXPECT_EQ(list.selected, 0);
 }
 
 TEST(MenuLogic, NavigateUpWrapsFromFirstToLast)
 {
-    auto list = MakeAllEnabled(4, /*initial=*/0);
+    auto list = MakeAllEnabled(4, 0);
     MenuLogic::NavigateUp(list);
     EXPECT_EQ(list.selected, 3);
 }
 
-// ----- Disabled-item skipping -----
-
 TEST(MenuLogic, NavigateDownSkipsDisabled)
 {
-    // Layout: [New, Continue(disabled), Settings(disabled), Quit]
     MenuLogic::ItemList list;
     list.enabled = {true, false, false, true};
     list.selected = 0;
@@ -76,7 +67,6 @@ TEST(MenuLogic, NavigateUpSkipsDisabled)
 
 TEST(MenuLogic, NavigateDownWrapsAcrossDisabled)
 {
-    // Layout: [New, Continue(disabled), Settings(disabled), Quit]
     MenuLogic::ItemList list;
     list.enabled = {true, false, false, true};
     list.selected = 3;
@@ -107,8 +97,6 @@ TEST(MenuLogic, NavigateNoOpWhenAllDisabledExceptCurrent)
     EXPECT_EQ(list.selected, 1);
 }
 
-// ----- Initial selection helper -----
-
 TEST(MenuLogic, FirstEnabledIndexFindsFirstEnabled)
 {
     MenuLogic::ItemList list;
@@ -122,8 +110,6 @@ TEST(MenuLogic, FirstEnabledIndexReturnsZeroWhenAllDisabled)
     list.enabled = {false, false, false};
     EXPECT_EQ(MenuLogic::FirstEnabledIndex(list), 0);
 }
-
-// ----- Confirm prompt toggle (2-option, no wrap) -----
 
 TEST(MenuPrompt, DefaultsToCancel)
 {
