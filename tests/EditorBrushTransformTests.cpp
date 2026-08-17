@@ -1,7 +1,4 @@
-// Tests for the brush rotation+flip source mapping used by the editor's
-// placement preview and multi-tile paint. The math lives in a header so it
-// can be exercised without linking the editor's input pipeline (which pulls
-// in dialogue tree builders excluded from the test build).
+// brush source mapping must agree between placement previews and multi-tile painting.
 
 #include <gtest/gtest.h>
 
@@ -63,7 +60,7 @@ TEST(EditorBrushTransform, FlipXAndFlipYMirrorsBoth)
 
 TEST(EditorBrushTransform, Rotation90MatchesExistingBehavior)
 {
-    // 2x1 brush. Existing CalculateRotatedSourceTile at rotation=90:
+    // 2x1 brush at rotation 90:
     //   sourceDx = width - 1 - dy, sourceDy = dx
     auto a = Source(0, 0, 2, 1, 90, false, false);
     EXPECT_EQ(a.sourceDx, 1);
@@ -94,10 +91,10 @@ TEST(EditorBrushTransform, FlipXThenRotation90_2x2)
     // 2x2 brush:
     //   |A|B|
     //   |C|D|
-    // Rotation 90 alone (no flip):
+    // rotation 90 alone (no flip):
     //   |B|D|
     //   |A|C|
-    // Plus flipX (mirror columns, set per-cell flipX flag):
+    // plus flipX (mirror columns, set per-cell flipX flag):
     //   |D|B|
     //   |C|A|
     auto topLeft = Source(0, 0, 2, 2, 90, true, false);  // D at source (1,1)
@@ -119,7 +116,7 @@ TEST(EditorBrushTransform, FlipXThenRotation90_2x2)
 
 TEST(EditorBrushTransform, FlipXIsInvolutionAcrossDestination)
 {
-    // Source(dx, dy, ..., flipX=false) must equal Source(destW-1-dx, dy, ..., flipX=true).
+    // source(dx, dy, ..., flipX=false) must equal source(destW-1-dx, dy, ..., flipX=true).
     for (int rot : {0, 90, 180, 270})
     {
         const int destW = (rot == 90 || rot == 270) ? 2 : 3;
