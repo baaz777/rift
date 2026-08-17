@@ -1,7 +1,4 @@
-// Tests for the developer console's visibility state machine. Exercises the
-// pure transition function `NextConsoleState` so the cycle Closed -> Half ->
-// Full -> Closed can be validated without constructing a Console + Game pair
-// (which would require a graphics context per the test-suite constraints).
+// console state cycle: Closed -> Half -> Full -> Closed.
 
 #include <gtest/gtest.h>
 
@@ -33,8 +30,6 @@ TEST(ConsoleStateTests, ThreeStepCycleReturnsToStart)
 
 TEST(ConsoleStateTests, FunctionIsConstexpr)
 {
-    // Compile-time validation: if NextConsoleState ever loses constexpr,
-    // these constant_expressions stop compiling.
     constexpr auto a = NextConsoleState(Console::State::Closed);
     constexpr auto b = NextConsoleState(Console::State::Half);
     constexpr auto c = NextConsoleState(Console::State::Full);
