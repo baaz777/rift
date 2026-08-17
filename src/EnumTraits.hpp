@@ -7,22 +7,13 @@
 #include <utility>
 
 /**
- * @brief CRTP base providing common ToString/FromString for EnumTraits.
- * @author Alex (https://github.com/lextpf)
+ * @brief Enum name lookup from Count and an index-parallel Names array.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * @tparam E       Enum type.
- * @tparam Derived The concrete EnumTraits<E> specialization.
- *
- * Derived must provide:
- * - `static constexpr size_t Count`
- * - `static constexpr std::string_view Names[]`
- *
- * ToString returns the literal "Unknown" for a value outside [0, Count) instead of failing,
- * so a bad value can reach user-visible output unnoticed. FromString is an exact,
- * case-sensitive linear scan of Names and returns nullopt on no match. The spellings in
- * Names are therefore part of the contract: manifest validation and console argument
- * parsing both branch on that exact match.
+ * Values must be contiguous from zero to `Count - 1`, with one name per value in `Names`.
+ * `ToString` returns `Unknown` outside that range. `FromString` matches exact case and returns
+ * `nullopt` if absent. Name spelling is part of console and manifest input.
  */
 template <typename E, typename Derived>
 struct EnumTraitsBase
@@ -43,20 +34,11 @@ struct EnumTraitsBase
 };
 
 /**
- * @brief Compile-time reflection traits for enum types.
- * @author Alex (https://github.com/lextpf)
+ * @brief Specialize with Count and Names in underlying-value order.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * @tparam E The enum type to reflect.
- *
- * Specialize this template, inheriting from EnumTraitsBase, to provide:
- * - `Count`      - number of enumerators
- * - `Names[]`    - string names indexed by underlying value
- *
- * ToString and FromString are provided automatically by EnumTraitsBase.
- *
- * @par Example specialization
- * @code
+ * @code{.cpp}
  * enum class Color { Red = 0, Green = 1, Blue = 2 };
  *
  * template<>
@@ -70,19 +52,12 @@ template <typename E>
 struct EnumTraits;
 
 /**
- * @brief Advance an enum value to the next enumerator, wrapping at Count.
+ * @fn constexpr E NextEnum(E value)
+ * @brief Advances through contiguous zero-based values, wrapping at Count.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * @tparam E Enum type with a valid EnumTraits specialization.
- *
- * Requires contiguous zero-based enumerators (0, 1, ..., Count-1).
- * Uses C++23 `std::to_underlying` for clean enum-to-integer conversion.
- *
- * @param value Current enumerator.
- * @return Next enumerator, wrapping from the last back to 0.
- *
- * @par Example
- * @code
+ * @code{.cpp}
  * auto next = NextEnum(CharacterType::BW1_MALE);  // BW1_FEMALE
  * auto wrap = NextEnum(CharacterType::CC_FEMALE);  // BW1_MALE
  * @endcode
@@ -95,17 +70,12 @@ constexpr E NextEnum(E value)
 }
 
 /**
- * @brief Range of all enumerator values for an enum with EnumTraits.
+ * @fn constexpr auto EnumValues()
+ * @brief Iterates contiguous zero-based enum values below Count.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * @tparam E Enum type with a valid EnumTraits specialization.
- *
- * Like @ref NextEnum, this assumes contiguous zero-based enumerators: it iterates
- * `[0, Count)` and casts, so a sparse or offset enum yields values that were never
- * declared.
- *
- * @par Example
- * @code
+ * @code{.cpp}
  * for (auto pt : EnumValues<ParticleType>())
  *     std::cout << EnumTraits<ParticleType>::ToString(pt) << "\n";
  * @endcode
@@ -119,15 +89,13 @@ constexpr auto EnumValues()
 }
 
 /**
- * @brief Invoke a callable for each enumerator value.
+ * @fn constexpr void ForEachEnum(Fn&& fn)
+ * @brief Call once per trait value in underlying-value order.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * Runs to completion: the callable's return value is discarded, so there is no way
- * to break out early. Use @ref EnumValues directly when an early exit is needed.
- *
- * @tparam E  Enum type with a valid EnumTraits specialization.
- * @tparam Fn Callable accepting E.
- * @param fn  Invoked once per enumerator, in declaration order.
+ * Discard callback results. If the callback throws, iteration stops and earlier calls remain
+ * applied. The named callback is invoked as an lvalue on every iteration.
  */
 template <typename E, typename Fn>
     requires requires { EnumTraits<E>::Count; }
