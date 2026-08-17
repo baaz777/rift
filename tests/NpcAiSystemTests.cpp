@@ -17,17 +17,11 @@
 #include <random>
 #include <vector>
 
-// NpcAiSystem's randomness is an explicit std::mt19937& parameter (lifted off a
-// former file-local static into the world's globals-owned engine, owned by Game
-// and published via WorldServices::npcRng). That makes the idle FSM deterministic
-// for a given seed and unit-testable without a Game / GL context. These drive the
-// "look around indefinitely" idle branch (no patrol route) purely through data.
+// a fixed std::mt19937 seed makes the no-patrol idle branch deterministic.
 
 namespace
 {
-// Run `picks` look-around steps from a freshly seeded engine and collect the
-// resulting facing sequence. Each Update call lands in the no-route idle branch
-// and consumes exactly one direction draw.
+// each no-route update consumes one direction draw from the seeded engine.
 std::vector<CharacterDirection> LookAroundSequence(unsigned seed, int picks)
 {
     std::mt19937 rng(seed);
@@ -43,7 +37,6 @@ std::vector<CharacterDirection> LookAroundSequence(unsigned seed, int picks)
     PatrolRoute route;
     Speed speed;
 
-    // "No path available" idle: stand still and look around on every step.
     idle.standingStill = true;
     idle.randomStandStillTimer = 0.0f;
 
@@ -62,16 +55,12 @@ std::vector<CharacterDirection> LookAroundSequence(unsigned seed, int picks)
 
 TEST(NpcAiRng, LookAroundIsDeterministicForSameSeed)
 {
-    // Same seed -> identical pick sequence: the passed-in engine is the sole
-    // source of randomness, with no hidden global state leaking between runs.
     EXPECT_EQ(LookAroundSequence(0xC0FFEEu, 16), LookAroundSequence(0xC0FFEEu, 16));
 }
 
 TEST(NpcAiRng, EngineIsActuallyConsumed)
 {
-    // The sequence varies (not a single constant direction), proving the rng
-    // parameter is wired through to the pick rather than ignored. 16 draws from
-    // 4 options all colliding on one value has probability (1/4)^15 - nil.
+    // sixteen draws from four directions must vary; the seed fixes the sequence.
     const std::vector<CharacterDirection> seq = LookAroundSequence(0x1234u, 16);
     bool allSame = true;
     for (const CharacterDirection dir : seq)
