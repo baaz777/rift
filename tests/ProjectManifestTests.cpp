@@ -132,8 +132,7 @@ TEST(ProjectManifestTests, ParticlesMapParsesAndValidates)
     project.Touch("assets/particles/aaaa.png");
     project.Touch("assets/particles/bbbb_strip.png");
     std::string json = ValidManifestJson();
-    // Splice a particles object into the valid manifest: one static link,
-    // one strip-only link, one dangling link.
+
     const std::string needle = "\"fonts\":";
     json.insert(json.find(needle),
                 "\"particles\": {\n"
@@ -152,8 +151,7 @@ TEST(ProjectManifestTests, ParticlesMapParsesAndValidates)
     ASSERT_EQ(manifest->particleSprites.size(), 3u);
     EXPECT_EQ(manifest->particleSprites.at("smoke"), "assets/particles/aaaa.png");
     EXPECT_EQ(manifest->particleSprites.at("curse"), "assets/particles/bbbb_strip.png");
-    // Dangling link is a warning (particles degrade to procedural sprites),
-    // never a startup-blocking error.
+    // a dangling particle asset falls back to a procedural sprite and only warns.
     EXPECT_TRUE(HasDiagnosticFor(result, "particles.ghost"));
 }
 
@@ -312,8 +310,6 @@ TEST(ProjectManifestTests, PlayerCharacterAssetsCanBeRegisteredFromManifest)
     ASSERT_TRUE(type.has_value());
     const auto& character = manifest->playerCharacters.at("BW1_MALE");
 
-    // Register into an owned AssetRegistry (the demoted s_CharacterAssets static)
-    // and confirm each sprite resolves back to its manifest-resolved path.
     AssetRegistry assets;
     for (const auto& [spriteType, spritePath] : character.sprites)
     {
