@@ -42,8 +42,7 @@ namespace
 {
 using json = nlohmann::json;
 
-// Asset paths baked into BuiltInFallback(), used when no manifest file is found. They are
-// relative, so they resolve against the process working directory.
+// Built-in asset paths resolve relative to the working directory.
 constexpr const char* kDefaultTilesets[] = {
     "assets/overworld/cb5fa6a6-f88d-47ca-95d6-c73cc79f879d.png",
     "assets/overworld/5ee53950-ea54-41c5-93d3-991e1407cb8b.png",
@@ -69,9 +68,7 @@ constexpr const char* kDefaultNpcSprites[] = {
 
 constexpr const char* kDefaultFont = "assets/fonts/c8ab67e0-519a-49b5-b693-e8fc86d08efa.ttf";
 
-// Register one built-in playable character. characterName must be a CharacterType enum
-// name - Validate() rejects anything EnumTraits<CharacterType> cannot parse - and the three
-// sprite roles are exactly the keys Validate() looks for.
+// characterName must name a CharacterType; Validate checks required sprite roles.
 void AddPlayer(ProjectManifest& manifest,
                std::string characterName,
                std::string walking,
@@ -94,17 +91,13 @@ std::string ToLower(std::string value)
     return value;
 }
 
-// Renderer names are matched case-insensitively, so "OpenGL", "opengl" and "OPENGL" all
-// pass validation. The stored string keeps the author's casing; RendererFactory does its
-// own matching.
 bool IsKnownRendererName(const std::string& name)
 {
     std::string lower = ToLower(name);
     return lower == "opengl" || lower == "vulkan";
 }
 
-// Existence check against the manifest-relative resolution rules. An empty path counts as
-// missing, which is what lets the validators treat "" and "file not there" identically.
+// Empty paths count as missing.
 bool PathExists(const ProjectManifest& manifest, const std::string& path)
 {
     if (path.empty())
@@ -114,10 +107,7 @@ bool PathExists(const ProjectManifest& manifest, const std::string& path)
     return std::filesystem::exists(manifest.ResolvePath(path));
 }
 
-// Read helpers. All four share one contract: a missing key leaves `out` untouched (the
-// header's default survives), while a key of the wrong JSON type is an Error and also
-// leaves `out` untouched. Nothing here throws - the caller has already established that
-// the document parsed and is an object.
+// Absent keys preserve defaults; wrong types report an error and leave output unchanged.
 void ReadStringField(const json& object,
                      const char* key,
                      std::string& out,
@@ -149,10 +139,7 @@ void ReadIntField(const json& object, const char* key, int& out, ManifestValidat
     out = object[key].get<int>();
 }
 
-// Unlike the scalar readers, the array/map readers replace rather than merge: `out` is
-// cleared as soon as the key is confirmed to be the right type, so an explicitly empty
-// array in the manifest means "none", not "keep the defaults". Individual bad elements are
-// reported and skipped, so one malformed entry does not discard the rest of the list.
+// Replace valid arrays, including empty ones; report and skip malformed elements.
 void ReadStringArray(const json& object,
                      const char* key,
                      std::vector<std::string>& out,
@@ -182,8 +169,7 @@ void ReadStringArray(const json& object,
     }
 }
 
-// Name-to-path object reader (used for the "particles" table). Same replace-not-merge and
-// skip-bad-element behavior as ReadStringArray.
+// Replace valid objects and skip malformed entries, as ReadStringArray does.
 void ReadStringMap(const json& object,
                    const char* key,
                    std::map<std::string, std::string>& out,
@@ -211,11 +197,7 @@ void ReadStringMap(const json& object,
     }
 }
 
-// Two-level reader for "playerCharacters": { "<CharacterType>": { "<role>": "<path>" } }.
-// Deliberately permissive about the inner keys - any sprite role is accepted here and the
-// required set (Walking / Running, optional Bicycle) is enforced later by Validate, which
-// also checks that the outer key names a real CharacterType. A malformed character or
-// sprite entry is reported and skipped, not fatal to the whole table.
+// Parse arbitrary sprite roles; Validate checks character names and required roles.
 void ReadPlayerCharacters(const json& object,
                           ProjectManifest& manifest,
                           ManifestValidationResult& result)
@@ -255,9 +237,7 @@ void ReadPlayerCharacters(const json& object,
     }
 }
 
-// Where LoadDefaultOrFallback looks, in priority order: the working directory first, then
-// its parent. The parent entry is what lets the game find the repo-root manifest when it is
-// launched from a build output directory. Existence is not checked here.
+// Search the working directory before its parent.
 std::vector<std::filesystem::path> DefaultManifestCandidates()
 {
     std::vector<std::filesystem::path> candidates;
@@ -271,7 +251,7 @@ std::vector<std::filesystem::path> DefaultManifestCandidates()
 
     return candidates;
 }
-}  // namespace
+}  // Namespace
 
 void ManifestValidationResult::Add(ManifestDiagnosticSeverity severity,
                                    std::string fieldPath,
@@ -306,11 +286,6 @@ bool ManifestValidationResult::HasWarnings() const
         { return diagnostic.severity == ManifestDiagnosticSeverity::Warning; });
 }
 
-// Absolute paths are taken as-is; relative ones hang off the manifest's own directory so a
-// project can be moved without rewriting every path. baseDirectory is empty only for a
-// default-constructed manifest, in which case the working directory stands in.
-// lexically_normal (not canonical) keeps this a pure string operation: it never touches the
-// filesystem and never fails on a path that does not exist yet.
 std::filesystem::path ProjectManifest::ResolvePath(const std::string& path) const
 {
     std::filesystem::path resolved(path);
@@ -329,8 +304,6 @@ std::string ProjectManifest::ResolvePathString(const std::string& path) const
     return ResolvePath(path).string();
 }
 
-// Bulk form for the asset lists (tilesets, npcSprites, fonts). Order is preserved, which
-// matters for fonts: the loader takes the first candidate that works.
 std::vector<std::string> ProjectManifest::ResolvePathStrings(
     const std::vector<std::string>& paths) const
 {
@@ -343,20 +316,11 @@ std::vector<std::string> ProjectManifest::ResolvePathStrings(
     return resolved;
 }
 
-// Full schema + asset audit, in fixed order: schema, renderer, geometry, tilesets, map,
-// NPC sprites, fonts, particles, player characters. Returns a fresh result rather than
-// appending to a caller's, so it can be run standalone; LoadFromFile splices the output
-// into its own diagnostic list.
-//
-// Every path check goes through PathExists, so this hits the filesystem once per referenced
-// asset. Error vs Warning is the recoverability rule from the top of the file: if startup
-// has a working fallback for the missing thing, it is a Warning.
 ManifestValidationResult ProjectManifest::Validate() const
 {
     ManifestValidationResult result;
 
-    // Schema gate first - a version this build does not understand makes every field below
-    // suspect, but validation still continues so the report is complete in one pass.
+    // Continue after a schema error to report all validation failures.
     if (formatVersion != CURRENT_FORMAT_VERSION)
     {
         result.AddError("formatVersion",
@@ -383,8 +347,6 @@ ManifestValidationResult ProjectManifest::Validate() const
                         "Default map width and height must be greater than zero.");
     }
 
-    // Tilesets are the one asset class with no fallback - without them the tilemap has
-    // nothing to draw - so both "none configured" and "configured but missing" are Errors.
     if (tilesets.empty())
     {
         result.AddError("tilesets", "At least one tileset path is required.");
@@ -398,8 +360,6 @@ ManifestValidationResult ProjectManifest::Validate() const
         }
     }
 
-    // A missing save/map file is normal on a first run - startup generates a default map -
-    // so neither branch is fatal.
     if (defaultMap.empty())
     {
         result.AddWarning("defaultMap",
@@ -433,9 +393,7 @@ ManifestValidationResult ProjectManifest::Validate() const
     }
     else
     {
-        // Fonts are a candidate LIST, not a required set: the first one that loads wins.
-        // So each missing entry is worth a warning, but only an all-missing list warrants
-        // the second, louder warning that the renderer's own fallback will be used.
+        // Fonts are ordered candidates; only an all-missing list needs renderer fallback.
         bool anyFontExists = false;
         for (size_t i = 0; i < fonts.size(); ++i)
         {
@@ -471,9 +429,6 @@ ManifestValidationResult ProjectManifest::Validate() const
         }
     }
 
-    // The player must be drawable, so this block is the other source of hard Errors: an
-    // unknown CharacterType key, or a Walking/Running sprite that is unset or missing on
-    // disk. Bicycle is a movement mode the game can omit, so a missing sheet only warns.
     if (playerCharacters.empty())
     {
         result.AddError("playerCharacters", "At least one player character is required.");
@@ -528,15 +483,11 @@ ManifestValidationResult ProjectManifest::Validate() const
     return result;
 }
 
-// The pre-manifest configuration, kept so the game still boots with the bundled assets when
-// rift.project.json is absent. Scalars (renderer, tile size, map size, defaultMap) are left
-// at the header's defaults; only the asset lists are filled in. Nothing here is validated -
-// see LoadDefaultOrFallback for which of its callers does that.
 ProjectManifest ProjectManifest::BuiltInFallback()
 {
     ProjectManifest manifest;
     manifest.loadedFromFile = false;
-    // No source file, so relative asset paths resolve against the working directory.
+
     manifest.baseDirectory = std::filesystem::current_path();
 
     manifest.tilesets.assign(std::begin(kDefaultTilesets), std::end(kDefaultTilesets));
@@ -572,10 +523,6 @@ ProjectManifest ProjectManifest::BuiltInFallback()
     return manifest;
 }
 
-// Parse one manifest file. nullopt is reserved for "there is no usable document at all"
-// (cannot open, malformed JSON, root is not an object); every other problem becomes a
-// diagnostic on a manifest that is still returned. So a non-null return does not mean the
-// manifest is good - callers must inspect result.HasErrors().
 std::optional<ProjectManifest> ProjectManifest::LoadFromFile(const std::filesystem::path& path,
                                                              ManifestValidationResult& result)
 {
@@ -605,21 +552,16 @@ std::optional<ProjectManifest> ProjectManifest::LoadFromFile(const std::filesyst
 
     ProjectManifest manifest;
     manifest.loadedFromFile = true;
-    // Absolute first: baseDirectory must stay valid even if the working directory changes
-    // later, since every ResolvePath call hangs off it.
+    // Make baseDirectory independent of later working-directory changes.
     manifest.sourcePath = std::filesystem::absolute(path).lexically_normal();
     manifest.baseDirectory = manifest.sourcePath.parent_path();
 
-    // Field reads. Order is cosmetic - each helper is independent and skips absent keys, so
-    // a new field can be appended anywhere in this block.
     ReadIntField(document, "formatVersion", manifest.formatVersion, result);
     ReadStringField(document, "startupRenderer", manifest.startupRenderer, result);
     ReadStringField(document, "defaultMap", manifest.defaultMap, result);
     ReadIntField(document, "tileWidth", manifest.tileWidth, result);
     ReadIntField(document, "tileHeight", manifest.tileHeight, result);
 
-    // "defaultMapSize" is the only nested object among the scalars, so it gets an inline
-    // shape check before its two members are read with the ordinary helper.
     if (document.contains("defaultMapSize"))
     {
         if (!document["defaultMapSize"].is_object())
@@ -639,9 +581,6 @@ std::optional<ProjectManifest> ProjectManifest::LoadFromFile(const std::filesyst
     ReadStringMap(document, "particles", manifest.particleSprites, result);
     ReadPlayerCharacters(document, manifest, result);
 
-    // Validate here rather than at the call site so no caller can forget. Diagnostics are
-    // appended to the caller's list, keeping parse errors and validation findings in one
-    // ordered report.
     ManifestValidationResult validation = manifest.Validate();
     result.diagnostics.insert(
         result.diagnostics.end(), validation.diagnostics.begin(), validation.diagnostics.end());
@@ -649,9 +588,6 @@ std::optional<ProjectManifest> ProjectManifest::LoadFromFile(const std::filesyst
     return manifest;
 }
 
-// Search order, then fallback. The first candidate that exists is authoritative: if it is
-// there but unreadable, the loader falls back rather than trying the next location, so a broken
-// project file is never silently masked by a stale one further up the tree.
 ProjectManifest ProjectManifest::LoadDefaultOrFallback(ManifestValidationResult& result)
 {
     for (const auto& candidate : DefaultManifestCandidates())
@@ -667,14 +603,10 @@ ProjectManifest ProjectManifest::LoadDefaultOrFallback(ManifestValidationResult&
             return *manifest;
         }
 
-        // Unreadable manifest: return the built-ins carrying only the parse error. Note the
-        // asymmetry with the not-found path below - this fallback is not validated, so the
-        // report contains the parse failure and nothing about the built-in assets.
+        // Parse failure returns unvalidated defaults; retain the parse diagnostic.
         return BuiltInFallback();
     }
 
-    // No manifest anywhere: warn, then fall back and validate, so the caller still learns
-    // whether the bundled assets are present relative to the working directory.
     result.AddWarning(DEFAULT_FILENAME,
                       "Project manifest not found; using built-in asset defaults.");
     ProjectManifest fallback = BuiltInFallback();
