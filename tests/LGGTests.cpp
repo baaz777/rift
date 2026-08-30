@@ -1,6 +1,5 @@
-// Tests for ApplyLGG (the ASC CDL formula `out = pow(c * gain + lift, 1/gamma)`).
-// Pure-math, lives inline in PostFXParams.h so the test can call it directly.
-// The shader uses identical math; verifying the C++ side is sufficient.
+// the CPU grading helper evaluates pow(c * gain + lift, 1 / gamma); shader execution is outside
+// this suite.
 
 #include "PostFXParams.hpp"
 
@@ -12,7 +11,7 @@ constexpr float kTolerance = 1e-4f;
 
 TEST(ApplyLGG, IdentityWhenNeutral)
 {
-    // Identity: lift=(0,0,0), gamma=(1,1,1), gain=(1,1,1) -> output == input.
+    // identity: lift=(0,0,0), gamma=(1,1,1), gain=(1,1,1) -> output == input.
     glm::vec3 in(0.25f, 0.50f, 0.75f);
     glm::vec3 out = ApplyLGG(in, glm::vec3(0.0f), glm::vec3(1.0f), glm::vec3(1.0f));
     EXPECT_NEAR(out.r, in.r, kTolerance);
@@ -22,8 +21,7 @@ TEST(ApplyLGG, IdentityWhenNeutral)
 
 TEST(ApplyLGG, GainAffectsHighlightsMost)
 {
-    // With gain=2.0 and lift=0/gamma=1, output = c * 2.0. Highlights move more
-    // in absolute terms than shadows (the affecting power is multiplicative).
+    // gain=2, lift=0, gamma=1 gives output = c * 2; the change scales with brightness.
     glm::vec3 shadow(0.1f);
     glm::vec3 highlight(0.9f);
     glm::vec3 gain(2.0f);
@@ -40,8 +38,7 @@ TEST(ApplyLGG, GainAffectsHighlightsMost)
 
 TEST(ApplyLGG, LiftAffectsShadowsMost)
 {
-    // Lift adds a constant. The relative effect on shadows is much larger
-    // than on highlights (50% vs ~5%).
+    // constant lift has a larger relative effect on shadows than highlights.
     glm::vec3 shadow(0.10f);
     glm::vec3 highlight(0.90f);
     glm::vec3 lift(0.05f);
@@ -58,7 +55,7 @@ TEST(ApplyLGG, LiftAffectsShadowsMost)
 
 TEST(ApplyLGG, GammaCurvesMidtones)
 {
-    // Gamma > 1 brightens midtones. Shadows (~0) and highlights (~1) move less.
+    // gamma above one brightens midtones more than values near zero or one.
     glm::vec3 mid(0.5f);
     glm::vec3 lift(0.0f);
     glm::vec3 gamma(1.4f);
@@ -69,7 +66,6 @@ TEST(ApplyLGG, GammaCurvesMidtones)
 
 TEST(ApplyLGG, ASCCDLOrder)
 {
-    // Numerically verify out = pow(c * gain + lift, 1.0 / gamma).
     glm::vec3 in(0.3f, 0.5f, 0.7f);
     glm::vec3 lift(0.05f, 0.0f, -0.05f);
     glm::vec3 gamma(1.1f, 1.0f, 0.9f);
@@ -89,9 +85,7 @@ TEST(ApplyLGG, ASCCDLOrder)
 
 TEST(ApplyLGG, ClampsNegativeBeforePow)
 {
-    // pow of a negative number is undefined. ApplyLGG clamps `c * gain + lift`
-    // to zero before the power step. Verify a strongly negative pre-pow value
-    // produces a finite zero output instead of NaN.
+    // clamp the power base to zero to avoid NaN for negative channel values.
     glm::vec3 in(0.0f);
     glm::vec3 lift(-1.0f);  // forces c*gain+lift to be negative
     glm::vec3 gamma(2.2f);
