@@ -9,8 +9,6 @@ protected:
     void SetUp() override { tm.Initialize(); }
 };
 
-// --- Time Period Tests ---
-
 TEST_F(TimeManagerTest, GetTimePeriod_Dawn)
 {
     tm.SetTime(5.5f);
@@ -59,8 +57,6 @@ TEST_F(TimeManagerTest, GetTimePeriod_LateNight)
     EXPECT_EQ(tm.GetTimePeriod(), TimePeriod::LateNight);
 }
 
-// --- Sun Arc Tests ---
-
 TEST_F(TimeManagerTest, GetSunArc_BelowHorizonBeforeSunrise)
 {
     tm.SetTime(5.0f);
@@ -75,7 +71,7 @@ TEST_F(TimeManagerTest, GetSunArc_AtSunrise)
 
 TEST_F(TimeManagerTest, GetSunArc_AtNoon)
 {
-    tm.SetTime(13.0f);  // Midpoint of 6-20 = 13
+    tm.SetTime(13.0f);  // midpoint of 6-20 = 13
     EXPECT_FLOAT_EQ(tm.GetSunArc(), 0.5f);
 }
 
@@ -91,8 +87,6 @@ TEST_F(TimeManagerTest, GetSunArc_BelowHorizonAfterSunset)
     EXPECT_FLOAT_EQ(tm.GetSunArc(), -1.0f);
 }
 
-// --- Moon Arc Tests ---
-
 TEST_F(TimeManagerTest, GetMoonArc_AtMoonrise)
 {
     tm.SetTime(19.0f);
@@ -102,7 +96,7 @@ TEST_F(TimeManagerTest, GetMoonArc_AtMoonrise)
 TEST_F(TimeManagerTest, GetMoonArc_AtMidnight)
 {
     tm.SetTime(0.0f);
-    // At midnight: (0 + (24 - 19)) / 12 = 5/12
+    // at midnight: (0 + (24 - 19)) / 12 = 5/12
     EXPECT_NEAR(tm.GetMoonArc(), 5.0f / 12.0f, 0.001f);
 }
 
@@ -118,13 +112,10 @@ TEST_F(TimeManagerTest, GetMoonArc_BelowHorizon)
     EXPECT_FLOAT_EQ(tm.GetMoonArc(), -1.0f);
 }
 
-// --- Moon Phase Tests ---
-
 TEST_F(TimeManagerTest, GetMoonPhase_CyclesEvery8Days)
 {
     for (int day = 0; day < 16; ++day)
     {
-        // Manually set day count by advancing time
         tm.Initialize();
         tm.SetDayDuration(1.0f);  // 1 second = 1 day
         for (int d = 0; d < day; ++d)
@@ -134,8 +125,6 @@ TEST_F(TimeManagerTest, GetMoonPhase_CyclesEvery8Days)
         EXPECT_EQ(tm.GetMoonPhase(), day % 8);
     }
 }
-
-// --- Day/Night Tests ---
 
 TEST_F(TimeManagerTest, IsDay_AtNoon)
 {
@@ -169,8 +158,6 @@ TEST_F(TimeManagerTest, IsNight_JustAfterSunset)
     EXPECT_TRUE(tm.IsNight());
 }
 
-// --- Time Control Tests ---
-
 TEST_F(TimeManagerTest, SetTime_Wraps24Hours)
 {
     tm.SetTime(25.0f);
@@ -197,8 +184,6 @@ TEST_F(TimeManagerTest, AdvanceTime_WrapsAtMidnight)
     EXPECT_NEAR(tm.GetTimeOfDay(), 2.0f, 0.001f);
 }
 
-// --- Pause Tests ---
-
 TEST_F(TimeManagerTest, Pause_StopsTimeProgression)
 {
     tm.SetTime(12.0f);
@@ -215,8 +200,6 @@ TEST_F(TimeManagerTest, TogglePause)
     tm.TogglePause();
     EXPECT_FALSE(tm.IsPaused());
 }
-
-// --- Time Scale Tests ---
 
 TEST_F(TimeManagerTest, TimeScale_DoublesSpeed)
 {
@@ -236,8 +219,6 @@ TEST_F(TimeManagerTest, TimeScale_HalvesSpeed)
     EXPECT_NEAR(tm.GetTimeOfDay(), 0.5f, 0.001f);
 }
 
-// --- Star Visibility Tests ---
-
 TEST_F(TimeManagerTest, GetStarVisibility_ZeroAtMidday)
 {
     tm.SetTime(12.0f);
@@ -252,14 +233,10 @@ TEST_F(TimeManagerTest, GetStarVisibility_FullAtMidnight)
 
 TEST_F(TimeManagerTest, GetStarVisibility_ZeroInHeavyRain)
 {
-    // Equivalent night-time star-suppression check using HeavyRain since
-    // Overcast was removed in the weather overhaul.
     tm.SetTime(0.0f);
     tm.SetWeather(WeatherState::HeavyRain);
     EXPECT_FLOAT_EQ(tm.GetStarVisibility(), 0.0f);
 }
-
-// --- Dawn Intensity Tests ---
 
 TEST_F(TimeManagerTest, GetDawnIntensity_ZeroAtNoon)
 {
@@ -275,11 +252,9 @@ TEST_F(TimeManagerTest, GetDawnIntensity_PeakAt6)
 
 TEST_F(TimeManagerTest, GetDawnIntensity_FadingIn)
 {
-    tm.SetTime(5.0f);  // Midpoint of 4.5-5.5 fade in
+    tm.SetTime(5.0f);  // midpoint of 4.5-5.5 fade in
     EXPECT_NEAR(tm.GetDawnIntensity(), 0.5f, 0.01f);
 }
-
-// --- Color Tests ---
 
 TEST_F(TimeManagerTest, GetAmbientColor_NotZeroAtNight)
 {
