@@ -162,7 +162,6 @@ void BuildEditorAwareDialogueTree(DialogueTree& tree, std::string& outNpcName)
     tree.startNodeId = "start";
     outNpcName = "Wyatt";
 
-    // Start - the NPC feels something is off
     DialogueNode startNode(
         "start",
         outNpcName,
@@ -172,7 +171,6 @@ void BuildEditorAwareDialogueTree(DialogueTree& tree, std::string& outNpcName)
     startNode.options.push_back(DialogueOption("You seem paranoid.", "dismiss"));
     tree.AddNode(startNode);
 
-    // Details - tiles shifting
     DialogueNode detailsNode(
         "details",
         outNpcName,
@@ -183,7 +181,6 @@ void BuildEditorAwareDialogueTree(DialogueTree& tree, std::string& outNpcName)
     detailsNode.options.push_back(DialogueOption("Maybe you need some rest.", "dismiss"));
     tree.AddNode(detailsNode);
 
-    // Deeper - the cursor
     DialogueNode deeperNode(
         "deeper",
         outNpcName,
@@ -195,7 +192,6 @@ void BuildEditorAwareDialogueTree(DialogueTree& tree, std::string& outNpcName)
         DialogueOption("I think you've been staring at the sun too long.", "dismiss"));
     tree.AddNode(deeperNode);
 
-    // Revelation - existential crisis
     DialogueNode revelationNode(
         "revelation",
         outNpcName,
@@ -206,7 +202,6 @@ void BuildEditorAwareDialogueTree(DialogueTree& tree, std::string& outNpcName)
     revelationNode.options.push_back(DialogueOption("Goodbye.", ""));
     tree.AddNode(revelationNode);
 
-    // Final - the secret
     DialogueNode finalNode(
         "final",
         outNpcName,
@@ -217,7 +212,6 @@ void BuildEditorAwareDialogueTree(DialogueTree& tree, std::string& outNpcName)
     finalNode.options.push_back(DialogueOption("I think I need to go...", ""));
     tree.AddNode(finalNode);
 
-    // Dismiss
     DialogueNode dismissNode(
         "dismiss",
         outNpcName,
@@ -235,7 +229,6 @@ void BuildAnnoyedNPCDialogueTree(DialogueTree& tree, std::string& outNpcName)
 
     const std::string kFlag = "talked_to_salma";
 
-    // Router node - player greeting changes based on visit count
     DialogueNode startNode("start", outNpcName, "*glances up*");
 
     DialogueOption opt1("Hello there.", "first");
@@ -258,14 +251,12 @@ void BuildAnnoyedNPCDialogueTree(DialogueTree& tree, std::string& outNpcName)
     opt5.conditions.push_back(DialogueCondition(DialogueCondition::Type::FLAG_EQUALS, kFlag, "4"));
     startNode.options.push_back(opt5);
 
-    // Visit 5+ - same as fifth
     DialogueOption opt6("...", "fifth");
     opt6.conditions.push_back(DialogueCondition(DialogueCondition::Type::FLAG_EQUALS, kFlag, "5"));
     startNode.options.push_back(opt6);
 
     tree.AddNode(startNode);
 
-    // First visit.
     DialogueNode first(
         "first",
         outNpcName,
@@ -290,7 +281,6 @@ void BuildAnnoyedNPCDialogueTree(DialogueTree& tree, std::string& outNpcName)
     firstEnd.options.push_back(DialogueOption("Bye.", ""));
     tree.AddNode(firstEnd);
 
-    // Second visit.
     DialogueNode second(
         "second",
         outNpcName,
@@ -318,7 +308,6 @@ void BuildAnnoyedNPCDialogueTree(DialogueTree& tree, std::string& outNpcName)
     secondFollowup.options.push_back(DialogueOption("Okay, okay. I'll go.", ""));
     tree.AddNode(secondFollowup);
 
-    // Third visit.
     DialogueNode third(
         "third",
         outNpcName,
@@ -354,7 +343,6 @@ void BuildAnnoyedNPCDialogueTree(DialogueTree& tree, std::string& outNpcName)
     thirdGrumpy.options.push_back(DialogueOption("Noted.", ""));
     tree.AddNode(thirdGrumpy);
 
-    // Fourth visit.
     DialogueNode fourth(
         "fourth",
         outNpcName,
@@ -376,7 +364,6 @@ void BuildAnnoyedNPCDialogueTree(DialogueTree& tree, std::string& outNpcName)
     fourthResponse.options.push_back(DialogueOption("...sorry.", ""));
     tree.AddNode(fourthResponse);
 
-    // Fifth visit, and every visit after it.
     DialogueNode fifth("fifth", outNpcName, "...");
 
     DialogueOption fi1("...", "fifth_response");
