@@ -1,6 +1,4 @@
-// Tests for TextureStore, the renderer-side texture owner that backs the future
-// ECS Sprite component's TextureHandle. Pure data paths - textures are built via
-// LoadFromData (no GL/Vulkan context), honoring the rift_tests constraint.
+// LoadFromData keeps textures in CPU memory when no graphics context is current.
 
 #include <gtest/gtest.h>
 
@@ -12,7 +10,7 @@
 
 namespace
 {
-// Build a 4x4 solid RGBA texture in CPU memory (no GL context required).
+
 Texture MakeSolid(unsigned char r, unsigned char g, unsigned char b)
 {
     std::vector<unsigned char> px(4 * 4 * 4);
@@ -24,7 +22,7 @@ Texture MakeSolid(unsigned char r, unsigned char g, unsigned char b)
         px[i * 4 + 3] = 255;
     }
     Texture t;
-    t.LoadFromData(px.data(), 4, 4, 4, /*flipY=*/false);
+    t.LoadFromData(px.data(), 4, 4, 4, false);
     return t;
 }
 }  // namespace
@@ -49,7 +47,7 @@ TEST(TextureStore, AdoptReturnsValidHandleAndGetResolves)
 TEST(TextureStore, GetInvalidReturnsSharedEmptyTexture)
 {
     TextureStore store;
-    // Empty (never-loaded) texture has zero dimensions; deref is safe.
+
     EXPECT_EQ(store.Get(TextureHandle{}).GetWidth(), 0);
 }
 
@@ -76,7 +74,7 @@ TEST(TextureStore, GetReferenceStableAcrossLaterAdopts)
     const TextureHandle a = store.Adopt(MakeSolid(7, 8, 9));
     const Texture& first = store.Get(a);
     const void* addr = &first;
-    // Force rehash/growth with several more adopts.
+
     for (int i = 0; i < 32; ++i)
     {
         store.Adopt(MakeSolid(static_cast<unsigned char>(i), 0, 0));
