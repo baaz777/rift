@@ -20,11 +20,10 @@ TextureHandle TextureStore::Acquire(const std::string& path)
     }
 
     Texture tex;
-    // Match the historical per-class loader behavior: try the given path, then a
-    // parent-directory fallback (handy when the working directory is build/).
+    // Retry from the parent directory for build-directory launches.
     if (!tex.LoadFromFile(path) && !tex.LoadFromFile("../" + path))
     {
-        return TextureHandle{};  // invalid
+        return TextureHandle{};  // Invalid
     }
 
     const AssetId id = m_NextId++;
