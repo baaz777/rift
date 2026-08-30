@@ -10,7 +10,7 @@ const DialogueTree& EmptyTree()
     static const DialogueTree empty;
     return empty;
 }
-}  // namespace
+}  // Namespace
 
 DialogueHandle DialogueStore::Add(DialogueTree tree)
 {
