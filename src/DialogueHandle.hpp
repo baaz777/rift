@@ -2,19 +2,16 @@
 
 #include <cstdint>
 
-/// @brief Dialogue-tree id type used as a @ref DialogueStore key.
+/// Dialogue-tree id type used as a DialogueStore key.
 using DialogueId = std::uint32_t;
 
 /**
  * @struct DialogueHandle
- * @brief A trivially-copyable reference to a @ref DialogueTree owned by a @ref DialogueStore.
- * @author Alex (https://github.com/lextpf)
+ * @brief Store-local dialogue tree handle.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Dialogue
  *
- * Replaces an owned @ref DialogueTree member on an NPC: the store owns the
- * (non-reflectable) node graph and the ECS @c Dialogue component holds only this
- * handle. Flat aggregate (one field, no ctors) so it is usable directly inside a
- * reflectable ECS component. @c id 0 means "no tree".
+ * Zero means no tree. DialogueStore owns the graph.
  */
 struct DialogueHandle
 {
