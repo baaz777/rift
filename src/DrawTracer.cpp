@@ -4,7 +4,7 @@ namespace DrawTracer
 {
 namespace
 {
-// Hard cap on per-frame events. With section markers (~30) plus flush
+// hard cap on per-frame events. With section markers (~30) plus flush
 // events (~50 in a busy frame) this leaves plenty of headroom while
 // preventing a runaway loop from allocating gigabytes.
 constexpr size_t kMaxEvents = 50000;
@@ -19,7 +19,6 @@ void SetEnabled(bool enabled)
     s_Enabled = enabled;
     if (!enabled)
     {
-        // Free memory when disabled - capture is opt-in for debugging.
         std::vector<Event>().swap(s_LiveEvents);
         std::vector<Event>().swap(s_LastEvents);
     }
@@ -36,8 +35,8 @@ void BeginFrame()
         return;
     s_LastEvents = std::move(s_LiveEvents);
     s_LiveEvents.clear();
-    // Pre-size to last frame's event count so this frame's pushes do not grow the
-    // vector repeatedly. The buffer itself went to s_LastEvents in the move above,
+    // pre-size to last frame's event count so this frame's pushes do not grow the
+    // Vector repeatedly. The buffer itself went to s_LastEvents in the move above,
     // so one fresh allocation per frame remains.
     s_LiveEvents.reserve(s_LastEvents.size());
 }
