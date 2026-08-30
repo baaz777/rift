@@ -9,52 +9,38 @@
 
 /**
  * @enum LogLevel
- * @brief Severity levels for Logger entries, ordered by ascending priority.
- * @author Alex (https://github.com/lextpf)
+ * @brief Severity order used by the minimum-level filter.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
- *
- * Each level maps to a tag printed in the log line and to an ANSI color used
- * for the console mirror. Calls below the configured minimum level
- * (Logger::SetMinLevel) are dropped at the entry point with no formatting cost.
- *
- * | Level   | Tag       | Level tag color  | Typical Use                      |
- * |---------|-----------|------------------|----------------------------------|
- * | Trace   | `[TRACE]` | Dim white        | Very verbose flow tracing        |
- * | Debug   | `[DEBUG]` | Cyan             | Diagnostic detail for developers |
- * | Info    | `[INFO] ` | Bright blue      | Normal status messages           |
- * | Warn    | `[WARN] ` | Yellow           | Recoverable problems             |
- * | Error   | `[ERROR]` | Bright red       | Failed operations, kept running  |
- * | Fatal   | `[FATAL]` | White on red     | About-to-terminate condition     |
- *
- * The tag color is only one of the three a console line carries. The timestamp is
- * always grey. The message body is white for Trace, Debug and Info, and takes the
- * level color from Warn upward. The subsystem tag gets its own color by hashing the
- * subsystem name into a fixed 24-entry palette - stable across runs, and deliberately
- * free of yellow and red so it can never be read as a severity.
  */
 enum class LogLevel : std::uint8_t
 {
-    Trace,  ///< Verbose flow tracing (dim white).
-    Debug,  ///< Diagnostic detail for development (cyan).
-    Info,   ///< Normal status messages (bright blue).
-    Warn,   ///< Recoverable problems (yellow).
-    Error,  ///< Failed operations the program survived (bright red).
-    Fatal   ///< About to terminate (white on red).
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal
 };
 
 /**
  * @class Logger
- * @brief Engine-wide leveled logger with timestamped, subsystem-tagged output
- *        mirrored to console (ANSI-colored) and `rift.project.log` (plain text).
- * @author Alex (https://github.com/lextpf)
+ * @brief Timestamped console and file logging for a single-threaded engine.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Core
  *
- * Logger is a static class with no instances. Every call has the form
- * `Logger::Info(subsystem, message)` and produces one line in both the console
- * (with ANSI color escapes) and the log file (plain text).
  *
- * @par Output format
- * Four single-space-separated fields, three of them fixed width:
+ * Initialize after console redirection to enable ANSI color on the correct handles.
+ * Initialize truncates rift.project.log; Shutdown closes it. Console output remains
+ * available before initialization, after shutdown and when the file cannot open.
+ * Serialize calls that read or change logger state; there is no internal synchronization.
+ * Formatted helpers build the message before applying the level filter. Filtering skips
+ * timestamp and output-line formatting, but still evaluates and formats message arguments.
+ *
+ * Trace through Info use stdout; Warn through Fatal use stderr. Both flush each line.
+ * Signal and SEH handlers append directly to the same path and must not call Logger.
+ * Fatal writes at the highest severity; it does not terminate the process.
+ *
  * @verbatim
  *   [12:34:56.789] [ERROR] [Dialogue] Start node not found in NPC tree
  *   |------------| |-----| |--------| |---------------------------------
@@ -67,46 +53,16 @@ enum class LogLevel : std::uint8_t
  *                          [INFO] and [WARN] get a trailing space to match.
  * @endverbatim
  *
- * @par Console stream split
- * The same line goes to the log file and to the console, but the console stream is
- * chosen by severity - the cut is at Warn:
  * @verbatim
  *   Trace   Debug   Info      Warn   Error   Fatal
  *   ----------------------    ---------------------
  *          std::cout                 std::cerr
  * @endverbatim
- * Both streams are flushed after every line. Anyone redirecting output, or writing a
- * capture-based test, has to capture both - capturing only stdout silently drops
- * every warning and error. The log FILE is unaffected: all six levels land in
- * `rift.project.log` in one stream, in call order.
  *
- * @par Initialization order
- * Must be Initialized after `AllocConsole()` + `freopen_s` redirects so the
- * VT-processing toggle has the post-redirect console handle. Must be Shutdown
- * before `main()` returns to flush the file. See `src/main.cpp`.
- *
- * @par Crash handler coexistence
- * The signal/SEH handlers in `main.cpp` write the same file
- * (@ref LOG_FILE_PATH) via async-signal-safe `_open`/`_write`/`_close` and
- * cannot call into Logger. Both ends use the same literal path so entries
- * interleave correctly, and the crash handlers always open with `_O_APPEND`.
- *
- * @par Thread safety
- * Single-threaded by design. The rest of the engine has no `std::mutex` or
- * `std::atomic`; Logger matches that contract. Calling from multiple threads
- * concurrently is a data race.
- *
- * @par Format helpers
- * `*F` overloads accept C++23 `std::format` strings:
- * @code
+ * @code{.cpp}
  * Logger::InfoF("Tilemap", "Loaded '{}' ({}x{})", path, width, height);
  * @endcode
- * The plain overloads accept any `std::string_view` and are used when the
- * caller already has a fully-built string.
  *
- * @par Per-file subsystem convention
- * Each `.cpp` declares a constant at the top of an anonymous namespace and
- * passes it to every Logger call:
  * @code
  * namespace
  * {
@@ -118,248 +74,155 @@ enum class LogLevel : std::uint8_t
  *     Logger::Info(LOG_SUBSYSTEM, "Doing stuff");
  * }
  * @endcode
- *
- * @par Failure semantics
- * If `Initialize()` cannot open the file, it returns `false` but still marks
- * Logger initialized for console output. Virtual-terminal setup only controls
- * whether ANSI colors are emitted. The level filter is the only thing that drops
- * a call: the console write is never gated on Logger state, so entries emitted
- * before `Initialize()` or after `Shutdown()` still reach `std::cout` /
- * `std::cerr`. Only the file write is skipped while the file is not open, so
- * @ref IsInitialized reports lifecycle state and is not an emission gate. Crashes
- * still produce output because the signal handlers do not depend on Logger state.
- *
- * @see LogLevel
  */
 class Logger
 {
 public:
-    /// Static-only utility; no Logger instances may be created.
     Logger() = delete;
-    /// Static-only utility; copying is not meaningful.
+
     Logger(const Logger&) = delete;
-    /// Static-only utility; assignment is not meaningful.
+
     Logger& operator=(const Logger&) = delete;
 
-    /// @name Constants
-    /// @{
-
-    /**
-     * @brief Path of the log file, relative to the working directory.
-     *
-     * Signal/SEH handlers cannot call methods of this class, so they embed
-     * the same literal. Keep them in sync if the path ever changes.
-     */
+    /// working-directory path shared with signal and SEH handlers; keep their literals consistent.
     static constexpr const char* LOG_FILE_PATH = "rift.project.log";
 
-    /// @}
-
-    /// @name Lifecycle
-    /// @{
-
     /**
-     * @brief Open the log file (truncate), enable VT processing on console.
+     * @fn bool Logger::Initialize()
+     * @brief Open the log file and configure console color support.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Idempotent: a second call is a no-op. Safe to call before
-     * `AllocConsole()` (color toggle will silently fail and ANSI codes will
-     * be omitted from console output).
+     * Truncate the file on the first call after construction or Shutdown. A failed file open
+     * still marks the logger initialized so console logging can continue. Call Shutdown
+     * before retrying.
      *
-     * @return true if the file was opened successfully, false otherwise. Only the first
-     *         call reports the file state; a redundant call returns true whether or not
-     *         the file is open. Either way, log calls are safe and still emit to console.
+     * @return Whether the file opened, or true if the logger was already initialized.
      */
     static bool Initialize();
 
     /**
-     * @brief Flush and close the log file.
-     *
-     * Idempotent. After Shutdown the file write stops, but log calls still reach the
-     * console; nothing suppresses them.
+     * @fn void Logger::Shutdown()
+     * @brief Close the file; repeated calls are safe and console logging continues.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static void Shutdown();
 
-    /// @}
-
-    /// @name Configuration
-    /// @{
-
     /**
-     * @brief Set the minimum severity level emitted.
-     *
-     * Calls with lower severity are dropped at the entry point with no
-     * formatting cost.
-     *
-     * @param level Minimum severity to emit (default: Trace, emit everything).
+     * @fn void Logger::SetMinLevel(LogLevel level)
+     * @brief Filter lower levels before output; formatted helpers still build their message first.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static void SetMinLevel(LogLevel level);
 
-    /**
-     * @brief Get the current minimum severity level.
-     * @return The level configured by SetMinLevel.
-     */
     static LogLevel GetMinLevel();
 
     /**
-     * @brief Check whether Initialize() has run and Shutdown() has not.
-     * @return true between those two calls, even if the log file failed to open.
-     *         Emission does not depend on this: see "Failure semantics" above.
+     * @fn bool Logger::IsInitialized()
+     * @brief True between Initialize and Shutdown, including when file opening failed.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static bool IsInitialized();
 
-    /// @}
-
-    /**
-     * @name Plain-message emitters
-     * @brief One method per LogLevel; the message is written verbatim.
-     */
-    /// @{
-
-    /// @brief Emit a Trace-level entry.
     static void Trace(std::string_view subsystem, std::string_view message);
 
-    /// @brief Emit a Debug-level entry.
     static void Debug(std::string_view subsystem, std::string_view message);
 
-    /// @brief Emit an Info-level entry.
     static void Info(std::string_view subsystem, std::string_view message);
 
-    /// @brief Emit a Warn-level entry.
     static void Warn(std::string_view subsystem, std::string_view message);
 
-    /// @brief Emit an Error-level entry.
     static void Error(std::string_view subsystem, std::string_view message);
 
-    /// @brief Emit a Fatal-level entry.
     static void Fatal(std::string_view subsystem, std::string_view message);
 
-    /// @brief Emit an entry at the specified level.
     static void Log(LogLevel level, std::string_view subsystem, std::string_view message);
 
-    /// @}
-
-    /**
-     * @name std::format emitters
-     * @brief Variadic helpers that accept a `std::format` string.
-     */
-    /// @{
-
-    /// @brief Emit a Trace-level entry built from a format string.
     template <typename... Args>
     static void TraceF(std::string_view subsystem, std::format_string<Args...> fmt, Args&&... args)
     {
         Trace(subsystem, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    /// @brief Emit a Debug-level entry built from a format string.
     template <typename... Args>
     static void DebugF(std::string_view subsystem, std::format_string<Args...> fmt, Args&&... args)
     {
         Debug(subsystem, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    /// @brief Emit an Info-level entry built from a format string.
     template <typename... Args>
     static void InfoF(std::string_view subsystem, std::format_string<Args...> fmt, Args&&... args)
     {
         Info(subsystem, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    /// @brief Emit a Warn-level entry built from a format string.
     template <typename... Args>
     static void WarnF(std::string_view subsystem, std::format_string<Args...> fmt, Args&&... args)
     {
         Warn(subsystem, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    /// @brief Emit an Error-level entry built from a format string.
     template <typename... Args>
     static void ErrorF(std::string_view subsystem, std::format_string<Args...> fmt, Args&&... args)
     {
         Error(subsystem, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    /// @brief Emit a Fatal-level entry built from a format string.
     template <typename... Args>
     static void FatalF(std::string_view subsystem, std::format_string<Args...> fmt, Args&&... args)
     {
         Fatal(subsystem, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    /// @}
-
-    /**
-     * @name Field widths
-     * @brief Tag-field padding constants used by Emit() and exposed for tests.
-     */
-    /// @{
-
-    /// @brief Width of the bracketed level tag, e.g. `[ERROR]` = 7 chars.
+    /// bracketed tag width in characters.
     static constexpr std::size_t LEVEL_FIELD_WIDTH = 7;
 
-    /// @brief Width of the bracketed subsystem tag, e.g. `[Dialogue]` = 10 chars.
+    /// bracketed subsystem width in characters.
     static constexpr std::size_t SUBSYSTEM_FIELD_WIDTH = 10;
 
-    /**
-     * @brief Maximum subsystem name length that fits without truncation
-     *        (`SUBSYSTEM_FIELD_WIDTH` minus the two enclosing brackets).
-     */
+    /// Maximum name length excluding brackets.
     static constexpr std::size_t MAX_SUBSYSTEM_NAME_LENGTH = SUBSYSTEM_FIELD_WIDTH - 2;
 
-    /// @}
-
     /**
-     * @name Test hooks
-     * @brief Internal helpers exposed for unit tests; not for production callers.
-     */
-    /// @{
-
-    /**
-     * @brief Format the level tag with bracket padding (e.g. `"[INFO] "`).
-     *
-     * Returns a 7-character string view including any trailing space needed
-     * to align with the longest tag, `[ERROR]` / `[FATAL]`.
-     *
-     * @param level Severity level.
-     * @return Padded tag of width @ref LEVEL_FIELD_WIDTH.
+     * @fn std::string_view Logger::LevelTagPadded(LogLevel level)
+     * @brief Pad the severity tag to LEVEL_FIELD_WIDTH characters.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static std::string_view LevelTagPadded(LogLevel level);
 
     /**
-     * @brief Format the subsystem tag with bracket padding.
-     *
-     * The result is at most @ref SUBSYSTEM_FIELD_WIDTH characters; longer
-     * subsystem names are truncated to `MAX_SUBSYSTEM_NAME_LENGTH`.
-     *
-     * @param subsystem Subsystem name (without brackets).
-     * @return Padded tag of width @ref SUBSYSTEM_FIELD_WIDTH.
+     * @fn std::string Logger::SubsystemTagPadded(std::string_view subsystem)
+     * @brief Truncate names to MAX_SUBSYSTEM_NAME_LENGTH and pad to SUBSYSTEM_FIELD_WIDTH.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static std::string SubsystemTagPadded(std::string_view subsystem);
 
-    /// @}
-
 private:
     /**
-     * @brief Format a message and emit it to file and console.
-     *
-     * The caller is expected to have already filtered by SetMinLevel.
+     * @fn void Logger::Emit(LogLevel level, std::string_view subsystem, std::string_view message)
+     * @brief Caller must apply the minimum-level filter first.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static void Emit(LogLevel level, std::string_view subsystem, std::string_view message);
 
-    /// @brief Build the `[HH:MM:SS.mmm]` timestamp string for the current moment.
+    /**
+     * @fn std::string Logger::FormatTimestamp()
+     * @brief Local timestamp in HH:MM:SS.mmm format.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     static std::string FormatTimestamp();
 
     /**
-     * @brief Get the ANSI color escape for a level's tag.
-     *
-     * Always returns an escape for a valid level; `""` is the unreachable out-of-range
-     * fallback. This does not consult the VT state - Emit decides whether the escape is
-     * written at all.
+     * @fn const char* Logger::AnsiColorFor(LogLevel level)
+     * @brief Return an ANSI escape without checking VT support; invalid levels return an empty
+     * string.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static const char* AnsiColorFor(LogLevel level);
 
     /**
-     * @brief Try to enable `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout/stderr.
-     * @return true if both handles were updated successfully.
+     * @fn bool Logger::TryEnableVirtualTerminal()
+     * @brief True only if both stdout and stderr enable virtual-terminal processing.
+     * @author Alex (<https://github.com/lextpf>)
      */
     static bool TryEnableVirtualTerminal();
 
