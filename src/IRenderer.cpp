@@ -22,14 +22,7 @@ void IRenderer::RotateCorners(glm::vec2 corners[4], glm::vec2 size, float rotati
 
 namespace
 {
-// Maps a "headline 1.0x" call onto the body atlas for backends without a
-// separate high-res atlas - still visibly large, just blurry. Vulkan is the only
-// consumer today; the OpenGL backend overrides both headline entry points.
-//
-// 4.0 is the OpenGL backend's HEADLINE_FONT_LOGICAL_PIXEL_SIZE (96) over its
-// BODY_FONT_LOGICAL_PIXEL_SIZE (24), duplicated here as a literal. Keep it in step
-// with those two constants, or DrawTextLarge and GetTextWidthLarge silently
-// mis-size on every backend that does not override them.
+// Keep the fallback ratio equal to OpenGL headline/body logical font sizes.
 constexpr float kHeadlineFallbackScale = 4.0f;
 }  // namespace
 
