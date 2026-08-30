@@ -12,33 +12,20 @@ class IRenderer;
 
 /**
  * @class TextureStore
- * @brief Renderer-side owner of sprite textures, addressed by @ref TextureHandle.
- * @author Alex (https://github.com/lextpf)
+ * @brief Owns textures for the lifetime of the store.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * Centralizes texture ownership: the sprite components (@ref PlayerSprite,
- * @ref NpcSprite) hold @ref TextureHandle values rather than owned @ref Texture
- * objects, so the store keeps the one copy and is the single place the
- * renderer-switch re-upload iterates.
+ * Acquire deduplicates the exact path string; it does not normalize separators or resolve aliases.
+ * Adopt always allocates a new entry, including for an empty texture. Handles belong to this store.
+ * The same numeric ID in another store can refer to a different texture.
  *
- * @par Deduplication
- * @ref Acquire dedups by path, so many NPCs of the same type share one texture.
- * @ref Adopt takes ownership of an already-built (e.g. procedural / in-memory)
- * texture and is never deduped.
+ * References remain valid across insertions and renderer switches until this store is destroyed.
+ * GPU handles are rebuilt; cached renderer pointers become invalid.
  *
- * @par Pointer stability
- * Textures live in a node-based @c std::unordered_map, so a @c const @c Texture&
- * obtained from @ref Get stays valid across later @ref Acquire / @ref Adopt
- * calls (only erasure would invalidate it, and the store never erases).
+ * There is no erase API. Reuse procedural handles instead of adopting textures on each map load.
  *
- * @par Renderer switch order
- * @ref UploadAll is one step of a fixed sequence in `Game::SwitchRenderer`. Two steps
- * of it are easy to get wrong: the GL context generation advances only when the new
- * backend is OpenGL, and the character atlas re-pack runs after @ref UploadAll and
- * deliberately overwrites the tileset upload.
- *
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * sequenceDiagram
  *     participant G as Game
  *     participant T as Texture (static)
@@ -54,70 +41,79 @@ class IRenderer;
  *     Note over S,R: GL recreates only on generation mismatch; Vulkan always recreates
  *     G->>G: PackCharactersIntoAtlas()
  *     Note over G: repacks from CPU pixels and overwrites the tileset upload
- * </pre>
- * @endhtmlonly
- *
- * The store and its @ref Texture objects survive the switch, so handles and references
- * stay valid; only their GPU-side handles are rebuilt. Any cached @c IRenderer* does
- * dangle.
- *
- * @warning There is deliberately no release/erase API, and @c m_NextId only ever
- * increments, so handles are never recycled and no texture is ever freed before
- * the store itself is destroyed. Every texture the process touches is resident
- * for the lifetime of the owning @c Game. That is fine for @ref Acquire, which
- * dedups by path, but each @ref Adopt is a permanent allocation: adopting
- * procedural textures per world load grows the store without bound. Adopt once
- * at startup, or reuse the existing handle.
+ * ```
  */
 class TextureStore
 {
 public:
     /**
-     * @brief Load-or-get a texture by path, deduped by path.
+     * @fn TextureHandle Acquire(const std::string& path)
+     * @brief Caches successful loads by path.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Tries @p path, then @c "../" + @p path. Only a successful load enters the dedup
-     * index, so a path that fails is retried in full - two file-open attempts and two
-     * Logger errors - on every call. Callers on a per-spawn path must not rely on the
-     * index to suppress repeated failures.
+     * Tries the supplied path, then the same path prefixed with ../ for build-directory launches.
+     * Only successful loads enter the cache. Failed loads are retried and logged on every call.
      *
-     * @param path  Texture file path.
-     * @return      Handle to the loaded texture, or an invalid handle when it cannot load.
+     * @return A store-local handle, or an invalid handle if both loads fail.
      */
     TextureHandle Acquire(const std::string& path);
 
-    /// @brief Take ownership of an already-built texture (not deduped).
+    /**
+     * @fn TextureHandle Adopt(Texture&& texture)
+     * @brief Take ownership of a texture without path deduplication.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * The source becomes empty. Reuse the returned handle across reloads; entries are never erased.
+     */
     TextureHandle Adopt(Texture&& texture);
 
-    /// @brief True if @p handle refers to a loaded texture.
+    /**
+     * @fn bool IsValid(TextureHandle handle) const
+     * @brief Test whether the handle names an entry in this store.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * This checks membership only. An adopted empty texture still has a valid handle.
+     */
     [[nodiscard]] bool IsValid(TextureHandle handle) const;
 
-    /// @brief Resolve @p handle. Invalid handles resolve to a shared empty
-    /// texture so callers can render/sample without null checks.
+    /**
+     * @fn const Texture& Get(TextureHandle handle) const
+     * @brief Resolve a handle to a borrowed texture.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * Unknown IDs return a shared empty texture. A reference to an owned entry remains valid until
+     * this store is destroyed. The returned reference does not transfer GPU resource ownership.
+     */
     [[nodiscard]] const Texture& Get(TextureHandle handle) const;
 
     /**
-     * @brief (Re)upload every owned texture into @p renderer (renderer switch).
+     * @fn void UploadAll(IRenderer& renderer) const
+     * @brief Synchronously uploads all textures to the renderer.
+     * @author Alex (<https://github.com/lextpf>)
      *
-     * Synchronous, not a batched submit: each Vulkan upload blocks on its own fence, so
-     * the cost is one GPU round-trip per texture. The Vulkan path can also throw
-     * `std::runtime_error` out of @ref Texture::CreateVulkanTexture. The throw propagates
-     * mid-iteration and abandons the remaining uploads, leaving the store partly uploaded.
-     *
-     * @param renderer  Backend that receives every owned texture.
+     * Call outside an active render pass. Vulkan waits on one fence per texture.
+     * An upload exception propagates and leaves remaining entries unprocessed.
+     * Iteration order is unspecified.
      */
     void UploadAll(IRenderer& renderer) const;
 
-    /// @brief Accent color for a handle's texture (invalid/empty -> @p fallback).
+    /**
+     * @fn glm::vec3 SampleAccent(TextureHandle handle, glm::vec3 fallback) const
+     * @brief Accent color for a handle's texture (invalid/empty -> fallback).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] glm::vec3 SampleAccent(TextureHandle handle, glm::vec3 fallback) const;
 
-    /// @brief Number of textures owned. Monotonically non-decreasing for the
-    /// store's lifetime - nothing is ever erased.
+    /**
+     * @fn std::size_t Count() const
+     * @brief Count never decreases during the store lifetime.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] std::size_t Count() const { return m_Textures.size(); }
 
 private:
     std::unordered_map<std::string, TextureHandle> m_ByPath;  ///< Dedup index for Acquire.
     std::unordered_map<AssetId, Texture> m_Textures;          ///< The owned textures.
-    /// Next id to mint (0 = invalid). Monotonic and never reused, so a handle
-    /// stays valid forever and a stale handle can never alias a newer texture.
+    /// Next store-local ID; zero is reserved and IDs are never reused.
     AssetId m_NextId = 1;
 };
