@@ -12,18 +12,16 @@
 namespace
 {
 constexpr const char* ANSI_RESET = "\x1b[0m";
-constexpr const char* ANSI_TIMESTAMP = "\x1b[90m";     // Bright black (grey)
+constexpr const char* ANSI_TIMESTAMP = "\x1b[90m";     // bright black (grey)
 constexpr const char* ANSI_BODY_DEFAULT = "\x1b[37m";  // White (info / debug / trace bodies)
-constexpr const char* ANSI_TRACE = "\x1b[2;37m";       // Dim white
+constexpr const char* ANSI_TRACE = "\x1b[2;37m";       // dim white
 constexpr const char* ANSI_DEBUG = "\x1b[36m";         // Cyan
-constexpr const char* ANSI_INFO = "\x1b[94m";          // Bright blue
+constexpr const char* ANSI_INFO = "\x1b[94m";          // bright blue
 constexpr const char* ANSI_WARN = "\x1b[33m";          // Yellow
-constexpr const char* ANSI_ERROR = "\x1b[91m";         // Bright red
+constexpr const char* ANSI_ERROR = "\x1b[91m";         // bright red
 constexpr const char* ANSI_FATAL = "\x1b[97;41m";      // White on red
 
-// 24 readable 256-color codes across the cool half of the spectrum
-// (greens/cyans/blues/magentas/pinks). Yellow and red are omitted so the
-// subsystem tag never collides with WARN/ERROR/FATAL body colors.
+// omit yellow and red so subsystem colors cannot be mistaken for severity.
 constexpr const char* SUBSYSTEM_PALETTE[] = {
     "\x1b[38;5;39m",   // azure blue
     "\x1b[38;5;41m",   // spring green
@@ -62,7 +60,7 @@ constexpr std::string_view TAG_FATAL = "[FATAL]";
 
 const char* AnsiColorForSubsystem(std::string_view subsystem)
 {
-    // FNV-style hash - stable across runs, so each subsystem keeps the same color.
+    // stable hash keeps subsystem colors consistent across runs.
     std::size_t hash = 2166136261u;
     for (char c : subsystem)
     {
