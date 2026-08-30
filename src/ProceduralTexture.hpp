@@ -5,38 +5,21 @@
 #include <vector>
 
 /**
- * @brief RGBA pixel value returned by procedural texture generators.
- * @author Alex (https://github.com/lextpf)
+ * @brief RGBA channel order compatible with Texture::LoadFromData using four channels.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
- *
- * Channel order is R, G, B, A - the same packing Texture::LoadFromData expects
- * with `channels == 4`.
- *
- * @see GeneratePixels
  */
 using Pixel = std::array<uint8_t, 4>;
 
 /**
- * @brief Generate an RGBA pixel buffer by evaluating a functor at every texel.
+ * @fn void GeneratePixels(std::vector<unsigned char>& pixels, int w, int h, PixelFn fn)
+ * @brief Fill an RGBA buffer in row order with a caller-supplied pixel function.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * Allocates `w * h * 4` bytes in @p pixels and fills each texel by calling
- * @p fn(x, y, w, h), which must return a `Pixel` (std::array<uint8_t, 4>).
+ * `w` and `h` must be positive texel dimensions; `fn` returns Pixel.
+ * Upload with flipY = false to preserve the generated row order.
  *
- * Rows are written top-down, y = 0 first, which is already the orientation
- * Texture::LoadFromData stores. Pass `flipY = false` when uploading the result; that
- * parameter's `true` default is for decoded image files, not for generated buffers.
- *
- * @tparam PixelFn Callable with signature `Pixel(int x, int y, int w, int h)`.
- * @param[out] pixels Output buffer (resized automatically).
- * @param      w      Texture width in texels.
- * @param      h      Texture height in texels.
- * @param      fn     Per-texel color function.
- *
- * @pre w > 0 and h > 0. Negative dimensions are converted to size_t during
- *      allocation and would request an invalidly large buffer.
- *
- * @par Example: radial gaussian falloff
  * @code{.cpp}
  * std::vector<unsigned char> pixels;
  * GeneratePixels(pixels, 64, 64,
