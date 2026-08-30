@@ -8,64 +8,57 @@
 
 /**
  * @class DialogueStore
- * @brief Owner of NPC @ref DialogueTree graphs, addressed by @ref DialogueHandle.
- * @author Alex (https://github.com/lextpf)
+ * @brief Append-only owner of dialogue trees.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Dialogue
  *
- * Centralizes ownership of the branching dialogue trees: an NPC entity's
- * @c Dialogue component holds a @ref DialogueHandle rather than an owned tree, and
- * the store keeps the one copy. This mirrors @ref TextureStore - the heavy,
- * non-field-serializable resource lives behind a handle so the component stays a
- * flat, reflectable aggregate.
+ * Handles belong to the store that issued them. Despawning an NPC does not erase its tree;
+ * loads and redo operations can accumulate unused trees. References remain valid across Add.
+ * DialogueManager copies the active tree so a conversation survives NPC removal.
  *
- * @par Ownership chain
- * Nothing but this store owns a tree. @ref DialogueManager takes a private COPY at
- * @c StartDialogue so its node/option pointers survive the NPC being despawned
- * mid-conversation:
- *
- * @htmlonly
- * <pre class="mermaid">
+ * ```mermaid
  * flowchart LR
  *     NPC["NPC entity"] --> Comp["Dialogue component"]
  *     Comp --> H["DialogueHandle .id"]
  *     H -- "map key" --> Map["DialogueStore::m_Trees"]
  *     Map --> Tree["DialogueTree (the one owner)"]
  *     Tree -- "copied at StartDialogue" --> Active["DialogueManager::m_ActiveTree"]
- * </pre>
- * @endhtmlonly
- *
- * @par Pointer stability
- * Trees live in a node-based @c std::unordered_map, so a @c const @c DialogueTree&
- * obtained from @ref Get stays valid across later @ref Add calls (only erasure
- * would invalidate it, and the store never erases).
- *
- * @note The store is append-only for the whole process lifetime: there is no erase
- * or clear API, @ref Add never dedups, and nothing clears the store when NPC
- * entities are destroyed. A map load and each editor redo of an NPC placement
- * therefore mint fresh trees on top of the orphaned previous ones, so the store
- * grows across reloads and editor sessions.
- *
- * @note A handle is never invalidated. A handle held past its NPC's despawn keeps
- * resolving to the orphaned tree instead of reporting invalid, and a handle is only
- * meaningful for the store instance that minted it.
+ * ```
  */
 class DialogueStore
 {
 public:
-    /// @brief Take ownership of a tree (moved in); returns its handle.
+    /**
+     * @fn DialogueHandle DialogueStore::Add(DialogueTree tree)
+     * @brief Take ownership of a tree (moved in); returns its handle.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     DialogueHandle Add(DialogueTree tree);
 
-    /// @brief True if @p handle refers to a stored tree.
+    /**
+     * @fn bool DialogueStore::IsValid(DialogueHandle handle) const
+     * @brief True if handle refers to a stored tree.
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] bool IsValid(DialogueHandle handle) const;
 
-    /// @brief True if @p handle refers to a stored, non-empty tree (has nodes).
+    /**
+     * @fn bool DialogueStore::HasTree(DialogueHandle handle) const
+     * @brief True if handle refers to a stored, non-empty tree (has nodes).
+     * @author Alex (<https://github.com/lextpf>)
+     */
     [[nodiscard]] bool HasTree(DialogueHandle handle) const;
 
-    /// @brief Resolve @p handle. Invalid handles resolve to a shared empty tree
-    /// so callers can read without null checks.
+    /**
+     * @fn const DialogueTree& DialogueStore::Get(DialogueHandle handle) const
+     * @brief Read a stored tree or the shared empty fallback.
+     * @author Alex (<https://github.com/lextpf>)
+     *
+     * @return A borrowed tree. Stored references survive Add calls until this store is
+     * destroyed; the empty fallback has static lifetime.
+     */
     [[nodiscard]] const DialogueTree& Get(DialogueHandle handle) const;
 
-    /// @brief Number of trees owned.
     [[nodiscard]] std::size_t Count() const { return m_Trees.size(); }
 
 private:
