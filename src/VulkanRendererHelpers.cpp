@@ -12,8 +12,7 @@ constexpr const char* LOG_SUBSYSTEM = "Render";
 
 namespace
 {
-// Barrier template for a single-mip, single-layer 2D color image. Access masks and
-// pipeline stages are filled in per transition by CmdTransitionColorImageLayout.
+// Single-mip color barrier; the transition selects access masks and stages.
 VkImageMemoryBarrier CreateColorImageBarrier(VkImage image,
                                              VkImageLayout oldLayout,
                                              VkImageLayout newLayout)
@@ -33,11 +32,7 @@ VkImageMemoryBarrier CreateColorImageBarrier(VkImage image,
     return barrier;
 }
 
-// Record one of the only two layout transitions texture upload needs:
-// UNDEFINED -> TRANSFER_DST (before the copy) and TRANSFER_DST -> SHADER_READ_ONLY
-// (after it). Anything else throws rather than guessing at access masks, so an
-// unsupported transition fails loudly at the call site instead of silently
-// producing a barrier that does not synchronize what the caller assumed.
+// Support only undefined -> TRANSFER_DST -> SHADER_READ_ONLY; other pairs throw.
 void CmdTransitionColorImageLayout(VkCommandBuffer commandBuffer,
                                    VkImage image,
                                    VkImageLayout oldLayout,
@@ -70,8 +65,7 @@ void CmdTransitionColorImageLayout(VkCommandBuffer commandBuffer,
         commandBuffer, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-// Whole-image copy region for a tightly packed RGBA staging buffer. Zeroed
-// bufferRowLength/bufferImageHeight mean "no padding - rows are width * texel size".
+// Zero row length and image height select tightly packed staging rows.
 VkBufferImageCopy CreateColorImageCopyRegion(uint32_t width, uint32_t height)
 {
     VkBufferImageCopy region{};
@@ -88,9 +82,6 @@ VkBufferImageCopy CreateColorImageCopyRegion(uint32_t width, uint32_t height)
 }
 }  // namespace
 
-// Record a layout transition into the current frame's command buffer, so this is
-// only valid between BeginFrame and EndFrame. `format` is unused: every image this
-// renderer transitions is a color image, so the aspect mask is always COLOR.
 void VulkanRenderer::TransitionImageLayout(VkImage image,
                                            VkFormat format,
                                            VkImageLayout oldLayout,
@@ -101,11 +92,6 @@ void VulkanRenderer::TransitionImageLayout(VkImage image,
     CmdTransitionColorImageLayout(commandBuffer, image, oldLayout, newLayout);
 }
 
-// Self-contained, synchronous texture upload: allocate a one-shot command buffer,
-// record transition -> copy -> transition, submit, and block on m_TransferFence
-// until the GPU is done. Deliberately independent of the frame command buffer so a
-// texture can be uploaded outside BeginFrame/EndFrame; the cost is a full
-// CPU-GPU round trip per texture, which is why uploads happen at load time.
 void VulkanRenderer::UploadStagingBufferToImage(VkBuffer stagingBuffer,
                                                 VkImage image,
                                                 uint32_t width,
@@ -150,10 +136,6 @@ void VulkanRenderer::UploadStagingBufferToImage(VkBuffer stagingBuffer,
     vkFreeCommandBuffers(m_Device, m_CommandPool, 1, &commandBuffer);
 }
 
-// Record just the buffer->image copy into the current frame's command buffer. The
-// caller owns the surrounding layout transitions and must have already put the
-// image in TRANSFER_DST_OPTIMAL; unlike UploadStagingBufferToImage this neither
-// submits nor waits.
 void VulkanRenderer::CopyBufferToImage(VkBuffer buffer,
                                        VkImage image,
                                        uint32_t width,
@@ -166,10 +148,6 @@ void VulkanRenderer::CopyBufferToImage(VkBuffer buffer,
         commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 }
 
-// One sampler shared by every texture. NEAREST + CLAMP_TO_EDGE matches the OpenGL
-// backend's per-texture parameters: nearest keeps pixel art crisp, clamp stops
-// neighboring sprite-sheet cells bleeding across a tile's edge. No mips exist, so
-// mipmapMode is irrelevant, and anisotropy is off (nothing is minified in 2D).
 void VulkanRenderer::CreateTextureSampler()
 {
     VkSamplerCreateInfo samplerInfo{};
@@ -190,26 +168,17 @@ void VulkanRenderer::CreateTextureSampler()
     VK_CHECK(vkCreateSampler(m_Device, &samplerInfo, nullptr, &m_TextureSampler));
 }
 
-// Resolve a CPU Texture to its cached Vulkan resources, keyed by the Texture's own
-// address. Never uploads: it cannot reach Texture's private creation path, so an
-// un-uploaded texture is cached as the 1x1 white fallback (with a warning) and the
-// entry is silently upgraded on a later call once the real image view exists. That
-// self-healing is why a texture missing on the first frame after a renderer switch
-// appears white rather than staying white forever - UploadTexture must still run.
-//
-// Currently unreachable: no draw path calls this. Every path resolves
-// Texture::GetVulkanImageView() directly with a white fallback, so m_TextureCache stays
-// empty. Kept as the seam for renderer-owned texture resources.
+// Unused cache path; draw calls resolve texture image views directly.
 VulkanRenderer::TextureResources& VulkanRenderer::GetOrCreateTexture(const Texture& texture)
 {
-    // Texture object's address as the cache key - each Texture has a unique
+    // Texture object's address as the cache key - each texture has a unique
     // memory location, so collisions can't happen (unlike a size-based hash).
     const Texture* textureKey = &texture;
 
     auto it = m_TextureCache.find(textureKey);
     if (it != m_TextureCache.end() && it->second.initialized)
     {
-        // Upgrade cached fallback once the real image view appears.
+        // Replace a cached white fallback after the texture is uploaded.
         VkImageView liveView = texture.GetVulkanImageView();
         if (liveView != VK_NULL_HANDLE && it->second.imageView != liveView)
         {
@@ -245,10 +214,6 @@ VulkanRenderer::TextureResources& VulkanRenderer::GetOrCreateTexture(const Textu
         return m_TextureCache[textureKey];
     }
 
-    // Texture has no Vulkan resources yet, and CreateVulkanTexture cannot be called
-    // from here (no access to the Texture's private methods), so log and
-    // fall back to white; the cache entry is upgraded above when the real
-    // image view appears.
     Logger::WarnF(LOG_SUBSYSTEM,
                   "Texture {} (size {}x{}) not uploaded to Vulkan yet. Using white texture "
                   "fallback.",
