@@ -2,8 +2,8 @@
 
 /**
  * @enum RendererAPI
- * @brief Available rendering APIs.
- * @author Alex (https://github.com/lextpf)
+ * @brief Available rendering apis.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  */
 enum class RendererAPI
