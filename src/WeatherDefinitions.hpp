@@ -7,48 +7,38 @@
 
 /**
  * @enum WeatherState
- * @brief Weather conditions affecting lighting, particles, and sky rendering.
- * @author Alex (https://github.com/lextpf)
+ * @brief Selects ambient, particle, and sky settings.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Effects
- *
- * Each state drives a `WeatherDefinition` (see GetWeatherDefinition) that
- * specifies ambient tint, particle spawn config, and sky modifications.
  */
 enum class WeatherState
 {
-    // Baseline
+
     Clear = 0,
 
-    // Precipitation
     LightRain,
     HeavyRain,
     Thunderstorm,
     Blizzard,
 
-    // Atmosphere - Fog is one thinned stream of large soft puffs (uniform
-    // 48-96 px); fogAlphaMultiplier holds per-puff alpha down so the world
-    // stays legible.
+    // Fog uses 48-96 pixel puffs; fogAlphaMultiplier limits their opacity.
     Fog,
     HeatHaze,
     Sandstorm,
 
-    // Floral / seasonal
     FallingLeaves,
     CherryBlossoms,
     PollenStorm,
 
-    // Special / events
     Aurora,
     MeteorShower,
     FireflySwarm,
     AshFall,
     EmberStorm,
 
-    // Atmospheric / prismatic
     GodRays
 };
 
-/// Compile-time reflection for WeatherState.
 template <>
 struct EnumTraits<WeatherState> : EnumTraitsBase<WeatherState, EnumTraits<WeatherState>>
 {
@@ -77,12 +67,9 @@ struct EnumTraits<WeatherState> : EnumTraitsBase<WeatherState, EnumTraits<Weathe
 
 /**
  * @enum WeatherParticleType
- * @brief Identifies which particle effect a weather state spawns.
+ * @brief Renderer-independent effect IDs translated by ParticleSystem.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Effects
- *
- * Decoupled from ParticleSystem's internal `ParticleType` enum so that
- * WeatherDefinitions.hpp can stay renderer-free and unit-testable.
- * ParticleSystem translates this to the concrete ParticleType at spawn time.
  */
 enum class WeatherParticleType
 {
@@ -98,8 +85,8 @@ enum class WeatherParticleType
     Sand,          ///< Maps to ParticleType::Sand.
     Firefly,       ///< Maps to ParticleType::Firefly.
     Wisp,          ///< Maps to ParticleType::Wisp. Aurora's sparse aurora-dust layer.
-    Sunshine,      ///< Maps to ParticleType::Sunshine. Used by GodRays for rainbow-tinted beams.
-    Smoke,         ///< Maps to ParticleType::Smoke. Drifting haze layer for AshFall/EmberStorm.
+    Sunshine,      ///< Maps to ParticleType::Sunshine. used by GodRays for rainbow-tinted beams.
+    Smoke,         ///< Maps to ParticleType::Smoke. drifting haze layer for AshFall/EmberStorm.
     Zap,           ///< Maps to ParticleType::Zap. Thunderstorm's electric crackle layer.
     Wind,          ///< Maps to ParticleType::Wind. Sandstorm's gust-streak layer.
     Aurora,        ///< Maps to ParticleType::Aurora. Aurora's hand-painted mote layer.
@@ -108,11 +95,9 @@ enum class WeatherParticleType
 
 /**
  * @enum LightSchedule
- * @brief When a WorldLight emits.
+ * @brief Light schedule with smooth dawn and dusk transitions.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
- *
- * Drives `ComputeLightIntensity(schedule, hour)` to produce a smooth
- * 0-1 envelope around dusk/dawn.
  */
 enum class LightSchedule
 {
@@ -133,12 +118,11 @@ struct EnumTraits<LightSchedule> : EnumTraitsBase<LightSchedule, EnumTraits<Ligh
 
 /**
  * @struct WorldLight
- * @brief A point light source anchored to a world position.
+ * @brief Map-owned lamp resolved by worldLights::Build.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * Owned by `Tilemap` (serialized in the map JSON). Rendered as an additive
- * soft-circle sprite in `Game::Render`, with intensity driven by
- * `ComputeLightIntensity(schedule, time.GetTimeOfDay()) * nightFactor`.
+ * Flat rendering uses camera-relative pools; 3D pools sit at the lamp's surface height.
  */
 struct WorldLight
 {
@@ -150,11 +134,9 @@ struct WorldLight
 
 /**
  * @struct WeatherDefinition
- * @brief Per-weather configuration for ambient, particles, and sky FX.
+ * @brief Settings in the static WeatherState table.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Effects
- *
- * Looked up by `GetWeatherDefinition(state)` - a static table indexed
- * by `std::to_underlying(WeatherState)`. Pure data, no side effects.
  */
 struct WeatherDefinition
 {
@@ -164,7 +146,7 @@ struct WeatherDefinition
     /// If any component is < 0, no override (use TimeManager::GetSkyColor).
     glm::vec3 skyColorOverride{-1.0f, -1.0f, -1.0f};
 
-    /// Primary weather particle. None disables weather-driven spawning.
+    /// Primary weather particle. none disables weather-driven spawning.
     WeatherParticleType particleType{WeatherParticleType::None};
 
     /// Particles spawned per second across the visible viewport (before intensity).
@@ -176,7 +158,7 @@ struct WeatherDefinition
     /// Multiplier on the type's default sprite size.
     float particleSizeScale{1.0f};
 
-    /// If >= 0, overrides `TimeManager::GetStarVisibility` (clamped 0-1).
+    /// If >= 0, overrides TimeManager::GetStarVisibility (clamped 0-1).
     float starVisibilityOverride{-1.0f};
 
     /// Hide sun/moon body sprites entirely (rays still draw if sun is up).
@@ -194,60 +176,45 @@ struct WeatherDefinition
     /// Wind intensity 0-1 - affects horizontal drift of leaf/pollen/ash/sand.
     float windIntensity{0.5f};
 
-    /**
-     * @brief Optional secondary weather particle that spawns alongside @ref particleType.
-     *
-     * Default `None` means single-type spawning (current behavior). Used by Blizzard to
-     * layer Fog particles on top of Snow without losing either.
-     */
+    /// Optional second spawn slot; none disables it.
     WeatherParticleType secondaryParticleType{WeatherParticleType::None};
 
-    /// Spawn rate (particles/sec) for the secondary particle. Ignored when
-    /// @ref secondaryParticleType is `None`.
+    /**
+     * @brief Spawn rate (particles/sec) for the secondary particle.
+     *
+     * ignored when `secondaryParticleType` is `None`.
+     */
     float secondaryBaseSpawnRate{0.0f};
 
-    /// Hard cap on simultaneously live secondary particles. 0 = unlimited
-    /// (still subject to global ParticleSystem cap).
+    /**
+     * @brief Hard cap on simultaneously live secondary particles.
+     *
+     * 0 = unlimited (still subject to global ParticleSystem cap).
+     */
     int secondaryMaxWeatherParticles{0};
 
-    /**
-     * @brief Multiplier on the Fog particle's render-time base alpha (default 1.0 =
-     *        unchanged).
-     *
-     * Lets fog-bearing weathers soften the fog wall without changing density. Read by
-     * `ParticleBehavior<ParticleType::Fog>::Update`.
-     */
+    /// Scales Fog render alpha independently of spawn density.
     float fogAlphaMultiplier{1.0f};
 
-    /// Reserved for a future heat-haze post-FX pass; currently unused.
-    /// The tint multiplier still applies.
+    /// Unused; the weather tint still applies.
     float hazeAmplitude{0.0f};
 };
 
 /**
- * @brief Look up the static definition for a weather state.
+ * @fn const WeatherDefinition& GetWeatherDefinition(WeatherState state)
+ * @brief Returns a program-lifetime definition; invalid states select clear.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Effects
- *
- * @param state Any WeatherState value.
- * @return Reference to a static WeatherDefinition (lifetime: program). An
- * out-of-range value - a deserialized integer, for example - resolves to the
- * Clear entry instead of failing.
  */
 const WeatherDefinition& GetWeatherDefinition(WeatherState state);
 
 /**
- * @brief Compute light envelope (0-1) for a schedule at the given hour.
+ * @fn float ComputeLightIntensity(LightSchedule schedule, float hourOfDay)
+ * @brief Smooth light intensity from 0 to 1 for the selected schedule.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup World
  *
- * Uses a smoothstep ramp at the dawn and dusk boundaries:
- *  - AlwaysOn   -> 1.0
- *  - NightOnly  -> 1.0 in [22, 4) (wraps midnight), smoothstep ramp
- *                 [20, 22] up and [4, 6] down, 0.0 elsewhere.
- *  - DuskToDawn -> 1.0 in [20, 4) (wraps midnight), smoothstep ramp
- *                 [18, 20] up and [4, 7] down, 0.0 elsewhere.
- *
- * @param schedule Light schedule.
- * @param hourOfDay Time in hours [0, 24).
- * @return Intensity in [0, 1].
+ * @param schedule Activation rule; disabled schedules contribute no light.
+ * @param hourOfDay Hours from zero inclusive to 24 exclusive.
  */
 float ComputeLightIntensity(LightSchedule schedule, float hourOfDay);
