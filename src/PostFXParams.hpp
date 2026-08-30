@@ -7,74 +7,36 @@
 #include <glm/glm.hpp>
 
 /**
- * @brief Per-frame parameters threaded into the post-processing pass, plus
- *        pure-math helpers shared between the shader and CPU-side tests.
- * @author Fable 5 (https://github.com/claude)
+ * @brief OpenGL post-processing parameters and CPU equivalents of shader math.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
- *
- * Constructed by Game::Render() each frame from TimeManager and friends, then
- * handed to IRenderer::EndSceneApplyPostFX() which composites the offscreen
- * scene through the bloom + grading + vignette + grain + tonemap chain.
- *
- * The grading model uses the industry-standard ASC CDL split (lift / gamma /
- * gain) instead of a single scalar tint, so shadows, midtones and highlights move
- * independently - required for the per-time-of-day character that a single
- * multiplier can't express.
  */
 
 /**
  * @struct GradingParams
- * @brief Lift / gamma / gain triplet - the ASC CDL model for color grading.
+ * @brief Per-channel lift, gamma and gain for HDR scene colors.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
  *
- * Standard formula: `out = pow(in * gain + lift, 1.0 / gamma)`.
- * - `lift`  shifts shadows (additive, fades toward black)
- * - `gamma` curves midtones (per-channel power)
- * - `gain`  scales highlights (multiplicative)
- *
- * Identity (no grading) is `lift = vec3(0)`, `gamma = vec3(1)`, `gain = vec3(1)`.
- *
- * @par Color space
- * Operates on the scene color as rendered - unencoded linear-ish RGB in an
- * RGB16F target, so channel values are not clamped to [0, 1] and highlights may
- * legitimately arrive above 1.0. Grading runs after the bloom add and before
- * saturation / vignette / grain / tonemap, so it sees HDR input and hands HDR
- * output on; the soft-shoulder tonemap is what finally brings values into range.
+ * Out = pow(max(in * gain + lift, 0), 1 / gamma).
+ * Identity is lift = 0, gamma = 1, gain = 1. The RGB16F scene may exceed 1;
+ * Grading runs after bloom and before saturation, vignette, grain and tonemapping.
  */
 struct GradingParams
 {
-    /**
-     * @brief Additive shadow offset per channel.
-     *
-     * 0 = identity; negative crushes toward black. Not clamped by the type, but
-     * ApplyLGG floors `c * gain + lift` at 0 before the power step.
-     * ComputeGradingParams keeps every channel inside
-     * +/-0.7 * ambience::GRADING_TINT_AMPLITUDE (about +/-0.042 at the default).
-     */
+    /// Additive shadow offset; 0 is identity. ApplyLGG floors the adjusted color at 0.
     glm::vec3 lift{0.0f};
-    /**
-     * @brief Per-channel midtone power, applied as `pow(x, 1/gamma)`.
-     *
-     * 1 = identity; >1 lifts midtones, <1 crushes them. Must stay strictly
-     * positive - a zero channel divides by zero in the exponent.
-     * ComputeGradingParams stays inside roughly [0.96, 1.03] at the default tint
-     * amplitude.
-     */
+    /// Strictly positive midtone exponent denominator; 1 is identity.
     glm::vec3 gamma{1.0f};
-    /**
-     * @brief Multiplicative highlight scale per channel.
-     *
-     * 1 = identity, 0 kills the channel. ComputeGradingParams stays inside
-     * roughly [0.95, 1.08] at the default tint amplitude.
-     */
+    /// Highlight multiplier; 1 is identity, 0 removes the channel.
     glm::vec3 gain{1.0f};
 };
 
 /**
- * @brief Pure-math implementation of the ASC CDL formula. Inlined for tests.
- *
- * `pow` of a negative base is undefined, so the intermediate `c * gain + lift`
- * is clamped to zero before the power step.
+ * @fn glm::vec3 ApplyLGG(const glm::vec3& c, const glm::vec3& lift, const glm::vec3& gamma, \
+ * const glm::vec3& gain)
+ * @brief Floor the adjusted color at 0 before the power step.
+ * @author Alex (<https://github.com/lextpf>)
  */
 inline glm::vec3 ApplyLGG(const glm::vec3& c,
                           const glm::vec3& lift,
@@ -89,12 +51,9 @@ inline glm::vec3 ApplyLGG(const glm::vec3& c,
 }
 
 /**
- * @brief Karis-style soft threshold weight for bloom bright-pass.
- *
- * A soft knee rather than a hard cutoff, so bloom doesn't pop on/off as scene
- * luminance crosses the threshold. Returns 0 below the threshold, ramping
- * smoothly above. Retained as public API even though no shader path currently
- * feeds it - the chroma-bleed pipeline uses KarisBloomChromaWeight instead.
+ * @fn float KarisBloomWeight(float lum, float threshold)
+ * @brief Soft-knee luminance threshold; return 0 below threshold.
+ * @author Alex (<https://github.com/lextpf>)
  */
 inline float KarisBloomWeight(float lum, float threshold)
 {
@@ -103,16 +62,11 @@ inline float KarisBloomWeight(float lum, float threshold)
 }
 
 /**
- * @brief HSV saturation - "how colored is this pixel."
+ * @fn float HsvSaturation(const glm::vec3& c)
+ * @brief HSV saturation with a 1e-4 near-black guard; matches BloomPrefilter.frag.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Returns `(max - min) / max` over the RGB channels, or 0 for all-equal
- * (achromatic) input. Mirrors the GLSL formula in BloomPrefilter.frag so the
- * same math is testable on the CPU side. The 1e-4 epsilon guards against a
- * divide-by-zero on near-black pixels (which read as achromatic anyway).
- *
- * V-relative saturation reads dim colored pixels as fully saturated - a dim
- * red `(0.3, 0, 0)` returns 1.0 the same as bright red `(1, 0, 0)`. That
- * matches the arcade-neon intuition: the eye reads "colored," not "intense."
+ * (max - min) / max gives 1 for both dim red (0.3, 0, 0) and bright red (1, 0, 0).
  */
 inline float HsvSaturation(const glm::vec3& c)
 {
@@ -122,11 +76,9 @@ inline float HsvSaturation(const glm::vec3& c)
 }
 
 /**
- * @brief Karis-style soft saturation weight for the chroma-bloom bright-pass.
- *
- * Returns 0 below the saturation threshold, ramping smoothly above. Same shape
- * as KarisBloomWeight but gated on HSV saturation instead of luma, so only
- * colored pixels enter the bloom mip chain.
+ * @fn float KarisBloomChromaWeight(float sat, float threshold)
+ * @brief Soft-knee HSV saturation threshold; only colored pixels feed bloom.
+ * @author Alex (<https://github.com/lextpf>)
  */
 inline float KarisBloomChromaWeight(float sat, float threshold)
 {
@@ -135,11 +87,10 @@ inline float KarisBloomChromaWeight(float sat, float threshold)
 }
 
 /**
- * @brief Pure-math saturation pump. Mirrors the GLSL `applySaturation()` in
- *        PostFXComposite.frag so the same formula is testable on the CPU side.
- *
- * `s = 1.0` is identity, `s > 1.0` pumps chroma away from luma, `s = 0.0`
- * collapses to grayscale. LUMA weights match the shader.
+ * @fn glm::vec3 ApplySaturation(const glm::vec3& c, float s)
+ * @brief Luma-preserving saturation: 0 is grayscale, 1 is identity; weights match
+ * PostFXComposite.frag.
+ * @author Alex (<https://github.com/lextpf>)
  */
 inline glm::vec3 ApplySaturation(const glm::vec3& c, float s)
 {
@@ -149,35 +100,18 @@ inline glm::vec3 ApplySaturation(const glm::vec3& c, float s)
 }
 
 /**
- * @brief Compute per-time-of-day LGG grading parameters.
+ * @fn GradingParams ComputeGradingParams(float timeOfDay, float nightFactor)
+ * @brief Blend golden-hour warmth and night grading.
+ * @author Alex (<https://github.com/lextpf>)
  *
- * Anchors:
- * - Dawn (~6h):   cool lift / slight gamma lift / warm gain
- * - Midday (12h): identity (no grading)
- * - Dusk (~19h):  purple lift / slight gamma lift / warm-orange gain
- * - Night:        navy lift / slight gamma crush / cool muted gain
- *
- * Per-channel directional weights are dimensionless multipliers of
- * `GRADING_TINT_AMPLITUDE`, drawn from {0, +/-0.1, +/-0.2, +/-0.3, +/-0.4,
- * +/-0.6, +/-0.8, +/-1.0, +1.2}. They encode time-of-day color identity
- * (red strongest at warmth, blue strongest at night) and the channel
- * hierarchy; tuning the per-time-of-day swing magnitude is a single edit
- * to `GRADING_TINT_AMPLITUDE` in AmbienceConfig.hpp.
- *
- * @param timeOfDay    Hour of the day in [0, 24). Only the golden-hour windows
- *                     5-7h and 18-20h produce a warmth ramp; every other hour
- *                     contributes no warmth term.
- * @param nightFactor  Night blend in [0, 1] (0 = full day, 1 = deep night),
- *                     added independently of @p timeOfDay - the caller is
- *                     responsible for keeping the two consistent.
- * @return Lift/gamma/gain for this frame; identity at midday with
- *         @p nightFactor 0.
+ * timeOfDay is in hours from 0 inclusive to 24 exclusive; warmth occurs only at 5-7 and 18-20.
+ * nightFactor ranges from 0 to 1 and is independent; callers must keep it consistent
+ * with timeOfDay. midday with zero nightFactor gives identity grading.
  */
 inline GradingParams ComputeGradingParams(float timeOfDay, float nightFactor)
 {
     constexpr float A = ambience::GRADING_TINT_AMPLITUDE;
 
-    // Warmth ramps at golden hour (dawn 5-7h, dusk 18-20h), zero elsewhere.
     float warmth = 0.0f;
     bool isDusk = false;
     if (timeOfDay >= 5.0f && timeOfDay <= 7.0f)
@@ -232,51 +166,33 @@ inline GradingParams ComputeGradingParams(float timeOfDay, float nightFactor)
 
 /**
  * @struct PostFXParams
- * @brief Per-frame post-processing parameters.
+ * @brief OpenGL composite parameters; Vulkan ignores every field, including postFXEnabled.
+ * @author Alex (<https://github.com/lextpf>)
  * @ingroup Rendering
- *
- * @warning **The entire struct is inert on the Vulkan backend.**
- * `VulkanRenderer::EndSceneApplyPostFX` ignores its parameter outright - Vulkan
- * has no offscreen scene target, so the world has already been drawn straight to
- * the swapchain by the time it is called. Bloom, LGG grading, saturation,
- * vignette, grain, tonemap and the @ref postFXEnabled master gate all silently do
- * nothing there, and there is no log line to say so. Anything that must be
- * visible on both backends has to be applied before the composite (e.g. the
- * per-draw ambient tint), not through these params.
  */
 struct PostFXParams
 {
-    /// Time of day in hours [0, 24], driven by TimeManager.
+    /// Hours from 0 to 24.
     float timeOfDay{12.0f};
 
-    /// Night factor [0, 1]. 0 = full day, 1 = deep night.
+    /// 0 is full day; 1 is deep night.
     float nightFactor{0.0f};
 
     /// Vignette intensity scalar (0 disables vignette this frame).
     float vignetteIntensity{ambience::VIGNETTE_INTENSITY};
 
-    /// Film grain intensity scalar.
     float grainIntensity{ambience::GRAIN_INTENSITY};
 
-    /// Bloom intensity scalar applied during composite.
     float bloomIntensity{ambience::BLOOM_INTENSITY};
 
-    /// Color saturation multiplier. 1.0 = identity, >1 pumps chroma, 0 = grayscale.
+    /// Saturation multiplier: 0 is grayscale, 1 is identity.
     float saturation{ambience::COLOR_SATURATION};
 
-    /// LGG grading parameters (see GradingParams). Default = identity.
     GradingParams gradingParams{};
 
     /// Time accumulator (seconds) - drives the grain noise seed.
     float time{0.0f};
 
-    /**
-     * @brief Master gate.
-     *
-     * When false the post fragment shader early-returns the raw scene texel,
-     * bypassing every post step (CA, blur, bloom, grading, saturation, vignette,
-     * grain, tonemap). Toggled from the dev console via `postfx [on|off|toggle]`
-     * (aliases: `fx`, `pfx`).
-     */
+    /// False returns the raw scene texel without composite effects.
     bool postFXEnabled{true};
 };
