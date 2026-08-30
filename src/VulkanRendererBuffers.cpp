@@ -17,9 +17,6 @@ uint32_t VulkanRenderer::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFla
 
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
     {
-        // typeFilter bit i is set if memory type i is compatible with the
-        // resource; also require the requested property flags
-        // (e.g., HOST_VISIBLE, DEVICE_LOCAL).
         if ((typeFilter & (1 << i)) &&
             (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
         {
@@ -91,9 +88,7 @@ void VulkanRenderer::CopyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDevice
 
 void VulkanRenderer::CreateBuffers()
 {
-    // One vertex buffer per frame in flight - GPU may be reading frame N's
-    // data while CPU writes frame N+1. Size: 4 floats * 6 verts * 10000 quads
-    // ~937 KB (typical frames use ~2000 quads).
+    // One mapped vertex buffer per frame avoids overwriting vertices still used by the GPU.
     const uint32_t maxSprites = 10000;
     m_VertexBufferSize = sizeof(SpriteVertex) * 6 * maxSprites;
 
@@ -114,10 +109,7 @@ void VulkanRenderer::CreateBuffers()
                              &m_VertexBuffersMapped[i]));
     }
 
-    // Matching per-frame storage for the world-space 3D path. A separate buffer
-    // rather than a shared one because Vertex3D has a different stride, and
-    // interleaving two strides in one buffer would defeat vkCmdDraw's firstVertex
-    // addressing.
+    // Separate Vertex3D storage keeps firstVertex indexing consistent with its stride.
     m_Vertex3DBufferSize = sizeof(Vertex3D) * 6 * maxSprites;
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
@@ -131,9 +123,7 @@ void VulkanRenderer::CreateBuffers()
             m_Device, m_Vertex3DMemories[i], 0, m_Vertex3DBufferSize, 0, &m_Vertex3DMapped[i]));
     }
 
-    // Index buffer: allocated and uploaded here, but currently unused - every draw path
-    // is a non-indexed vkCmdDraw over 6 duplicated vertices, and nothing ever calls
-    // vkCmdBindIndexBuffer. Kept as the seam for an indexed quad batch.
+    // Unused index buffer; all draw paths submit non-indexed quads.
     uint32_t indices[] = {0, 1, 2, 3, 4, 5};
     VkDeviceSize indexBufferSize = sizeof(indices);
 
