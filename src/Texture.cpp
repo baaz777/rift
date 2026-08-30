@@ -8,8 +8,7 @@
 #include <limits>
 #include <utility>
 
-// Define STB_IMAGE_IMPLEMENTATION in exactly one .cpp file (this one) to pull
-// in stb_image's implementation without duplicate symbols.
+// stb_image implementation must be defined in exactly one translation unit.
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
@@ -163,7 +162,7 @@ Texture& Texture::operator=(Texture&& other) noexcept
 {
     if (this != &other)
     {
-        // GL context may be gone during shutdown; skip glDeleteTextures then.
+        // Delete only names owned by the current GL context.
         GLFWwindow* currentContext = glfwGetCurrentContext();
         if (m_OpenGLID != 0 && currentContext != nullptr &&
             m_OpenGLContextGeneration == s_CurrentOpenGLContextGeneration)
@@ -208,9 +207,6 @@ Texture& Texture::operator=(Texture&& other) noexcept
 
 Texture::~Texture()
 {
-    // GL textures must be deleted while the context is valid. GLFW may
-    // destroy the context before this destructor runs at shutdown - guard
-    // with glfwGetCurrentContext() to avoid crashes.
     GLFWwindow* currentContext = glfwGetCurrentContext();
     if (m_OpenGLID != 0 && currentContext != nullptr &&
         m_OpenGLContextGeneration == s_CurrentOpenGLContextGeneration)
@@ -221,9 +217,7 @@ Texture::~Texture()
     m_OpenGLContextTag = nullptr;
     m_OpenGLContextGeneration = 0;
 
-    // Vulkan resources should have been explicitly destroyed before this
-    // destructor runs. Reaching here means the renderer's Shutdown() missed
-    // this texture - destroy to avoid leaks and log a warning.
+    // Surviving Vulkan resources require a live device; log missed renderer cleanup.
     if (m_VulkanDevice != VK_NULL_HANDLE && m_VulkanImage != VK_NULL_HANDLE)
     {
         Logger::Warn(LOG_SUBSYSTEM,
@@ -237,9 +231,7 @@ Texture::~Texture()
 
 bool Texture::LoadFromFile(const std::string& path)
 {
-    // stb_image is (0,0)-top-left; OpenGL is (0,0)-bottom-left - flip on load.
-    // Use the thread-local variant to avoid mutating the process-wide flag
-    // (unsafe under concurrent loading or third-party stbi use).
+    // Flip rows for OpenGL with stb_image's thread-local setting.
     stbi_set_flip_vertically_on_load_thread(true);
 
     // Last param 0 = "whatever channels the file has" (returned in m_Channels).
@@ -266,9 +258,7 @@ bool Texture::LoadFromFile(const std::string& path)
     const unsigned char* sourceData = data;
     int sourceChannels = m_Channels;
 
-    // Normalize to RGBA so both backends share one path. VK_FORMAT_R8G8B8_UNORM
-    // isn't universally supported for optimal tiling, so 3-channel textures
-    // must also be expanded.
+    // Expand to RGBA because optimal Vulkan RGB images are not universally supported.
     if (sourceChannels != 4)
     {
         const size_t srcSize = static_cast<size_t>(m_Width) * static_cast<size_t>(m_Height) *
@@ -403,7 +393,7 @@ void Texture::CreateOpenGLTexture(const unsigned char* data, bool flipY) const
         return;
     }
 
-    // Replace existing texture when reloading in the same context generation.
+    // Reuse context generation to distinguish reloads from stale GL names.
     if (m_OpenGLID != 0 && m_OpenGLContextGeneration == s_CurrentOpenGLContextGeneration &&
         m_OpenGLContextTag == reinterpret_cast<void*>(currentContext))
     {
@@ -427,11 +417,11 @@ void Texture::CreateOpenGLTexture(const unsigned char* data, bool flipY) const
 
     glTexImage2D(GL_TEXTURE_2D, 0, format, m_Width, m_Height, 0, format, GL_UNSIGNED_BYTE, data);
 
-    // Clamp to edge so neighboring sprite-sheet tiles don't bleed in.
+    // Clamp sampling at texture borders.
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    // NEAREST for pixel art (no blurring). Use GL_LINEAR for smooth textures.
+    // Nearest for pixel art (no blurring). Use GL_LINEAR for smooth textures.
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
@@ -440,8 +430,7 @@ void Texture::CreateOpenGLTexture(const unsigned char* data, bool flipY) const
 
 namespace
 {
-// Convert sRGB byte channels (0-255) to HSV (each in [0, 1]).
-// Hue is normalized to [0, 1] (multiply by 360 for degrees).
+// Convert byte RGB to hsv; hue 0-1 spans 360 degrees.
 struct Hsv
 {
     float h, s, v;
@@ -468,7 +457,7 @@ Hsv RgbToHsv(unsigned char r8, unsigned char g8, unsigned char b8)
             out.h = ((b - r) / delta) + 2.0f;
         else
             out.h = ((r - g) / delta) + 4.0f;
-        out.h /= 6.0f;  // [0, 1]
+        out.h /= 6.0f;  // 0 to 1
     }
     return out;
 }
@@ -476,9 +465,7 @@ Hsv RgbToHsv(unsigned char r8, unsigned char g8, unsigned char b8)
 
 glm::vec3 Texture::SampleDominantNonSkinColor(glm::vec3 fallback) const
 {
-    // No upper-value cap: saturated colors like #ff8030 or #ffff00 have
-    // value=1.0 (one RGB channel at max). Real highlights are already caught
-    // by the saturation < 0.30 filter (highlights have low sat).
+    // No value ceiling: saturated colors can reach 1. low saturation already rejects highlights.
     constexpr float kMinSat = 0.30f;
     constexpr float kMinValue = 0.25f;
     constexpr float kSkinHueMaxNorm = 30.0f / 360.0f;  // 30 degrees normalized
@@ -494,7 +481,7 @@ glm::vec3 Texture::SampleDominantNonSkinColor(glm::vec3 fallback) const
     if (m_ImageData.size() < expectedBytes)
         return fallback;
 
-    float bestScore = -1.0f;  // saturation * value of best survivor so far
+    float bestScore = -1.0f;  // Saturation * value of best survivor so far
     glm::vec3 bestRgb = fallback;
 
     for (size_t i = 0; i < pixelCount; ++i)
@@ -509,8 +496,7 @@ glm::vec3 Texture::SampleDominantNonSkinColor(glm::vec3 fallback) const
         if (hsv.v < kMinValue)
             continue;
 
-        // Skin-tone band: orange-tan hues at low-mid saturation read as skin.
-        // Saturated reds and oranges (sat > kSkinSatMax) escape the filter.
+        // Keep saturated reds and oranges outside the skin band.
         const bool inSkinHue = (hsv.h >= 0.0f && hsv.h <= kSkinHueMaxNorm);
         const bool inSkinSat = (hsv.s >= kSkinSatMin && hsv.s <= kSkinSatMax);
         if (inSkinHue && inSkinSat)
@@ -540,7 +526,7 @@ void Texture::Unbind() const
 
 void Texture::RecreateOpenGLTexture() const
 {
-    // Called after a GL context switch (e.g., renderer hot-swap). Old IDs are
+    // Called after a GL context switch (e.g., renderer hot-swap). old IDs are
     // invalid in the new context, so the texture is rebuilt from the CPU copy.
     if (m_ImageData.empty())
     {
@@ -558,8 +544,7 @@ void Texture::RecreateOpenGLTexture() const
         return;
     }
 
-    // Only delete if the old ID belongs to the current generation - stale IDs
-    // from the prior context may collide with live IDs in the new one.
+    // Stale GL names can collide with new-context resources; abandon them.
     if (m_OpenGLID != 0 && currentContext != nullptr &&
         m_OpenGLContextGeneration == s_CurrentOpenGLContextGeneration)
     {
@@ -569,7 +554,7 @@ void Texture::RecreateOpenGLTexture() const
     m_OpenGLContextTag = nullptr;
     m_OpenGLContextGeneration = 0;
 
-    // m_ImageData is already in the correct orientation, so flipY=false.
+    // CPU pixels already have the upload orientation.
     CreateOpenGLTexture(m_ImageData.data(), false);
 }
 
@@ -622,10 +607,7 @@ void Texture::CreateVulkanTexture(VkDevice device,
 
     m_VulkanDevice = device;
 
-    // VkImage: 2D, no mipmaps, no array, UNORM (linear) to match OpenGL.
-    // SRGB would apply gamma correction and make textures brighter.
-    // OPTIMAL tiling = GPU-fastest layout (LINEAR would allow CPU access but
-    // is slower for rendering). EXCLUSIVE = single queue family.
+    // Unorm matches OpenGL output without an extra sRGB conversion.
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -708,7 +690,7 @@ void Texture::CreateVulkanTexture(VkDevice device,
         throw std::runtime_error("Failed to create Vulkan image view!");
     }
 
-    // Sampler: NEAREST filter for pixel art (no interpolation); clamp to edge
+    // Sampler: nearest filter for pixel art (no interpolation); clamp to edge
     // prevents border artifacts; no anisotropy; normalized 0..1 UVs.
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -736,11 +718,11 @@ void Texture::CreateVulkanTexture(VkDevice device,
         throw std::runtime_error("Failed to create Vulkan sampler!");
     }
 
-    // Step 5: Upload pixel data using a staging buffer
-    // Device-local memory is not host-writable, so the upload goes:
-    // 1. Create a host-visible staging buffer.
-    // 2. Copy pixel data into the staging buffer.
-    // 3. Issue a GPU command copying the staging buffer into the image.
+    // Step 5: upload pixel data using a staging buffer
+    // device-local memory is not host-writable, so the upload goes:
+    // 1. create a host-visible staging buffer.
+    // 2. copy pixel data into the staging buffer.
+    // 3. issue a GPU command copying the staging buffer into the image.
 
     VkDeviceSize imageSize = static_cast<VkDeviceSize>(imageSizeBytes);
 
@@ -783,8 +765,7 @@ void Texture::CreateVulkanTexture(VkDevice device,
     VkMemoryAllocateInfo stagingAllocInfo{};
     stagingAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     stagingAllocInfo.allocationSize = stagingMemRequirements.size;
-    // HOST_VISIBLE: CPU can map and write to this memory
-    // HOST_COHERENT: writes are immediately visible to GPU (no explicit flush needed)
+    // HOST_COHERENT avoids explicit flushing after mapped writes.
     stagingAllocInfo.memoryTypeIndex =
         FindMemoryType(stagingMemRequirements.memoryTypeBits,
                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -805,18 +786,16 @@ void Texture::CreateVulkanTexture(VkDevice device,
 
     vkBindBufferMemory(device, stagingBuffer, stagingBufferMemory, 0);
 
-    // Map staging buffer memory and copy pixel data
-    // Note: m_ImageData is already flipped for OpenGL. Vulkan uses the same data
-    // and handles the Y-axis difference via UV coordinate flipping in the renderer.
+    // Copy retained GL-oriented rows; Vulkan adjusts UVs.
     void* data;
     vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
     memcpy(data, m_ImageData.data(), imageSize);
     vkUnmapMemory(device, stagingBufferMemory);
 
     // The remaining GPU commands:
-    // 1. Transition the image layout from UNDEFINED to TRANSFER_DST.
-    // 2. Copy data from the staging buffer into the image.
-    // 3. Transition the image layout from TRANSFER_DST to SHADER_READ_ONLY.
+    // 1. transition the image layout from undefined to TRANSFER_DST.
+    // 2. copy data from the staging buffer into the image.
+    // 3. transition the image layout from TRANSFER_DST to SHADER_READ_ONLY.
 
     // Allocate a one-time command buffer for these operations
     VkCommandBufferAllocateInfo cmdAllocInfo{};
@@ -848,8 +827,8 @@ void Texture::CreateVulkanTexture(VkDevice device,
         throw std::runtime_error("Failed to begin command buffer!");
     }
 
-    // Image memory barrier to transition layout from UNDEFINED to TRANSFER_DST
-    // Tells the GPU that this image is about to be written.
+    // Image memory barrier to transition layout from undefined to TRANSFER_DST
+    // tells the GPU that this image is about to be written.
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -865,7 +844,7 @@ void Texture::CreateVulkanTexture(VkDevice device,
     barrier.srcAccessMask = 0;                             // No prior access to wait for
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;  // Transfer write access needed
 
-    // Pipeline barrier ensures layout transition completes before transfer stage
+    // pipeline barrier ensures layout transition completes before transfer stage
     vkCmdPipelineBarrier(commandBuffer,
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -929,8 +908,7 @@ void Texture::CreateVulkanTexture(VkDevice device,
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    // Use a local fence to wait for the transfer to complete instead of
-    // vkQueueWaitIdle, which would stall all work on the queue.
+    // Wait on this transfer's fence without idling unrelated queue work.
     VkFenceCreateInfo uploadFenceInfo{};
     uploadFenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence uploadFence;
@@ -977,7 +955,7 @@ void Texture::DestroyVulkanTexture(VkDevice device) const
     }
 
     // Destroy Vulkan resources in reverse creation order
-    // Sampler first (depends on nothing)
+    // sampler first (depends on nothing)
     if (m_VulkanSampler != VK_NULL_HANDLE)
     {
         vkDestroySampler(destroyDevice, m_VulkanSampler, nullptr);
