@@ -43,8 +43,7 @@ void TimeManager::SetWeatherOverlay(WeatherState state)
 
 void TimeManager::ClearWeatherOverlay()
 {
-    // The blend eases to 0 on subsequent weather-effect updates; retain the
-    // state so the fade-out continues to resolve the correct definition.
+    // Retain overlay state while its blend fades out.
     m_OverlayActive = false;
 }
 
@@ -61,8 +60,7 @@ void TimeManager::UpdateWeatherEffects(float deltaTime)
 
 void TimeManager::Update(float deltaTime)
 {
-    // Overlay fades are real-time cosmetic effects. They must keep advancing
-    // when time.freeze pauses the game clock.
+    // Overlay fades use real time even while the game clock is paused.
     UpdateWeatherEffects(deltaTime);
 
     if (m_Paused)
@@ -119,7 +117,7 @@ float TimeManager::GetSunArc() const
     if (m_CurrentTime < SUNRISE_TIME || m_CurrentTime > SUNSET_TIME)
         return -1.0f;  // Sun below horizon
 
-    // Map sunrise-sunset to 0-1 arc
+    // map sunrise-sunset to 0-1 arc
     float dayLength = SUNSET_TIME - SUNRISE_TIME;
     return (m_CurrentTime - SUNRISE_TIME) / dayLength;
 }
@@ -129,9 +127,6 @@ float TimeManager::GetMoonArc() const
     // Moon visible from MOONRISE_TIME (19:00) to MOONSET_TIME (7:00 next day)
     float t = m_CurrentTime;
 
-    // Moon is up from 19:00 to 7:00 (12 hours). The divisor below is a literal
-    // 12.0, not (24 - MOONRISE_TIME) + MOONSET_TIME, so the documented [0, 1]
-    // range holds only while the two constants stay 12 hours apart.
     if (t >= MOONRISE_TIME)
     {
         // Evening portion: 19:00 to 24:00 (5 hours = 0 to 0.417)
@@ -164,10 +159,7 @@ glm::vec3 TimeManager::ComputeAmbientColor(const WeatherDefinition& def) const
     glm::vec3 dawnColor(0.85f, 0.75f, 0.7f);
     // Morning: warm white (toned below white for daytime exposure headroom)
     glm::vec3 morningColor(0.90f, 0.88f, 0.85f);
-    // Midday: just below white for daytime exposure headroom (slight warm).
-    // Ambient is an unclamped multiply on albedo with no scene tonemap, so a
-    // white midday made noon as bright as the source art allowed; ~7% of
-    // headroom here takes the eye-strain off daytime while staying the peak.
+    // Keep midday ambient below white to preserve exposure headroom before tonemapping.
     glm::vec3 middayColor(0.93f, 0.93f, 0.91f);
     // Afternoon: warm yellow (toned for daytime exposure headroom)
     glm::vec3 afternoonColor(0.90f, 0.85f, 0.78f);
@@ -237,8 +229,7 @@ glm::vec3 TimeManager::ComputeAmbientColor(const WeatherDefinition& def) const
         result = LerpColor(nightColor, lateNightColor, factor);
     }
 
-    // Weather modulates ambient color. Intensity scales the effect:
-    // intensity 0 -> no weather tint; intensity 1 -> full tint.
+    // Weather intensity scales the ambient tint.
     glm::vec3 weatherTint =
         glm::mix(glm::vec3(1.0f), def.ambientTintMultiplier, m_WeatherIntensity);
     return result * weatherTint;
@@ -257,7 +248,7 @@ glm::vec3 TimeManager::NaturalSkyColor() const
     glm::vec3 eveningSky(0.12f, 0.12f, 0.28f);    // Dark blue
     glm::vec3 nightSky(0.04f, 0.04f, 0.12f);      // Near black
 
-    // Smooth transitions
+    // smooth transitions
     if (t >= NIGHT_END && t < DAWN_START)
     {
         float factor = GetTransitionFactor(t, NIGHT_END, DAWN_START);
@@ -305,8 +296,7 @@ glm::vec3 TimeManager::NaturalSkyColor() const
 
 float TimeManager::SkyDayNightFactor() const
 {
-    // Ramped day/night factor for the sky override. A binary day test would step the sky by
-    // 3.3x in a single frame at the 24-second day length, so the factor ramps instead.
+    // Ramp the sky override across dawn/dusk to avoid a binary day/night jump.
     const float ramp = ambience::WEATHER_SKY_DAYNIGHT_RAMP_HOURS;
     float dayness =
         GetTransitionFactor(m_CurrentTime, SUNRISE_TIME - ramp, SUNRISE_TIME + ramp) *
@@ -320,8 +310,7 @@ glm::vec3 TimeManager::ComputeSkyColor(const WeatherDefinition& def) const
     if (def.skyColorOverride.x >= 0.0f)
     {
         glm::vec3 overrideSky = def.skyColorOverride * SkyDayNightFactor();
-        // Blend toward override by intensity so a low-intensity weather (e.g.
-        // light HeavyRain) doesn't fully wash out the natural sky.
+        // Scale the override by weather intensity.
         return glm::mix(NaturalSkyColor(), overrideSky, m_WeatherIntensity);
     }
     return NaturalSkyColor();
@@ -333,9 +322,6 @@ glm::vec3 TimeManager::GetSunColor() const
     if (arc < 0.0f)
         return glm::vec3(0.0f);  // Sun not visible
 
-    // Sun color changes through the day
-    // Sunrise/sunset: orange
-    // Midday: bright white/yellow
     glm::vec3 sunriseColor(1.0f, 0.6f, 0.3f);  // Orange
     glm::vec3 middayColor(1.0f, 0.98f, 0.9f);  // Bright white-yellow
     glm::vec3 sunsetColor(1.0f, 0.5f, 0.2f);   // Deep orange
@@ -361,9 +347,6 @@ glm::vec3 TimeManager::GetSunColor() const
 
 float TimeManager::NaturalStarVisibility() const
 {
-    // Stars fade in during dusk (18:00 - 20:00)
-    // Stars fully visible at night (20:00 - 5:00)
-    // Stars fade out during dawn (5:00 - 7:00)
     float t = m_CurrentTime;
     if (t >= AFTERNOON_END && t < DUSK_END)
     {
@@ -406,8 +389,7 @@ glm::vec3 TimeManager::GetAmbientColor() const
                                   GetWeatherDefinition(m_OverlayWeather).ambientTintMultiplier,
                                   m_OverlayBlend * m_WeatherIntensity);
     }
-    // Pull ground lighting toward the night ambient so it isn't noon-bright
-    // under an imposed-night sky (matches ComputeAmbientColor's nightColor).
+    // Imposed-night stars also darken ground lighting.
     const float night = ImposedNightAmount();
     if (night > 0.0f)
     {
@@ -424,9 +406,7 @@ glm::vec3 TimeManager::GetSkyColor() const
                        ComputeSkyColor(*m_BlendTo),
                        m_BlendT)
             : ComputeSkyColor(GetWeatherDefinition(m_Weather));
-    // A weather that explicitly raises star visibility above the natural hour
-    // (for example MeteorShower) imposes matching darkness on the sky. Aurora
-    // has no star override, so it leaves the time-of-day sky untouched.
+    // Only star visibility above the natural hour imposes night; aurora adds no override.
     const float night = ImposedNightAmount();
     if (night > 0.0f)
     {
@@ -437,11 +417,6 @@ glm::vec3 TimeManager::GetSkyColor() const
 
 float TimeManager::ImposedNightAmount() const
 {
-    // How much darker the active weather config wants the scene than the natural
-    // hour, read straight off the folded star visibility (which already blends
-    // base weather + overlay + any transition). Aurora deliberately follows the
-    // natural value; explicit star events such as MeteorShower may still impose
-    // night during the day.
     return std::clamp(GetStarVisibility() - NaturalStarVisibility(), 0.0f, 1.0f);
 }
 
@@ -475,10 +450,7 @@ void TimeManager::SetWeatherBlend(const WeatherDefinition* from,
     m_BlendTo = to;
     m_BlendT = std::clamp(t, 0.0f, 1.0f);
     m_BlendEffective = effective;
-    // A resolved-from capture belongs to one specific blend publication; any
-    // republish invalidates it (the caller re-applies it afterward if wanted).
-    // Without this, a capture from an old retarget silently corrupts the next
-    // transition's from-endpoint.
+    // Each blend publication invalidates its resolved-from capture.
     m_HasResolvedFrom = false;
 }
 
@@ -519,9 +491,7 @@ float TimeManager::GetCelestialFade() const
     const float base = (m_CelestialFade >= 0.0f)
                            ? m_CelestialFade
                            : (GetEffectiveWeatherDefinition().showCelestialBodies ? 1.0f : 0.0f);
-    // Fade the daytime sun/moon out as a night weather imposes darkness. Zero
-    // imposed night (nothing wants it, or already night) leaves it untouched, so
-    // the real night moon is unaffected.
+    // Imposed night fades daytime celestial bodies; the natural night moon remains visible.
     return base * (1.0f - ImposedNightAmount());
 }
 
