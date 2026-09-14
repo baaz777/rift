@@ -212,7 +212,9 @@ build/
 
 ### Dependency Errors
 
-If CMake reports missing dependencies (GLFW, GLM, GLAD, stb_image, nlohmann/json, ecs), see the [Setup Guide - Troubleshooting](SETUP.md#troubleshooting) section for solutions. All six are hard `FATAL_ERROR` checks; `setup.ps1` provisions them.
+if CMake reports missing dependencies (GLFW, GLM, GLAD, stb_image, nlohmann/json, EnTT), see the
+[setup troubleshooting guide](SETUP.md#troubleshooting). All six are hard `FATAL_ERROR` checks;
+`setup.ps1` provisions them.
 
 ### Vulkan Errors
 
