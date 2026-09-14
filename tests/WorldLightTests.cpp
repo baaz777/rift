@@ -1,5 +1,4 @@
-// Tests for the WorldLight schedule math (ComputeLightIntensity) and the
-// LightSchedule EnumTraits specialization. Renderer-free.
+// light schedules fade continuously across their on and off windows, including wrapped hours.
 
 #include <gtest/gtest.h>
 
@@ -42,7 +41,7 @@ TEST(WorldLightTests, NightOnlyRampsUpAtDusk)
     EXPECT_GT(v21, 0.0f);
     EXPECT_LT(v21, 1.0f);
     EXPECT_FLOAT_EQ(v22, 1.0f);
-    // Smoothstep is monotonic.
+
     EXPECT_LT(v20, v21);
     EXPECT_LT(v21, v22);
 }
@@ -93,7 +92,6 @@ TEST(WorldLightTests, IntensityClampedToRange)
 
 TEST(WorldLightTests, NegativeHoursWrap)
 {
-    // Hour -1.0 should be equivalent to 23.0.
     EXPECT_FLOAT_EQ(ComputeLightIntensity(LightSchedule::NightOnly, -1.0f),
                     ComputeLightIntensity(LightSchedule::NightOnly, 23.0f));
 }
