@@ -1,6 +1,5 @@
-// Tests for the weather and light console commands. Each free function is
-// invoked through CommandContext with hand-built dependency references, so
-// the tests never need a Game instance or renderer.
+// weather handlers receive an explicit CommandContext so missing-service paths can be checked
+// independently.
 
 #include <gtest/gtest.h>
 
@@ -39,8 +38,7 @@ struct ArgPack
     }
 };
 
-// Count scrollback lines that open with "day +", i.e. one per weather.forecast
-// day entry (night-event lines are indented "  night: ..." and don't match).
+// count "day +" entries only; indented night-event lines are separate forecast output.
 int CountDayLines(const ConsoleBuffer& buf)
 {
     int count = 0;
@@ -54,10 +52,6 @@ int CountDayLines(const ConsoleBuffer& buf)
     return count;
 }
 }  // namespace
-
-// ---------------------------------------------------------------------------
-// time.weather
-// ---------------------------------------------------------------------------
 
 TEST(WeatherCommandTests, TimeWeatherSetsState)
 {
@@ -80,7 +74,6 @@ TEST(WeatherCommandTests, TimeWeatherAcceptsCanonicalNamesOnly)
     CommandContext ctx{buf};
     ctx.time = &time;
 
-    // Lowercase form is a breaking change vs the old command, intentionally.
     ArgPack lower({"thunderstorm"});
     EXPECT_FALSE(Cmd_TimeWeather(lower.span(), ctx));
     EXPECT_EQ(time.GetWeather(), WeatherState::Clear);
@@ -140,8 +133,7 @@ TEST(WeatherCommandTests, TimeWeatherFailsWithoutTimeManager)
     EXPECT_FALSE(Cmd_TimeWeather(args.span(), ctx));
 }
 
-// time.weather routes through the WeatherDirector: an explicit duration starts
-// a transition; 0 hard-cuts; a missing director falls back to a bare set.
+// duration starts a blend; zero or a missing director applies the weather immediately.
 TEST(WeatherCommandTests, TimeWeatherRoutesThroughDirector)
 {
     TimeManager time;
@@ -163,16 +155,11 @@ TEST(WeatherCommandTests, TimeWeatherRoutesThroughDirector)
     EXPECT_EQ(time.GetWeather(), WeatherState::Fog);
     EXPECT_FALSE(director.IsTransitioning());
 
-    // No director: bare set (test isolation contract of CommandContext).
     ctx.weatherDirector = nullptr;
     const ArgPack bare({"Clear"});
     EXPECT_TRUE(Cmd_TimeWeather(bare.span(), ctx));
     EXPECT_EQ(time.GetWeather(), WeatherState::Clear);
 }
-
-// ---------------------------------------------------------------------------
-// weather.intensity
-// ---------------------------------------------------------------------------
 
 TEST(WeatherCommandTests, IntensitySetsValue)
 {
@@ -200,7 +187,7 @@ TEST(WeatherCommandTests, IntensityRejectsOutOfRange)
     EXPECT_FALSE(Cmd_WeatherIntensity(ArgPack({"1.1"}).span(), ctx));
     EXPECT_FALSE(Cmd_WeatherIntensity(ArgPack({"abc"}).span(), ctx));
     EXPECT_FALSE(Cmd_WeatherIntensity(ArgPack({}).span(), ctx));
-    // Value should be unchanged after rejected calls.
+
     EXPECT_FLOAT_EQ(time.GetWeatherIntensity(), 0.7f);
 }
 
@@ -218,14 +205,8 @@ TEST(WeatherCommandTests, IntensityAcceptsBoundaries)
     EXPECT_FLOAT_EQ(time.GetWeatherIntensity(), 1.0f);
 }
 
-// ---------------------------------------------------------------------------
-// weather.next
-// ---------------------------------------------------------------------------
-
 TEST(WeatherCommandTests, NextCyclesForward)
 {
-    // After the weather overhaul (Overcast removed), LightRain is now the
-    // second enum value so weather.next from Clear advances to it.
     TimeManager time;
     time.Initialize();
     time.SetWeather(WeatherState::Clear);
@@ -242,9 +223,7 @@ TEST(WeatherCommandTests, NextWrapsFromLastToFirst)
 {
     TimeManager time;
     time.Initialize();
-    // Derive the last weather from the enum (Count - 1) so this wrap test stays
-    // correct when weather states change -- it previously hardcoded EmberStorm,
-    // which stopped being the last state when GodRays was added.
+
     constexpr auto lastWeather = static_cast<WeatherState>(EnumTraits<WeatherState>::Count - 1);
     time.SetWeather(lastWeather);
     ConsoleBuffer buf;
@@ -266,10 +245,6 @@ TEST(WeatherCommandTests, NextRejectsArgs)
     EXPECT_FALSE(Cmd_WeatherNext(ArgPack({"extra"}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// weather.random
-// ---------------------------------------------------------------------------
-
 TEST(WeatherCommandTests, RandomProducesValidState)
 {
     TimeManager time;
@@ -286,10 +261,6 @@ TEST(WeatherCommandTests, RandomProducesValidState)
         EXPECT_LT(idx, EnumTraits<WeatherState>::Count);
     }
 }
-
-// weather.next / weather.random now take an optional [seconds] arg (same
-// parse/validation as time.weather) and route through RouteWeatherRequest so
-// their echo matches time.weather's "(Ns)" vs "(instant)" wording.
 
 TEST(WeatherCommandTests, NextAcceptsOptionalSecondsAndTransitions)
 {
@@ -335,9 +306,7 @@ TEST(WeatherCommandTests, RandomAcceptsOptionalSecondsAsHardCut)
     EXPECT_FALSE(director.IsTransitioning());
 }
 
-// time.weather's echo is three-way honest: "(Ns)" only when THIS call
-// started/retargeted a blend, "(instant)" for hard cuts / disabled or null
-// director, "(no change)" when the director ignored a same-target request.
+// the echo must distinguish a started blend, an immediate change, and an ignored request.
 
 TEST(WeatherCommandTests, TimeWeatherEchoesInstantWithoutDirector)
 {
@@ -370,10 +339,7 @@ TEST(WeatherCommandTests, TimeWeatherEchoesDurationOnlyWhenTransitioning)
     EXPECT_NE(buf.Lines().back().text.find("(instant)"), std::string::npos);
 }
 
-// Re-requesting the state a transition is already heading to is a director
-// no-op (StartWeatherChange's same-target branch): the new duration never
-// takes effect. The echo must say "(no change)" -- not claim the requested
-// seconds -- and the in-flight transition must be untouched.
+// same-target requests preserve the active duration and report "(no change)".
 TEST(WeatherCommandTests, TimeWeatherSameTargetMidFlightEchoesNoChange)
 {
     TimeManager time;
@@ -399,10 +365,6 @@ TEST(WeatherCommandTests, TimeWeatherSameTargetMidFlightEchoesNoChange)
     EXPECT_EQ(after.to, before.to);
     EXPECT_FLOAT_EQ(after.progress, before.progress);
 }
-
-// ---------------------------------------------------------------------------
-// weather.auto
-// ---------------------------------------------------------------------------
 
 TEST(WeatherCommandTests, AutoTogglesDirectorState)
 {
@@ -451,10 +413,6 @@ TEST(WeatherCommandTests, AutoFailsWithoutDirector)
     CommandContext ctx{buf};
     EXPECT_FALSE(Cmd_WeatherAuto(ArgPack({"on"}).span(), ctx));
 }
-
-// ---------------------------------------------------------------------------
-// weather.forecast
-// ---------------------------------------------------------------------------
 
 TEST(WeatherCommandTests, ForecastDefaultsToThreeDays)
 {
@@ -520,10 +478,6 @@ TEST(WeatherCommandTests, ForecastFailsWithoutDirectorOrTime)
     ctxNoTime.weatherDirector = &director;
     EXPECT_FALSE(Cmd_WeatherForecast(ArgPack({}).span(), ctxNoTime));
 }
-
-// ---------------------------------------------------------------------------
-// weather.status
-// ---------------------------------------------------------------------------
 
 TEST(WeatherCommandTests, StatusReportsIdleWeather)
 {
@@ -593,10 +547,6 @@ TEST(WeatherCommandTests, StatusFailsWithoutDirectorOrTime)
     EXPECT_FALSE(Cmd_WeatherStatus(ArgPack({}).span(), ctxNoTime));
 }
 
-// ---------------------------------------------------------------------------
-// weather.wind
-// ---------------------------------------------------------------------------
-
 TEST(WeatherCommandTests, WindReadoutReturnsTrueAndPrints)
 {
     WeatherDirector director;
@@ -617,15 +567,6 @@ TEST(WeatherCommandTests, WindFailsWithoutDirector)
     EXPECT_FALSE(Cmd_WeatherWind(ArgPack({}).span(), ctx));
 }
 
-// ---------------------------------------------------------------------------
-// config.dump: weather line must be name-based/replayable, plus weather.auto
-// ---------------------------------------------------------------------------
-
-// weather.auto toggles the director; weather.forecast prints per-day lines;
-// weather.status reports the transition pair; config.dump emits a replayable
-// name (not the old integer) plus the auto state. Adapted from the brief's
-// RunCommandLine shape to this file's direct Cmd_* + ArgPack pattern (no
-// RunCommandLine helper exists here).
 TEST(WeatherCommandTests, ConfigDumpEmitsReplayableWeatherNameAndAutoState)
 {
     ConsoleBuffer buffer;
@@ -648,7 +589,6 @@ TEST(WeatherCommandTests, ConfigDumpEmitsReplayableWeatherNameAndAutoState)
     EXPECT_TRUE(Cmd_WeatherStatus(ArgPack({}).span(), ctx));
     EXPECT_TRUE(Cmd_WeatherWind(ArgPack({}).span(), ctx));
 
-    // config.dump: the weather line must round-trip through the name parser.
     EXPECT_TRUE(Cmd_ConfigDump(ArgPack({}).span(), ctx));
     bool sawName = false;
     bool sawAuto = false;
@@ -692,10 +632,6 @@ TEST(WeatherCommandTests, ConfigDumpOmitsAutoLineWithoutDirector)
     EXPECT_TRUE(sawName);
     EXPECT_FALSE(sawAuto);
 }
-
-// ---------------------------------------------------------------------------
-// light.add / list / remove / clear
-// ---------------------------------------------------------------------------
 
 TEST(WeatherCommandTests, LightAddAppendsToTilemap)
 {
@@ -781,7 +717,7 @@ TEST(WeatherCommandTests, LightRemoveByIndex)
 
     EXPECT_TRUE(Cmd_LightRemove(ArgPack({"0"}).span(), ctx));
     ASSERT_EQ(map.GetLights().size(), 1u);
-    // Surviving light is the one originally at index 1.
+
     EXPECT_FLOAT_EQ(map.GetLights()[0].position.x, 2.0f);
 }
 
