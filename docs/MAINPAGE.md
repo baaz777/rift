@@ -109,7 +109,7 @@ directory you start it from decides which configuration it picks up.
 | @ref PlayerMovementSystem | Stateless player movement, facing, and stop logic         |
 | @ref NpcAiSystem          | NPC patrol and idle AI over route components              |
 | @ref EntityStore          | Entity spawn, snapshot, reposition, despawn, query        |
-| @ref WorldServices        | Non-owning shared services published into `globals()`     |
+| @ref WorldServices        | non-owning shared services in the registry context        |
 | @ref PatrolRoute          | NPC patrol path generation and traversal                  |
 | @ref DialogueManager      | Branching conversation system                             |
 | @ref GameStateManager     | Game flags, quest state, persistence                      |
