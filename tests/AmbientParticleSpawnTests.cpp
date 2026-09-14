@@ -50,7 +50,7 @@ protected:
 
 TEST_F(AmbientParticleSpawnTest, RespectsTotalCapAtPeakBias)
 {
-    ps.SetTimeOfDay(12.0f);  // Peak leaf and dust bias.
+    ps.SetTimeOfDay(12.0f);  // peak leaf and dust bias.
     for (int i = 0; i < 200; ++i)
     {
         ps.Update(0.5f, cameraPos, viewSize);
@@ -60,7 +60,7 @@ TEST_F(AmbientParticleSpawnTest, RespectsTotalCapAtPeakBias)
 
 TEST_F(AmbientParticleSpawnTest, NoAmbientSpawnAtDeepNight)
 {
-    ps.SetTimeOfDay(2.0f);  // All three biases are zero at this hour.
+    ps.SetTimeOfDay(2.0f);  // all three biases are zero at this hour.
     for (int i = 0; i < 60; ++i)
     {
         ps.Update(0.5f, cameraPos, viewSize);
@@ -70,7 +70,7 @@ TEST_F(AmbientParticleSpawnTest, NoAmbientSpawnAtDeepNight)
 
 TEST_F(AmbientParticleSpawnTest, PollenAbsentAtMidday)
 {
-    // Midday: leaves and dust spawn, but pollen's golden-hour bias is zero.
+    // midday: leaves and dust spawn, but pollen's golden-hour bias is zero.
     ps.SetTimeOfDay(12.0f);
     for (int i = 0; i < 60; ++i)
     {
@@ -82,7 +82,7 @@ TEST_F(AmbientParticleSpawnTest, PollenAbsentAtMidday)
 
 TEST_F(AmbientParticleSpawnTest, PollenSpawnsAtDawnGoldenHour)
 {
-    ps.SetTimeOfDay(6.5f);  // Peak pollen bias at dawn golden hour.
+    ps.SetTimeOfDay(6.5f);  // peak pollen bias at dawn golden hour.
     for (int i = 0; i < 60; ++i)
     {
         ps.Update(0.1f, cameraPos, viewSize);
@@ -92,7 +92,7 @@ TEST_F(AmbientParticleSpawnTest, PollenSpawnsAtDawnGoldenHour)
 
 TEST_F(AmbientParticleSpawnTest, PollenSpawnsAtDuskGoldenHour)
 {
-    ps.SetTimeOfDay(19.0f);  // Peak pollen bias at dusk golden hour.
+    ps.SetTimeOfDay(19.0f);  // peak pollen bias at dusk golden hour.
     for (int i = 0; i < 60; ++i)
     {
         ps.Update(0.1f, cameraPos, viewSize);
@@ -103,26 +103,19 @@ TEST_F(AmbientParticleSpawnTest, PollenSpawnsAtDuskGoldenHour)
 TEST_F(AmbientParticleSpawnTest, AmbientParticlesDieAndRecycle)
 {
     ps.SetTimeOfDay(12.0f);
-    // Saturate, then advance simulated time well past max lifetime (15s leaves).
-    // Pool size should remain bounded across the recycle.
+    // advance past the 15 s leaf lifetime to exercise pool recycling.
     for (int i = 0; i < 200; ++i)
     {
         ps.Update(0.5f, cameraPos, viewSize);
     }
     int count = static_cast<int>(ps.GetParticles().size());
-    // Zones not set, so all particles come through the global ambient cap.
+    // zones not set, so all particles come through the global ambient cap.
     EXPECT_LE(count, ambience::AMBIENT_PARTICLE_TOTAL_CAP);
 }
 
 TEST_F(AmbientParticleSpawnTest, BlizzardSpawnsBothSnowAndFog)
 {
-    // Blizzard layers Fog particles on top of Snow via the secondary
-    // particle slot on WeatherDefinition. Drive several seconds of
-    // simulation at intensity 1.0 and assert both populations exist -
-    // confirms the secondary spawn path is firing alongside the primary
-    // Snow stream. Update() drives both ambient and weather spawning;
-    // ambient is gated by time-of-day (deep-night = none) so we set 2.0
-    // to keep the assertions specifically about weather output.
+    // 02:00 suppresses ambient spawning, so the pool contains only weather particles.
     ps.SetTimeOfDay(2.0f);
     ps.SetWeatherState(&GetWeatherDefinition(WeatherState::Blizzard), 1.0f);
     for (int i = 0; i < 240; ++i)
@@ -133,8 +126,7 @@ TEST_F(AmbientParticleSpawnTest, BlizzardSpawnsBothSnowAndFog)
     EXPECT_GT(CountOfType(ParticleType::Fog), 0);
 }
 
-// --- Editor zone tests: zones placed for ambient types must produce particles
-// independent of the global ambient spawner and time-of-day biasing. ---
+// placed zones spawn independently of the ambient cap and time-of-day bias.
 
 class AmbientParticleZoneTest : public AmbientParticleSpawnTest
 {
@@ -143,7 +135,7 @@ protected:
 
     void PlaceZone(ParticleType type)
     {
-        // Position inside the camera rect so the visibility check passes.
+        // position inside the camera rect so the visibility check passes.
         ParticleZone z(glm::vec2(100.0f, 100.0f), glm::vec2(64.0f, 64.0f), type);
         zones.push_back(z);
         ps.SetZones(&zones);
@@ -152,7 +144,7 @@ protected:
 
 TEST_F(AmbientParticleZoneTest, DriftingLeafZoneSpawnsLeaves)
 {
-    ps.SetTimeOfDay(2.0f);  // Deep night: global ambient gating zero.
+    ps.SetTimeOfDay(2.0f);  // deep night: global ambient gating zero.
     PlaceZone(ParticleType::DriftingLeaf);
     for (int i = 0; i < 60; ++i)
     {
@@ -174,7 +166,7 @@ TEST_F(AmbientParticleZoneTest, DustMoteZoneSpawnsMotes)
 
 TEST_F(AmbientParticleZoneTest, PollenZoneSpawnsOutsideGoldenHour)
 {
-    // Midday: global pollen bias is zero, but a placed zone must still spawn.
+    // midday: global pollen bias is zero, but a placed zone must still spawn.
     ps.SetTimeOfDay(12.0f);
     PlaceZone(ParticleType::Pollen);
     for (int i = 0; i < 60; ++i)
@@ -188,9 +180,8 @@ TEST_F(AmbientParticleZoneTest, ZoneSpawnedParticlesAreInsideZoneBounds)
 {
     ps.SetTimeOfDay(2.0f);
     PlaceZone(ParticleType::DriftingLeaf);
-    // Single update with dt slightly above the spawn interval (1/2.5 = 0.4s)
-    // so exactly one spawn fires. Spawning happens after the per-particle
-    // Update pass, so the just-spawned particle has not yet been moved.
+    // the spawn interval is 1 / 2.5 = 0.4 s. spawning follows the update pass,
+    // so this single spawn has not moved yet.
     ps.Update(0.5f, cameraPos, viewSize);
     ASSERT_GT(CountOfType(ParticleType::DriftingLeaf), 0);
     const auto& z = zones.front();
@@ -207,10 +198,7 @@ TEST_F(AmbientParticleZoneTest, ZoneSpawnedParticlesAreInsideZoneBounds)
     }
 }
 
-// --- Color palette constraints --------------------------------------------
-// DustMote represents floating dust caught in light - it should look
-// neutral. Pollen carries the chromatic ambient palette and must not
-// re-introduce the white/grey range.
+// dust stays neutral; pollen supplies the colored ambient particles.
 
 TEST_F(AmbientParticleZoneTest, DustMoteColorsAreNeutralGreyOnly)
 {
@@ -228,7 +216,7 @@ TEST_F(AmbientParticleZoneTest, DustMoteColorsAreNeutralGreyOnly)
             continue;
         }
         ++sampled;
-        // Pure grey: R == G == B (within float tolerance from accumulated math).
+        // pure grey: R == G == B (within float tolerance from accumulated math).
         EXPECT_NEAR(p.color.r, p.color.g, 1e-4f) << "DustMote has non-neutral RGB: (" << p.color.r
                                                  << ", " << p.color.g << ", " << p.color.b << ")";
         EXPECT_NEAR(p.color.g, p.color.b, 1e-4f) << "DustMote has non-neutral RGB: (" << p.color.r
@@ -253,8 +241,7 @@ TEST_F(AmbientParticleZoneTest, PollenIsNeverWhitish)
             continue;
         }
         ++sampled;
-        // The previous "White (dandelion)" species set R/G/B all >= 0.95 with
-        // tight grouping. Forbid any pollen falling in that envelope.
+        // exclude near-white pollen: all three channels above 0.95 with little separation.
         const bool whitish = p.color.r >= 0.9f && p.color.g >= 0.9f && p.color.b >= 0.9f &&
                              std::abs(p.color.r - p.color.g) <= 0.10f &&
                              std::abs(p.color.g - p.color.b) <= 0.10f;
@@ -266,10 +253,7 @@ TEST_F(AmbientParticleZoneTest, PollenIsNeverWhitish)
 
 TEST(ParticleType, EnumLayoutInvariant)
 {
-    // Original cozy types stay at their stable indices so saved zones in
-    // existing maps deserialize the right kind. Weather-driven types live
-    // strictly after Pollen, and the decorative/magic types added with the
-    // sprite-variant overhaul live strictly after Sand.
+    // particle indices are serialized in saved zones; keep their numeric values stable.
     EXPECT_EQ(static_cast<int>(ParticleType::Pollen), 10);
     EXPECT_EQ(static_cast<int>(ParticleType::CherryBlossom), 11);
     EXPECT_EQ(static_cast<int>(ParticleType::Ash), 12);
@@ -277,7 +261,7 @@ TEST(ParticleType, EnumLayoutInvariant)
     EXPECT_EQ(static_cast<int>(ParticleType::Sand), 14);
     EXPECT_EQ(static_cast<int>(ParticleType::Smoke), 15);
     EXPECT_EQ(static_cast<int>(ParticleType::Ink), 42);
-    // RainSplash / SnowSplash are the dedicated impact sprite types, appended after Ink.
+
     EXPECT_EQ(static_cast<int>(ParticleType::RainSplash), 43);
     EXPECT_EQ(static_cast<int>(ParticleType::SnowSplash), 44);
     EXPECT_EQ(EnumTraits<ParticleType>::Count, 45u);
@@ -285,11 +269,7 @@ TEST(ParticleType, EnumLayoutInvariant)
 
 TEST(ParticleType, AllTypesSpawnAndSurviveUpdate)
 {
-    // Every ParticleType must spawn through the dispatch table and survive a
-    // few Update ticks with finite state - catches a new enumerator whose
-    // behavior specialization produces NaNs or forgets core fields. Runs
-    // without LoadTextures, so it also guards the texture-less spawn path
-    // (variant counts default to 1).
+    // no textures are loaded, so this also checks the fallback variant count of one.
     ParticleSystem ps;
     const glm::vec2 cameraPos{0.0f, 0.0f};
     const glm::vec2 viewSize{640.0f, 480.0f};
@@ -299,8 +279,7 @@ TEST(ParticleType, AllTypesSpawnAndSurviveUpdate)
         const auto type = static_cast<ParticleType>(i);
         ps.SpawnOne(type, glm::vec2(320.0f, 240.0f));
     }
-    // Every type appends at least one particle (some, e.g. Butterfly or
-    // Confetti, may append more).
+    // some types, including Butterfly and Confetti, spawn more than one particle.
     EXPECT_GE(ps.GetParticles().size(), EnumTraits<ParticleType>::Count);
 
     for (int step = 0; step < 5; ++step)
