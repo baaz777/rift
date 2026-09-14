@@ -38,17 +38,9 @@
 #include <signal.h>
 #include <windows.h>
 
-// @author Fable 5 (https://github.com/claude)
-// Everything in this block runs from a context where
-// the C++ runtime may be unsound - SIGABRT can fire mid-destructor, and an
-// SEH access violation can fire with a corrupted heap. Only async-signal-safe
-// operations are allowed here:
-//   * the low-level _open / _write / _close POSIX wrappers
-//   * stack-only buffers (no `new`, no std::string, no streams)
-//   * manual integer-to-string conversion (no printf, no std::format)
-//   * direct termination via _exit(1) (skips C++ destructors and atexit)
-// Adding anything else - even seemingly harmless logging - can deadlock or
-// silently corrupt the crash log being written.
+// Crash output is best effort. The runtime may already be damaged, so avoid Logger,
+// streams and dynamic message buffers. Append with the CRT file functions and format
+// numbers in stack buffers. These calls do not guarantee recovery from a damaged runtime.
 
 // Signal-based crash handler for fatal errors. Appends `sig`, the signal number
 // that triggered the crash, to rift.project.log and then terminates via _exit(1).
@@ -117,10 +109,8 @@ int main()
     // overflows, division by zero, etc.) by logging the exception code
     // to rift.project.log and terminating immediately via _exit(1).
     //
-    // Only async-signal-safe operations are used here: low-level _open/_write/_close
-    // and manual integer-to-string conversion. Heap allocation (std::ofstream,
-    // std::string, std::runtime_error) is unsafe during structured exceptions
-    // because the heap may be corrupted or the stack nearly exhausted.
+    // Keep the exception path independent of Logger and dynamic message formatting.
+    // The direct file append can fail; termination must not depend on successful logging.
     _set_se_translator(
         [](unsigned int code, struct _EXCEPTION_POINTERS* ep)
         {
