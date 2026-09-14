@@ -23,8 +23,7 @@ int CountOfType(const ParticleSystem& ps, ParticleType t)
 }
 }  // namespace
 
-// Base HeavyRain + overlay Aurora must run all three weather particle layers at once:
-// Rain (base) + Aurora + Wisp (overlay) - past the 2-slot-per-weather ceiling.
+// HeavyRain with Aurora overlay must spawn Rain, Aurora, and Wisp together.
 TEST(WeatherOverlayParticles, BaseRainPlusOverlayAuroraRunsThreeLayers)
 {
     ParticleSystem ps;
