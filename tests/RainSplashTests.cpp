@@ -8,11 +8,7 @@
 #include <cmath>
 #include <vector>
 
-// Rain impacts spawn a dedicated RainSplash particle (a life-mapped 4-frame
-// water-splash sprite), replacing the old procedural Sparkles droplet burst.
-// These tests drive ParticleSystem::Update directly - no renderer, no atlas -
-// exercising the same spawn/update path the game uses.
-
+// impact tests drive the real particle update path without loading a renderer or sprite atlas.
 namespace
 {
 int CountOfType(const ParticleSystem& ps, ParticleType type)
@@ -28,16 +24,13 @@ int CountOfType(const ParticleSystem& ps, ParticleType type)
     return count;
 }
 
-// Editor Rain zone positioned inside the default camera rect so the
-// visibility check passes and its drops fall into view.
 void PlaceRainZone(ParticleSystem& ps, std::vector<ParticleZone>& zones)
 {
     zones.emplace_back(glm::vec2(100.0f, 100.0f), glm::vec2(64.0f, 64.0f), ParticleType::Rain);
     ps.SetZones(&zones);
-    ps.SetTimeOfDay(2.0f);  // Deep night: global ambient spawning is gated off.
+    ps.SetTimeOfDay(2.0f);  // deep night: global ambient spawning is gated off.
 }
 
-// Editor Snow zone, same placement, for the snow-impact (SnowSplash) path.
 void PlaceSnowZone(ParticleSystem& ps, std::vector<ParticleZone>& zones)
 {
     zones.emplace_back(glm::vec2(100.0f, 100.0f), glm::vec2(64.0f, 64.0f), ParticleType::Snow);
@@ -49,11 +42,7 @@ constexpr glm::vec2 kCameraPos{0.0f, 0.0f};
 constexpr glm::vec2 kViewSize{640.0f, 480.0f};
 }  // namespace
 
-// Rain drops crossing the ground band must produce RainSplash particles.
-// The ~30% spawn throttle is randomized (RNG seeded from random_device), so
-// we watch across many impacts rather than a single frame: over ~20 simulated
-// seconds of continuous rain the probability of never seeing a live splash is
-// vanishingly small.
+// impact spawning has a ~30% random throttle; observe many impacts over 20 s.
 TEST(RainSplash, EditorRainZoneProducesSplashes)
 {
     ParticleSystem ps;
@@ -72,9 +61,6 @@ TEST(RainSplash, EditorRainZoneProducesSplashes)
     EXPECT_TRUE(sawSplash);
 }
 
-// Regression: rain impacts must no longer emit Sparkles. With only a Rain zone
-// active and ambient spawning gated off, any Sparkles in the pool at any frame
-// would betray the old droplet-burst splash path.
 TEST(RainSplash, RainImpactsNoLongerEmitSparkles)
 {
     ParticleSystem ps;
@@ -90,8 +76,6 @@ TEST(RainSplash, RainImpactsNoLongerEmitSparkles)
     EXPECT_EQ(maxSparkles, 0);
 }
 
-// SpawnOne(RainSplash) (console / hand-placed path) appends exactly one valid,
-// finite, non-additive splash with a positive lifetime.
 TEST(RainSplash, SpawnOneAppendsFiniteSplash)
 {
     ParticleSystem ps;
@@ -105,8 +89,6 @@ TEST(RainSplash, SpawnOneAppendsFiniteSplash)
     EXPECT_FALSE(p.additive);
 }
 
-// A spawned splash keeps a finite, in-range alpha across its short life and is
-// eventually recycled (life-mapped one-shot, not a persistent particle).
 TEST(RainSplash, SplashFadesAndRecycles)
 {
     ParticleSystem ps;
@@ -126,14 +108,10 @@ TEST(RainSplash, SplashFadesAndRecycles)
             }
         }
     }
-    // ~3 simulated seconds >> the 0.30-0.40s splash lifetime, so it is gone.
+    // 3 s exceeds the splash lifetime of 0.30-0.40 s.
     EXPECT_EQ(CountOfType(ps, ParticleType::RainSplash), 0);
 }
 
-// --- Snow impact (SnowSplash): the snow-landing equivalent of RainSplash. -----
-
-// Snow landings produce SnowSplash particles (dedicated snow-impact sprite),
-// replacing the old procedural Sparkles puff.
 TEST(SnowSplash, EditorSnowZoneProducesImpacts)
 {
     ParticleSystem ps;
@@ -152,7 +130,6 @@ TEST(SnowSplash, EditorSnowZoneProducesImpacts)
     EXPECT_TRUE(sawSplash);
 }
 
-// Regression: snow landings must no longer emit Sparkles (the old puff path).
 TEST(SnowSplash, SnowImpactsNoLongerEmitSparkles)
 {
     ParticleSystem ps;
@@ -168,7 +145,6 @@ TEST(SnowSplash, SnowImpactsNoLongerEmitSparkles)
     EXPECT_EQ(maxSparkles, 0);
 }
 
-// SpawnOne(SnowSplash) appends one valid, finite, non-additive impact puff.
 TEST(SnowSplash, SpawnOneAppendsFiniteImpact)
 {
     ParticleSystem ps;
@@ -182,8 +158,7 @@ TEST(SnowSplash, SpawnOneAppendsFiniteImpact)
     EXPECT_FALSE(p.additive);
 }
 
-// Both impact types dim their (white, non-additive) sprite at night so it does
-// not glare against the dark scene - the alpha scales down with night factor.
+// impact sprites dim with night factor so white artwork does not glare.
 TEST(SplashVisibility, ImpactAlphaIsDimmerAtNight)
 {
     auto peakAlpha = [](ParticleType type, float nightFactor)
@@ -211,11 +186,8 @@ TEST(SplashVisibility, ImpactAlphaIsDimmerAtNight)
     }
 }
 
-// Regression: weather splashes are pushed to m_PendingSpawns and merged AFTER
-// the per-frame Update loop, so they render one frame before their first Update.
-// The spawn alpha must therefore already match the (scene-night) Update alpha -
-// otherwise a splash flashes bright for one frame, glaring at night. At deep
-// night no RainSplash should ever exceed the faint steady-state alpha.
+// pending splashes render before their first update. spawn alpha must already
+// include the night factor to prevent a one-frame flash.
 TEST(SplashVisibility, NoBrightSpawnFrameFlashAtNight)
 {
     ParticleSystem ps;
@@ -238,5 +210,5 @@ TEST(SplashVisibility, NoBrightSpawnFrameFlashAtNight)
         }
     }
     EXPECT_GT(maxSplashAlpha, 0.0f);   // splashes did appear
-    EXPECT_LT(maxSplashAlpha, 0.25f);  // ~0.15 steady state; never the old bright ~0.9 spawn flash
+    EXPECT_LT(maxSplashAlpha, 0.25f);  // ~0.15 at steady state
 }
