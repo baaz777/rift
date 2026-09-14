@@ -6,10 +6,7 @@
 
 #include <glm/glm.hpp>
 
-// Weather-blend-aware TimeManager getters: natural (weatherless)
-// channels, the dawn/dusk sky-override ramp, and endpoint-mix blending.
-
-// GetNaturalStarVisibility ignores the weather override entirely.
+// natural light ignores weather overrides; blended getters resolve each endpoint before mixing.
 TEST(TimeManagerBlend, NaturalStarVisibilityIgnoresWeatherOverride)
 {
     TimeManager time;
@@ -22,9 +19,7 @@ TEST(TimeManagerBlend, NaturalStarVisibilityIgnoresWeatherOverride)
     EXPECT_FLOAT_EQ(time.GetStarVisibility(), 0.0f);  // weather-resolved
 }
 
-// The sky-override day/night factor ramps across sunrise/sunset instead of
-// stepping. At one game-hour-per-real-second (24 s days) the old binary
-// IsDay() was a single-frame 3.3x sky jump.
+// sky overrides must ramp across sunrise and sunset to avoid a one-frame brightness jump.
 TEST(TimeManagerBlend, SkyOverrideRampsAcrossSunset)
 {
     TimeManager time;
@@ -32,8 +27,7 @@ TEST(TimeManagerBlend, SkyOverrideRampsAcrossSunset)
     time.SetWeather(WeatherState::Thunderstorm);  // has skyColorOverride
     time.SetWeatherIntensity(1.0f);
 
-    // Sample sky color across sunset (20:00) in 0.1 h steps; consecutive
-    // samples must never jump more than ~35% of the total day->night drop.
+    // at sunset, 0.1 h samples must differ by less than ~35% of the full day-to-night drop.
     time.SetTime(19.4f);
     glm::vec3 prev = time.GetSkyColor();
     time.SetTime(19.4f);
@@ -53,8 +47,6 @@ TEST(TimeManagerBlend, SkyOverrideRampsAcrossSunset)
     }
 }
 
-// Refactor guard: with no blend active, the getters must match the current
-// single-definition behavior for a non-override weather.
 TEST(TimeManagerBlend, IdleGettersUnchangedForClearWeather)
 {
     TimeManager time;
@@ -62,7 +54,6 @@ TEST(TimeManagerBlend, IdleGettersUnchangedForClearWeather)
     time.SetTime(12.0f);
     time.SetWeather(WeatherState::Clear);
 
-    // Clear has no overrides: sky = natural, stars = natural, ambient = base.
     EXPECT_FLOAT_EQ(time.GetStarVisibility(), 0.0f);         // noon
     EXPECT_FLOAT_EQ(time.GetNaturalStarVisibility(), 0.0f);  // same
     glm::vec3 ambient = time.GetAmbientColor();
@@ -71,7 +62,6 @@ TEST(TimeManagerBlend, IdleGettersUnchangedForClearWeather)
     EXPECT_NEAR(ambient.b, 0.91f, 1e-4f);
 }
 
-// With a blend active, each getter equals the manual per-endpoint mix.
 TEST(TimeManagerBlend, BlendedGettersEqualManualEndpointMix)
 {
     TimeManager time;
@@ -82,7 +72,6 @@ TEST(TimeManagerBlend, BlendedGettersEqualManualEndpointMix)
     const WeatherDefinition& clear = GetWeatherDefinition(WeatherState::Clear);
     const WeatherDefinition& storm = GetWeatherDefinition(WeatherState::Thunderstorm);
 
-    // Manual endpoint values (blend not yet active).
     time.SetWeather(WeatherState::Clear);
     glm::vec3 ambientFrom = time.GetAmbientColor();
     float starsFrom = time.GetStarVisibility();
@@ -100,7 +89,6 @@ TEST(TimeManagerBlend, BlendedGettersEqualManualEndpointMix)
     EXPECT_NEAR(time.GetAmbientColor().b, expectAmbient.b, 1e-5f);
     EXPECT_NEAR(time.GetStarVisibility(), starsFrom + (starsTo - starsFrom) * t, 1e-5f);
 
-    // Effective definition is served while the blend is active.
     EXPECT_FLOAT_EQ(time.GetEffectiveWeatherDefinition().baseSpawnRate, effective.baseSpawnRate);
 
     time.ClearWeatherBlend();
@@ -108,7 +96,6 @@ TEST(TimeManagerBlend, BlendedGettersEqualManualEndpointMix)
     EXPECT_FLOAT_EQ(time.GetEffectiveWeatherDefinition().baseSpawnRate, storm.baseSpawnRate);
 }
 
-// A resolved-from capture replaces the from-endpoint exactly (retarget seam).
 TEST(TimeManagerBlend, ResolvedFromOverridesFromEndpoint)
 {
     TimeManager time;
@@ -129,20 +116,17 @@ TEST(TimeManagerBlend, ResolvedFromOverridesFromEndpoint)
     time.SetWeatherBlend(&clear, &fog, 0.0f, &effective);
     time.SetWeatherBlendResolvedFrom(captured);
 
-    // At t=0 the getters must return the captured values verbatim.
     EXPECT_NEAR(time.GetAmbientColor().r, 0.5f, 1e-5f);
     EXPECT_NEAR(time.GetSkyColor().b, 0.3f, 1e-5f);
     EXPECT_NEAR(time.GetStarVisibility(), 0.42f, 1e-5f);
 }
 
-// Fades: derived from the effective def's bools when unset, published values
-// when set, and cleared together with the blend.
+// explicit fades override effective-definition flags until the blend is cleared.
 TEST(TimeManagerBlend, FadesDeriveThenPublishThenClear)
 {
     TimeManager time;
     time.Initialize();
-    // Aurora visibility derives from the weather independently of the natural
-    // clock, while its celestial visibility remains owned by the clock.
+
     time.SetTime(12.0f);
     time.SetWeather(WeatherState::Aurora);
     EXPECT_FLOAT_EQ(time.GetAuroraFade(), 1.0f);  // showAurora = true
