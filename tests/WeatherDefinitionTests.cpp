@@ -1,6 +1,4 @@
-// Tests for the weather definition table and the EnumTraits<WeatherState>
-// specialization. Renderer-free; validates the data layer that drives the
-// weather system.
+// the definition table and EnumTraits must cover the same weather states.
 
 #include <gtest/gtest.h>
 
@@ -11,12 +9,11 @@
 
 TEST(WeatherDefinitionTests, EveryEnumValueResolves)
 {
-    // Walk every enum value and assert the table returns a usable definition.
     for (size_t i = 0; i < EnumTraits<WeatherState>::Count; ++i)
     {
         auto state = static_cast<WeatherState>(i);
         const WeatherDefinition& def = GetWeatherDefinition(state);
-        // Tint must be non-negative.
+
         EXPECT_GE(def.ambientTintMultiplier.r, 0.0f);
         EXPECT_GE(def.ambientTintMultiplier.g, 0.0f);
         EXPECT_GE(def.ambientTintMultiplier.b, 0.0f);
@@ -87,8 +84,6 @@ TEST(WeatherDefinitionTests, MeteorShowerBoostsMeteorRate)
 
 TEST(WeatherDefinitionTests, IntensityZeroProducesNeutralAmbient)
 {
-    // With intensity 0, GetAmbientColor should not be modified by the
-    // weather tint at all (TimeManager mixes from glm::vec3(1) by intensity).
     TimeManager tm;
     tm.Initialize();
     tm.SetTime(12.0f);
@@ -112,7 +107,7 @@ TEST(WeatherDefinitionTests, IntensityOneAppliesFullTint)
     tm.SetWeatherIntensity(1.0f);
 
     glm::vec3 stormColor = tm.GetAmbientColor();
-    // Thunderstorm should darken substantially from the midday baseline.
+
     EXPECT_LT(stormColor.r, 0.7f);
     EXPECT_LT(stormColor.g, 0.7f);
 }
@@ -134,11 +129,9 @@ TEST(WeatherDefinitionTests, SetWeatherIntensityClampsToRange)
 
 TEST(WeatherDefinitionTests, HeavyRainHidesStars)
 {
-    // Equivalent night-time star-suppression test using HeavyRain, since
-    // Overcast was removed in the weather overhaul.
     TimeManager tm;
     tm.Initialize();
-    tm.SetTime(23.0f);  // Deep night
+    tm.SetTime(23.0f);  // deep night
     tm.SetWeather(WeatherState::Clear);
     EXPECT_FLOAT_EQ(tm.GetStarVisibility(), 1.0f);
 
@@ -160,8 +153,7 @@ TEST(WeatherDefinitionTests, BlizzardHasSecondaryFog)
     EXPECT_EQ(def.secondaryParticleType, WeatherParticleType::Fog);
     EXPECT_GT(def.secondaryBaseSpawnRate, 0.0f);
     EXPECT_GT(def.secondaryMaxWeatherParticles, 0);
-    // Blizzard's layered fog should be softer than the base alpha so the
-    // snow remains the dominant visual element.
+    // Blizzard fog stays soft so snow remains the dominant layer.
     EXPECT_LT(def.fogAlphaMultiplier, 1.0f);
 }
 
@@ -172,14 +164,12 @@ TEST(WeatherDefinitionTests, CherryBlossomsHasMistSecondary)
     EXPECT_EQ(def.secondaryParticleType, WeatherParticleType::Fog);
     EXPECT_GT(def.secondaryBaseSpawnRate, 0.0f);
     EXPECT_GT(def.secondaryMaxWeatherParticles, 0);
-    // Mist layer should be soft so the petals stay the dominant visual.
+
     EXPECT_LT(def.fogAlphaMultiplier, 1.0f);
 }
 
 TEST(WeatherDefinitionTests, FogStateSoftensAlpha)
 {
-    // Merged Fog (formerly two separate Fog + Mist weathers) sits at 0.65 -
-    // between the old Fog (0.7) and Mist (0.6).
     EXPECT_NEAR(GetWeatherDefinition(WeatherState::Fog).fogAlphaMultiplier, 0.65f, 0.001f);
 }
 
@@ -208,8 +198,6 @@ TEST(WeatherDefinitionTests, OnlyLayeredWeathersHaveSecondaryParticle)
 
 TEST(WeatherDefinitionTests, NewSecondaryLayersUseDedicatedParticles)
 {
-    // Sprite-variant overhaul layers: each of these weathers gained a
-    // secondary stream built on one of the new particle types.
     const WeatherDefinition& storm = GetWeatherDefinition(WeatherState::Thunderstorm);
     EXPECT_EQ(storm.secondaryParticleType, WeatherParticleType::Zap);
     EXPECT_GT(storm.secondaryBaseSpawnRate, 0.0f);
@@ -230,7 +218,6 @@ TEST(WeatherDefinitionTests, NewSecondaryLayersUseDedicatedParticles)
     EXPECT_GT(embers.secondaryBaseSpawnRate, 0.0f);
     EXPECT_GT(embers.secondaryMaxWeatherParticles, 0);
 
-    // MeteorShower gained a primary Constellation stardust stream.
     const WeatherDefinition& meteors = GetWeatherDefinition(WeatherState::MeteorShower);
     EXPECT_EQ(meteors.particleType, WeatherParticleType::Constellation);
     EXPECT_GT(meteors.baseSpawnRate, 0.0f);
@@ -250,10 +237,7 @@ TEST(WeatherDefinitionTests, GodRaysHasSunshineAndFogSecondary)
 
 TEST(WeatherDefinitionTests, AuroraHasAuroraPrimaryAndWispSecondary)
 {
-    // The primary stream is the dedicated Aurora particle (hand-painted
-    // aurora/aurora2/aurora3 mote variants); a sparse Wisp secondary keeps
-    // some spiraling aurora dust beneath the sky ribbons. Both streams are
-    // deliberately sparse so Aurora can layer over precipitation.
+    // sparse Aurora and Wisp streams leave room for precipitation in the overlay.
     const WeatherDefinition& def = GetWeatherDefinition(WeatherState::Aurora);
     EXPECT_TRUE(def.showAurora);
     EXPECT_EQ(def.particleType, WeatherParticleType::Aurora);
