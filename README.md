@@ -69,7 +69,7 @@ rift/
 |   |-- main.cpp                       # Program entry point; boots and runs Game
 |   |-- Game.*                         # Core loop + state (partials: GameInput/Menus/Dialogue)
 |   |-- GameMode.hpp                   # Title / Playing / Paused top-level mode
-|   |-- WorldServices.hpp              # Non-owning service pointers in the ECS globals
+|   |-- WorldServices.hpp              # non-owning service pointers in the registry context
 |   |-- Version.hpp                    # 4-part version string, parsed by CMake
 |   |-- DoxygenGroups.hpp              # The only file with @addtogroup; elsewhere use @ingroup
 |   |-- IRenderer.*                    # Renderer strategy interface
@@ -366,10 +366,10 @@ graph LR
     end
 
     subgraph Entities["ECS 🧩"]
-        Registry[("ecs::registry m_World 🗃️")]:::entity
+        Registry[("entt::registry m_World 🗃️")]:::entity
         Components["Components 📦<br/>Transform - Motor - Hitbox 📐<br/>Facing - Appearance - Patrol 🎭"]:::entity
         Systems["Stateless systems ⚙️<br/>PlayerSystem - NpcAiSystem 🧍‍♂️<br/>MotionSystem - CollisionSystem 🏃‍♂️"]:::entity
-        Services["WorldServices 🔗<br/>non-owning pointers in globals() 🌐"]:::entity
+        Services["WorldServices 🔗<br/>non-owning pointers in ctx() 🌐"]:::entity
     end
 
     Game --> Rendering
