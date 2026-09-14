@@ -41,7 +41,7 @@ TEST(TimeManagerOverlay, AuroraOverlayUsesNaturalStarsAndShowsAurora)
     TimeManager tm;
     tm.Initialize();
     tm.SetTime(2.0f);                        // night
-    tm.SetTimeScale(0.0f);                   // Keep natural stars at their night value.
+    tm.SetTimeScale(0.0f);                   // keep natural stars at their night value.
     tm.SetWeather(WeatherState::HeavyRain);  // base: starVis override 0, no aurora
     const float baseStar = tm.GetStarVisibility();
     tm.SetWeatherOverlay(WeatherState::Aurora);  // overlay restores natural stars at night
@@ -65,8 +65,7 @@ TEST(TimeManagerOverlay, ClearFadesBackToBase)
     SettleOverlay(tm);
     EXPECT_FALSE(tm.HasWeatherOverlay());
     EXPECT_LT(tm.GetAuroraFade(), 0.01f);
-    // HeavyRain overrides starVisibility to 0 at night; after the overlay
-    // fades back out, the base value should be resolved again.
+    // after overlay decay, HeavyRain must again suppress the stars.
     EXPECT_LT(tm.GetStarVisibility(), 0.05f);
 }
 
@@ -221,7 +220,6 @@ TEST(TimeManagerOverlay, AuroraWeatherFollowsTimeChangesAtFullStrength)
     const glm::vec3 midnightSky = tm.GetSkyColor();
     EXPECT_GT(tm.GetAuroraFade(), 0.5f);
 
-    // Mirrors entering `ts 12` while Aurora is already active.
     tm.SetTime(12.0f);
     const glm::vec3 auroraSky = tm.GetSkyColor();
     EXPECT_GT(auroraSky.r + auroraSky.g + auroraSky.b,
