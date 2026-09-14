@@ -378,7 +378,7 @@ rather than OR-combines, so a caller that wants an NPC frozen for another reason
 `isStopped` after this pass runs:
 
 ```cpp
-world.each<NpcIdle, NpcTag>([&](ecs::entity npc, NpcIdle& idle)
+world.view<NpcIdle, NpcTag>().each([&](entt::entity npc, NpcIdle& idle)
 {
     idle.isStopped = OverlapsPlayerFeetBox(world, npc, playerFeet);
 });
@@ -468,7 +468,7 @@ blocked, so the map edge does not read as an open escape route.
 ### Entity Collision
 
 Character-vs-character collision is brute force over a per-frame snapshot, which is acceptable at
-Rift's entity counts. `EntityStore::BuildNpcCollisionBodies` refills a reused vector each frame, so
+Rift's entity counts. `BuildNpcCollisionBodies` refills a reused vector each frame, so
 the scan allocates nothing:
 
 ```cpp
