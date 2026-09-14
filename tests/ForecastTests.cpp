@@ -6,20 +6,13 @@
 
 #include <set>
 
-// Deterministic day-seeded forecast: front partition integrity,
-// pool membership, night-event gating, and moon-phase weighting.
-
 namespace
 {
-// Pinned seed, adversarially verified: passes the partition bounds, the
-// distribution bounds (clearDays 1733, eventNights 1026, auroraFull 653 >
-// auroraNew 341 over the test horizons), and the truncated-first-run hazard.
-// Do NOT substitute an arbitrary seed - the partition test's first observed
-// run is window-truncated and other seeds can false-fail its lower bound.
+// keep this seed: it covers the distribution bounds and the truncated first
+// front. arbitrary seeds can fail the lower bound for that partial run.
 constexpr uint64_t kSeed = 0x51F7C0DEULL;
 }  // namespace
 
-// Same (seed, day) always yields the same forecast; different seeds diverge.
 TEST(Forecast, Deterministic)
 {
     for (int64_t d = -10; d < 50; ++d)
@@ -30,7 +23,7 @@ TEST(Forecast, Deterministic)
         EXPECT_EQ(a.hasNightEvent, b.hasNightEvent);
         EXPECT_EQ(a.nightEvent, b.nightEvent);
     }
-    // Different seeds produce a different sequence somewhere in 50 days.
+
     bool diverged = false;
     for (int64_t d = 0; d < 50 && !diverged; ++d)
     {
@@ -39,9 +32,7 @@ TEST(Forecast, Deterministic)
     EXPECT_TRUE(diverged);
 }
 
-// Front partition: every day belongs to exactly one front; indices are
-// non-decreasing; consecutive fronts differ by exactly 1; run lengths stay
-// within FRONT_LENGTH_DAYS +/- jitter bounds (2..6 days).
+// each day belongs to one front; front indices advance by one and full runs last 2-6 days.
 TEST(Forecast, FrontPartitionIsTotalAndBounded)
 {
     int64_t prev = ForecastFrontIndex(kSeed, -500);
@@ -71,7 +62,6 @@ TEST(Forecast, FrontPartitionIsTotalAndBounded)
     }
 }
 
-// Weather within one front is constant; day 0's front is Clear.
 TEST(Forecast, FrontWeatherConstantAndBootClear)
 {
     EXPECT_EQ(ForecastForDay(kSeed, 0).front, WeatherState::Clear);
@@ -85,8 +75,7 @@ TEST(Forecast, FrontWeatherConstantAndBootClear)
     }
 }
 
-// Pool membership: fronts draw only from the natural pool; night events only
-// from the three night states. Console-only states never appear.
+// forecasts exclude console-only states; night events use a separate pool.
 TEST(Forecast, PoolMembership)
 {
     const std::set<WeatherState> frontPool = {WeatherState::Clear,
@@ -113,8 +102,7 @@ TEST(Forecast, PoolMembership)
     }
 }
 
-// Clear dominates the pool (heaviest weight) and events respect the night
-// chance roughly (loose statistical bounds over 4000 days).
+// loose bounds over 4000 days check the weighted pool without fixing an exact sequence.
 TEST(Forecast, DistributionSanity)
 {
     int clearDays = 0;
@@ -130,8 +118,7 @@ TEST(Forecast, DistributionSanity)
     EXPECT_LT(eventNights, static_cast<int>(4000 * ambience::WEATHER_EVENT_NIGHT_CHANCE * 1.5f));
 }
 
-// Moon-phase weighting: aurora/meteor favor full-ish moons (phase 4 of 8),
-// fireflies favor new-ish moons (phase 0). Loose ratio over many days.
+// moon phases 4 and 0 favor aurora/meteors and fireflies, respectively.
 TEST(Forecast, MoonPhaseWeighting)
 {
     int auroraFull = 0;
