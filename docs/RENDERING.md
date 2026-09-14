@@ -705,16 +705,25 @@ swapchain, so every field of `params` is ignored and the frame ships without blo
 ## World-Space 3D Path
 
 The `world3d` console toggle switches `Game::Render()` to `RenderFrame3D()`, an in-progress
-world-space orbit camera. It is not the default path and does not replace the flat pipeline; both
-are compiled in and the flat path is untouched while the toggle is off.
+world-space orbit camera. It is not the default path; both are compiled in and the flat path is
+untouched while the toggle is off. Tiles, characters, particles, world light pools and the full
+sky all draw here. What remains flat-pipeline only is the editor's zone overlays and picking,
+dialogue boxes, NPC head text and the debug HUD.
 
 The 3D path does not use the 2D primitives at all. `CameraRig` builds one `projection * view`
 matrix, published through `SetViewProjection()`, and every piece of scene geometry - ground
-tiles, upright billboards, characters, particles, light pools - is submitted through
-`DrawQuad3D()` as four scene-space corners. Unlike every other draw method, `DrawQuad3D` does
-**not** take camera-pre-subtracted coordinates: the matrix does that work. Depth is a real depth
-buffer, selected per quad by `renderModes::DepthMode`, instead of submission order, and
-`Frustum` planes extracted from the same matrix cull off-screen geometry.
+tiles, upright billboards, characters and particles - is submitted through `DrawQuad3D()` as four
+scene-space corners. Unlike every other draw method, `DrawQuad3D` does **not** take
+camera-pre-subtracted coordinates: the matrix does that work. Depth is a real depth buffer,
+selected per quad by `renderModes::DepthMode`, instead of submission order, and `Frustum` planes
+extracted from the same matrix cull off-screen geometry.
+
+"Does not use the 2D primitives at all" is load-bearing, not incidental. `DrawQuad3D` drains the
+pending 2D batches before it records, but no 2D primitive drains the pending 3D batch, and
+`EndSceneApplyPostFX` flushes 2D first and 3D last - so a `DrawColoredRect` issued after a
+`DrawQuad3D`, with no projection switch between them, would render *underneath* the 3D geometry
+submitted before it. That is why the sky's two untextured bands become textured quads here
+instead of staying rects.
 
 `shaders/Geometry3D.vert` / `.frag` back this path; `Geometry.vert` / `.frag` stay in use for the
 flat world and for all screen-space UI, which must never be projected.
@@ -722,6 +731,74 @@ flat world and for all screen-space UI, which must never be projected.
 Tile stance becomes real geometry here: `TileStance::Prop` turns to face the camera,
 `TileStance::Wall` and `TileStance::Structure` stay locked to the grid as upright surfaces (see
 [Upright Tiles](#upright-tiles)).
+
+### Particle Cards
+
+A particle has no altitude - `Particle::position` is a 2D world pixel and "falling" is
+`+velocity.y` - so `world3d` draws each one as the same 2D sprite on a camera-facing card
+rather than as a point in space. All four cards share one orientation,
+`billboard::Orient(yaw, pitch, {1, 1})`, which makes them exactly perpendicular to the view
+ray: the lean equals the pitch (51.34 deg under the DS preset) against 41.07 deg for structure
+billboards, and `leanFollow` must stay 1.0 or the whole image foreshortens by
+`cos(pitch * (1 - k))`.
+
+| Card        | Who                                        | Anchor                        | Depth      | Cull         |
+|-------------|--------------------------------------------|-------------------------------|------------|--------------|
+| Sheet       | weather, ambient and console particles     | the rig's ground focus        | `None`     | the flat rect, rephrased about the focus |
+| Ground prop | zone particles with no net vertical motion | the particle itself           | `None`     | frustum sphere |
+| Zone card   | zone particles that fall or rise           | the focus clamped to the zone | `None`     | frustum sphere |
+| Facade      | no-projection particles on a structure     | the body's foot               | `TestOnly` | never        |
+
+The sheet is a plane of constant camera depth `D = DistanceForVisibleHeight(visible.y, fov)`,
+and the rig frames `visibleWorldSize` exactly at that depth under both projections - so one
+world pixel of offset on the sheet is one flat screen pixel at every yaw and pitch, and rain
+still falls straight down the screen at yaw 180. The facade card is biased 1 px toward the eye
+so a decal clears its own wall (0.984 px at DS) while a nearer building still occludes it.
+
+The per-type choice between ground prop and zone card is one field on that type's
+`kParticleVisuals` row.
+
+### Sky Sheet
+
+`SkyRenderer` builds one `skyDraw::List` per frame and replays it twice: `SubmitFlat` through the
+2D sprite primitives, `Submit3D` as sheet quads. Building once and submitting twice is what keeps
+the two paths from drifting apart, and it is what makes the sky testable without a graphics
+context.
+
+Every sky element rides the same sheet the weather particles use, so the sky renders as an
+unrotated, unforeshortened copy of the flat sky at every yaw and pitch.
+
+| Layer                                                        | Anchor                                        | Depth  | Cull                    |
+|--------------------------------------------------------------|-----------------------------------------------|--------|-------------------------|
+| Washes (dawn gradient and horizon, atmospheric bands, flash)  | viewport fractions, on the sheet               | `None` | sheet rect (never drops one) |
+| Stars, shooting stars, aurora curtains, halos, beams, wisps   | their wrapped world position                   | `None` | sheet rect              |
+| Sun and moon rays                                             | world-anchored in X only; their Y is viewport-relative | `None` | sheet rect      |
+| Light pools                                                   | the lamp's world position at its surface height | `None` | frustum sphere, radius * 1.5 |
+
+The whole transform is one line, and the camera cancels out of it:
+
+$$
+centreWorld = (focus - halfVisible) + pos + size/2
+$$
+
+That is why no element has to declare whether it is world-anchored or viewport-anchored: a star
+subtracts the camera position before it gets here and a dawn wash does not, and both land
+correctly. It is also why the `std::remainder` wrap phantoms the star field and aurora compute
+need no special handling - the formula reconstructs whatever point the flat path chose.
+
+Every sky quad is `Additive` and `SelfLit`. The two untextured atmospheric bands sample a
+generated opaque-white texture here, because the world-space path has no untextured primitive;
+on the flat path they stay colour-only rects.
+
+The procedural sky textures are pre-cut at the flat shader's 0.1 alpha threshold, so both
+fragment paths cut out on the same contour. Without that the flat frame would show an 800 px dawn
+glow as a ~456 px disc while the 3D frame drew it at full width, because `Geometry.frag` discards
+on *texture* alpha below 0.1 and `Geometry3D.frag` on *product* alpha below 1/255.
+
+Submissions are capped at `skyCards::MAX_SKY_QUADS_3D`, which the shipped content never reaches.
+The cap reserves the flash, the bolt, the rays, the dew and the washes, so an overrun thins the
+aurora and star layers at stride and never costs a lightning bolt. The sky is one texture and one
+batch **only while the atlas is bound**; with no atlas each sprite falls back to its own texture.
 
 ## Particle System Mathematics
 
@@ -843,6 +920,15 @@ order inside a group is the spawn order:
 
 Upright-tile particles are never viewport-culled, because they are projected onto the structure
 mesh underneath them. World particles are culled against the view rect with a size-based pad.
+
+`ParticleSystem::Render3D` is the world-space counterpart and is called once per frame from
+`Game::RenderFrame3D`, after the tile and actor passes and before post-FX. It submits pass B1 -
+facade decals, `DepthMode::TestOnly` - and then pass B0 - every other card, `DepthMode::None`.
+Within each pass the same non-additive-first partition applies, and there is no depth sort,
+because the cards in a pass are coplanar. Every quad carries
+`renderModes::LightMode::SelfLit`, so fog, aurora and constellations do not grey out at night.
+Submissions are capped at `ParticleSystem::MAX_PARTICLE_QUADS_3D`: the Vulkan backend's
+per-frame 3D vertex buffer is shared with the tile pass and silently drops the overflow.
 
 ## Renderer Architecture
 
