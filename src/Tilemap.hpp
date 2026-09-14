@@ -482,10 +482,7 @@ public:
     {
         return static_cast<size_t>(m_MapWidth) * static_cast<size_t>(m_MapHeight);
     }
-    inline const Texture& GetTilesetTexture() const
-    {
-        return m_TilesetTexture;
-    }
+    inline const Texture& GetTilesetTexture() const { return m_TilesetTexture; }
     inline int GetTilesPerRow() const { return m_TilesPerRow; }
     /**
      * @fn int GetTilesetDataWidth() const
