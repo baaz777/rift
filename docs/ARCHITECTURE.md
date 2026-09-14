@@ -33,8 +33,8 @@ flowchart LR
 
     subgraph Ecs["ECS World"]
         direction LR
-        Registry["ecs::registry m_World"]:::data
-        Services["WorldServices<br/>(registry globals)"]:::data
+        Registry["entt::registry m_World"]:::data
+        Services["WorldServices<br/>(registry context)"]:::data
         Player["Player entity<br/>PlayerTag components"]:::data
         NPC["NPC entities<br/>NpcTag components"]:::data
     end
@@ -228,7 +228,8 @@ tuning one does not reach the other.
 ### Game (Composition Root)
 
 `Game` owns every subsystem by value, plus the ECS registry itself. Shared services are **not**
-components: `Game` publishes non-owning pointers to five of them into `m_World.globals()` as a
+components: `Game` publishes non-owning pointers to five of them into the `m_World.ctx()` registry
+context as a
 `WorldServices` bundle, which is how a stateless system reaches a texture store or a dialogue tree.
 Every pointer in the bundle is nullable - tests routinely publish a partial bundle - so readers
 null-check rather than assume a wired world.
@@ -243,7 +244,7 @@ graph LR
     Game["Game"]:::owner
 
     Game --> |owns| Tilemap["Tilemap"]:::owned
-    Game --> |owns| Registry["ecs::registry m_World"]:::owned
+    Game --> |owns| Registry["entt::registry m_World"]:::owned
     Game --> |owns| Renderer["unique_ptr&lt;IRenderer&gt;"]:::owned
     Game --> |owns| Textures["TextureStore"]:::owned
     Game --> |owns| Dialogues["DialogueStore"]:::owned
@@ -259,7 +260,7 @@ graph LR
     Game --> |owns| Console["Console"]:::owned
     Game --> |owns| Camera["CameraController"]:::owned
 
-    Registry --> |globals| Services["WorldServices"]:::published
+    Registry --> |context| Services["WorldServices"]:::published
     Textures -.-> |pointer| Services
     Dialogues -.-> |pointer| Services
     Assets -.-> |pointer| Services
@@ -472,7 +473,7 @@ collision snapshot - stores only a feet anchor and a support state.
 | `CollisionSystem`      | Tile and character collision, wall sliding, lane snapping         |
 | `SurfaceSystem`        | Ground/elevation support graph and collision ownership            |
 | `CharacterKinematics`  | Elevation interpolation, animation cadence, support commit        |
-| `EntityStore`          | Spawn, snapshot, despawn, per-frame collision-body assembly       |
+| `EntityStore`          | Spawn, snapshot, despawn, and deterministic NPC queries           |
 | `*Render` helpers      | `PlayerRender`, `NpcRender`, `CharacterRender` draw assembly      |
 
 **Position Convention:**
