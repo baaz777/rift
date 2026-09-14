@@ -22,7 +22,7 @@ graph LR
         GLAD["GLAD"]:::required
         STB["stb_image"]:::required
         JSON["nlohmann/json"]:::required
-        ECS["ecs.hpp"]:::required
+        ENTT["EnTT v4.0.0"]:::required
     end
 
     subgraph RequiredSDK["Required SDK"]
@@ -71,7 +71,7 @@ The project requires C++23 support.
 | GLAD          | OpenGL function loading                                 | Yes (for OpenGL) |
 | stb_image     | Image file loading                                      | Yes              |
 | nlohmann/json | JSON parsing for maps, saves and the project manifest   | Yes              |
-| ecs           | Single-header ECS (lextpf/ecs), included as `<ecs.hpp>` | Yes              |
+| EnTT          | single-header ECS, included as `<entt/entt.hpp>`        | Yes              |
 | FreeType      | Font rendering                                          | Optional         |
 | Vulkan SDK    | Vulkan graphics API                                     | Yes              |
 
@@ -92,7 +92,7 @@ This script will:
 1. Clone GLFW into `external/glfw/` (or `git pull` it when already present)
 2. Clone GLM into `external/glm/` (or `git pull` it when already present)
 3. Download `nlohmann/json.hpp` into `external/nlohmann/`
-4. Download `ecs.hpp` (lextpf/ecs) into `external/ecs/`
+4. download the pinned EnTT v4.0.0 amalgamated header and license into `external/entt/`
 5. Report GLAD and stb_image as already present - both are committed to the repository
 6. Report the status of the Vulkan SDK (required), vcpkg and Doxygen
 
@@ -128,8 +128,14 @@ external/
 |       +-- ...
 |-- nlohmann/
 |   +-- json.hpp
-|-- ecs/
-|   +-- ecs.hpp
+|-- entt/
+|   |-- LICENSE
+|   +-- entt/
+|       +-- entt.hpp
+|-- entt-ext/
+|   +-- entt/
+|       +-- ext/
+|           +-- config.h
 +-- stb/
     +-- stb_image.h
 ```
@@ -162,12 +168,18 @@ mkdir external\nlohmann -Force
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nlohmann/json/develop/single_include/nlohmann/json.hpp" -OutFile "external\nlohmann\json.hpp" -UseBasicParsing
 ```
 
-#### ecs
+#### EnTT
 
 ```powershell
-mkdir external\ecs -Force
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/lextpf/ecs/main/src/ecs.hpp" -OutFile "external\ecs\ecs.hpp" -UseBasicParsing
+mkdir external\entt\entt -Force
+$enttCommit = "85c6bba014049b5de8fad49d25424df2f1f6a8c1"
+$enttBaseUrl = "https://raw.githubusercontent.com/skypjack/entt/$enttCommit"
+Invoke-WebRequest -Uri "$enttBaseUrl/single_include/entt/entt.hpp" -OutFile "external\entt\entt\entt.hpp" -UseBasicParsing
+Invoke-WebRequest -Uri "$enttBaseUrl/LICENSE" -OutFile "external\entt\LICENSE" -UseBasicParsing
 ```
+
+`external/entt-ext/entt/ext/config.h` is committed. It keeps game assertions active in Release
+builds and routes failures through the Rift logger before aborting.
 
 #### GLAD and stb_image
 
@@ -248,10 +260,10 @@ incomplete:
 
 stb_image is committed to the repository. Restore `external/stb/stb_image.h` from the checkout.
 
-### "nlohmann/json not found" or "ecs not found"
+### "nlohmann/json not found" or "EnTT not found"
 
 Both are downloaded by `setup.ps1` and are hard CMake errors when absent. Re-run `.\setup.ps1`, or
-fetch `external/nlohmann/json.hpp` and `external/ecs/ecs.hpp` manually as shown above.
+fetch `external/nlohmann/json.hpp` and `external/entt/entt/entt.hpp` manually as shown above.
 
 ### Vulkan Validation Layers Missing
 
