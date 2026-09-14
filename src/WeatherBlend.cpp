@@ -56,15 +56,13 @@ bool SpawnsType(const WeatherDefinition& def, WeatherParticleType type)
            (def.particleType == type || def.secondaryParticleType == type);
 }
 
-// Blended cap for the destination slot. When both endpoints spawn the type, hold
-// min(a-cap, b-cap) with 0-as-infinite semantics (no mixing); otherwise mix-and-round.
-// For the min case the a-side cap must come from otherEndpointCap (WeatherCapForType),
-// not capA, which can be the wrong slot's cap for a shared type (Blizzard: Snow/Fog).
+// Shared types use the minimum cap, treating zero as unlimited. query the other endpoint by
+// type because matching types can occupy different slots.
 int BlendCap(int capA, int capB, float t, bool bothSpawnType, int otherEndpointCap)
 {
     if (bothSpawnType)
     {
-        // min with 0-as-infinite semantics.
+        // Min with 0-as-infinite semantics.
         if (otherEndpointCap == 0)
         {
             return capB;
@@ -79,8 +77,7 @@ int BlendCap(int capA, int capB, float t, bool bothSpawnType, int otherEndpointC
         std::lround(Mix(static_cast<float>(capA), static_cast<float>(capB), t)));
 }
 
-// Rate for a destination spawn slot: mix when the outgoing endpoint spawns
-// the same type in the same slot, ramp from zero otherwise.
+// Mix rates only for matching slot types; otherwise ramp the incoming rate from zero.
 float BlendSlotRate(
     WeatherParticleType typeA, float rateA, WeatherParticleType typeB, float rateB, float t)
 {
@@ -117,7 +114,7 @@ WeatherDefinition BlendWeatherDefinitions(const WeatherDefinition& a,
         return b;
     }
 
-    WeatherDefinition out = b;  // destination copies: sentinels, bools, type enums
+    WeatherDefinition out = b;  // Destination copies: sentinels, bools, type enums
 
     out.ambientTintMultiplier = Mix(a.ambientTintMultiplier, b.ambientTintMultiplier, t);
     out.particleSizeScale = Mix(a.particleSizeScale, b.particleSizeScale, t);
@@ -156,8 +153,7 @@ WeatherDefinition BlendWeatherDefinitions(const WeatherDefinition& a,
 
 uint64_t SplitMix64(uint64_t x)
 {
-    // Standard SplitMix64 finalizer (Steele/Lea/Flood). Deterministic across
-    // platforms; used for gust phases, front boundaries, and forecast rolls.
+    // SplitMix64 finalizer (steele/lea/flood); deterministic across platforms.
     x += 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
@@ -197,8 +193,7 @@ glm::vec2 GustWindDirection(double clockSeconds, const glm::vec3& phases)
 
 namespace
 {
-// Weighted natural front pool. Clear dominates; harsher weathers are rare.
-// the three night states arrive as events, not fronts.
+// Weight fronts toward clear; the three night states use separate event rolls.
 struct FrontWeight
 {
     WeatherState state;
@@ -216,10 +211,9 @@ constexpr std::array<FrontWeight, 10> kFrontPool = {{
     {WeatherState::Blizzard, 4},
     {WeatherState::Thunderstorm, 3},
 }};
-constexpr int kFrontPoolTotalWeight = 94;  // keep in sync with the table
+constexpr int kFrontPoolTotalWeight = 94;  // Keep in sync with the table
 
-// Boundary of front k: nominal k*L, jittered by {-1, 0, +1} from the hash so
-// front lengths vary 2..6 days without gaps or overlaps (|jitter| <= 1 < L/2).
+// jitter front boundaries by at most one day; spans remain 2-6 days without gaps.
 int64_t FrontBoundary(uint64_t seed, int64_t k)
 {
     const uint64_t h = SplitMix64(seed ^ 0x9E37ULL ^ (static_cast<uint64_t>(k) * 0x9E3779B9ULL));
@@ -236,10 +230,9 @@ float HashUnitFloat(uint64_t h)
 
 int64_t ForecastFrontIndex(uint64_t seed, int64_t dayIndex)
 {
-    // Nominal guess, then local search: boundaries move at most 1 day from
-    // k*L, so the containing front is within one step of the guess.
+    // One-day boundary jitter limits the search to one front from the nominal guess.
     int64_t k = dayIndex / ambience::WEATHER_FRONT_LENGTH_DAYS;
-    // Handle negative days (C++ division truncates toward zero).
+    // Correct truncating integer division for negative days.
     if (dayIndex < 0 && dayIndex % ambience::WEATHER_FRONT_LENGTH_DAYS != 0)
     {
         --k;
@@ -262,7 +255,7 @@ ForecastEntry ForecastForDay(uint64_t seed, int64_t dayIndex)
     const int64_t front = ForecastFrontIndex(seed, dayIndex);
     if (front == ForecastFrontIndex(seed, 0))
     {
-        // Boot front: the world starts Clear, exactly like today.
+        // Boot front: the world starts clear, exactly like today.
         entry.front = WeatherState::Clear;
     }
     else
@@ -281,15 +274,13 @@ ForecastEntry ForecastForDay(uint64_t seed, int64_t dayIndex)
         }
     }
 
-    // Night event roll: independent of the front, per-day, moon-weighted.
+    // Roll night events independently of the front, weighted by moon phase.
     const uint64_t eventRoll =
         SplitMix64(seed ^ 0xE7E47ULL ^ (static_cast<uint64_t>(dayIndex) * 0x85EBCA6BULL));
     if (HashUnitFloat(eventRoll) < ambience::WEATHER_EVENT_NIGHT_CHANCE)
     {
         entry.hasNightEvent = true;
-        // Moon phase 0 = new, 4 = full (TimeManager: dayCount % 8). Aurora
-        // and meteors love bright full-ish nights in this world's fiction
-        // (they are sky spectacles); fireflies love dark new-moon nights.
+        // Bright phases favour aurora/meteors; dark phases favour fireflies.
         const int phase = static_cast<int>(((dayIndex % 8) + 8) % 8);
         const int distFromFull = std::abs(phase - 4);    // 0 (full) .. 4 (new)
         const int auroraW = 2 + (4 - distFromFull) * 2;  // 2..10, peak at full
