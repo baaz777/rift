@@ -6,11 +6,11 @@
 
 #include <glm/gtc/constants.hpp>
 
-// Pure blend math for weather transitions: endpoint identity, per-field
-// blend rules, lightning frequency-space, and the shared-type cap floor.
+// endpoint blends retain sentinel values; interior lightning blends use frequency rather than
+// interval.
 namespace
 {
-// Field-by-field equality (WeatherDefinition is a plain aggregate).
+
 void ExpectDefinitionEq(const WeatherDefinition& x, const WeatherDefinition& y)
 {
     EXPECT_EQ(x.ambientTintMultiplier, y.ambientTintMultiplier);
@@ -33,9 +33,7 @@ void ExpectDefinitionEq(const WeatherDefinition& x, const WeatherDefinition& y)
 }
 }  // namespace
 
-// The identity contract: t <= 0 returns a verbatim, t >= 1 returns b verbatim,
-// for every field including sentinels. Stateful adjustments (fog hold) live in
-// WeatherDirector, NOT here.
+// endpoints return every field verbatim, including sentinels. WeatherDirector handles fog hold.
 TEST(WeatherBlend, EndpointIdentity)
 {
     const WeatherDefinition& fog = GetWeatherDefinition(WeatherState::Fog);
@@ -70,7 +68,6 @@ TEST(WeatherBlend, SpawnsFogTypeDetectsPrimaryAndSecondary)
     EXPECT_FALSE(WeatherSpawnsFogType(GetWeatherDefinition(WeatherState::LightRain)));
 }
 
-// Plain floats mix linearly at interior t.
 TEST(WeatherBlend, PlainFloatsMixLinearly)
 {
     const WeatherDefinition& clear = GetWeatherDefinition(WeatherState::Clear);
@@ -89,8 +86,7 @@ TEST(WeatherBlend, PlainFloatsMixLinearly)
                     0.5f * (clear.particleSizeScale + storm.particleSizeScale));
 }
 
-// Destination-copied fields: sentinels, bools, and particle type enums come
-// from b at any interior t (they are resolved/faded elsewhere).
+// interior blends copy sentinels, booleans, and particle types from the destination.
 TEST(WeatherBlend, DestinationCopiedFields)
 {
     const WeatherDefinition& clear = GetWeatherDefinition(WeatherState::Clear);
@@ -105,8 +101,7 @@ TEST(WeatherBlend, DestinationCopiedFields)
     EXPECT_EQ(mid.secondaryParticleType, storm.secondaryParticleType);
 }
 
-// Lightning blends in frequency space: an interior interval is either 0 (off)
-// or >= the smaller positive endpoint interval. Never a tiny strobing value.
+// blend lightning frequency so a transition cannot produce a near-zero flash interval.
 TEST(WeatherBlend, LightningBlendsInFrequencySpace)
 {
     const WeatherDefinition& clear = GetWeatherDefinition(WeatherState::Clear);         // 0 = off
@@ -122,15 +117,13 @@ TEST(WeatherBlend, LightningBlendsInFrequencySpace)
             EXPECT_GE(interval, 8.0f) << "strobing interval at t=" << t;
         }
     }
-    // Near t=1 the frequency is close to 1/8 and must be on.
+
     EXPECT_GT(BlendWeatherDefinitions(clear, storm, 0.95f).lightningIntervalSeconds, 0.0f);
-    // Near t=0 the frequency is below the cutoff and must be off.
+
     EXPECT_FLOAT_EQ(BlendWeatherDefinitions(clear, storm, 0.01f).lightningIntervalSeconds, 0.0f);
 }
 
-// Spawn slots whose type differs between endpoints ramp the incoming rate
-// from zero instead of mixing across unrelated types (Thunderstorm rain rate
-// must not leak into Blizzard's snow stream).
+// different particle types ramp independently; outgoing rain rate must not enter the snow stream.
 TEST(WeatherBlend, TypeMismatchRampsIncomingRateFromZero)
 {
     const WeatherDefinition& storm =
@@ -141,8 +134,8 @@ TEST(WeatherBlend, TypeMismatchRampsIncomingRateFromZero)
     EXPECT_EQ(mid.particleType, WeatherParticleType::Snow);
     EXPECT_FLOAT_EQ(mid.baseSpawnRate, blizzard.baseSpawnRate * 0.5f);
 
-    // Same-type slots mix normally: Clear(0, type None)->LightRain(Rain 200):
-    // types differ (None vs Rain) so it also ramps -> 100 at t=0.5. Same-type
+    // same-type slots mix normally: Clear(0, type None)->LightRain(Rain 200):
+    // types differ (None vs Rain) so it also ramps -> 100 at t=0.5. same-type
     // case: LightRain -> HeavyRain (both Rain) mixes 200..600.
     const WeatherDefinition& light = GetWeatherDefinition(WeatherState::LightRain);
     const WeatherDefinition& heavy = GetWeatherDefinition(WeatherState::HeavyRain);
@@ -150,11 +143,8 @@ TEST(WeatherBlend, TypeMismatchRampsIncomingRateFromZero)
     EXPECT_FLOAT_EQ(rainMid.baseSpawnRate, 0.5f * (light.baseSpawnRate + heavy.baseSpawnRate));
 }
 
-// Shared-type cap floor: when both endpoints spawn the same type, the blended
-// cap for that slot is min of the endpoint caps (0 = uncapped = infinite).
-// Fog(primary Fog, cap 2500) -> Blizzard(secondary Fog, cap 10000) must keep
-// the fog slot at 2500 for interior t, or the population climbs past the
-// FogOpacityTests 3000 ceiling mid-transition.
+// shared types use the smaller cap across both endpoints; zero means uncapped.
+// Fog (primary, 2500) -> Blizzard (secondary, 10000) must retain the 2500 cap.
 TEST(WeatherBlend, SharedTypeCapFloor)
 {
     const WeatherDefinition& fog = GetWeatherDefinition(WeatherState::Fog);
@@ -169,9 +159,7 @@ TEST(WeatherBlend, SharedTypeCapFloor)
     EXPECT_EQ(mid.secondaryMaxWeatherParticles, 2500);
 }
 
-// Reverse direction of SharedTypeCapFloor: the shared Fog type lives in
-// DIFFERENT slots (Blizzard secondary -> Fog primary), so the floor must come
-// from CapForType on both endpoints, not the destination slot's raw pair.
+// reverse the endpoints so the shared cap must be found in a different slot.
 TEST(WeatherBlend, SharedTypeCapFloorReverseDirection)
 {
     const WeatherDefinition& blizzard = GetWeatherDefinition(WeatherState::Blizzard);
@@ -184,7 +172,6 @@ TEST(WeatherBlend, SharedTypeCapFloorReverseDirection)
     }
 }
 
-// SplitMix64 is deterministic and actually mixes (different inputs diverge).
 TEST(WeatherBlend, SplitMix64Deterministic)
 {
     EXPECT_EQ(SplitMix64(42), SplitMix64(42));
@@ -192,16 +179,12 @@ TEST(WeatherBlend, SplitMix64Deterministic)
     EXPECT_NE(SplitMix64(0), 0u);  // zero input must not fix-point to zero
 }
 
-// Gust strength: correct at the endpoints of its envelope, never negative,
-// continuous in time, and deterministic for a given seed.
 TEST(WeatherBlend, GustStrengthEnvelope)
 {
     const glm::vec3 phases = GustPhases(SplitMix64(7));
 
-    // Zero base -> zero strength regardless of clock.
     EXPECT_FLOAT_EQ(GustWindStrength(0.0f, 3.25, phases), 0.0f);
 
-    // Bounded by base * (1 +/- GUST_AMP) and never negative.
     for (double t = 0.0; t < 30.0; t += 0.05)
     {
         float s = GustWindStrength(0.5f, t, phases);
@@ -210,7 +193,6 @@ TEST(WeatherBlend, GustStrengthEnvelope)
         EXPECT_LE(s, 0.5f * (1.0f + ambience::WEATHER_GUST_AMP) + 1e-4f);
     }
 
-    // Continuity: small dt -> small change (no steps).
     float prev = GustWindStrength(0.5f, 10.0, phases);
     for (double t = 10.0 + 1.0 / 60.0; t < 12.0; t += 1.0 / 60.0)
     {
@@ -219,12 +201,9 @@ TEST(WeatherBlend, GustStrengthEnvelope)
         prev = cur;
     }
 
-    // Determinism.
     EXPECT_FLOAT_EQ(GustWindStrength(0.5f, 4.5, phases), GustWindStrength(0.5f, 4.5, phases));
 }
 
-// Gust direction: normalized, wanders within the configured cone around
-// WEATHER_WIND_BASE_DIR, and is continuous.
 TEST(WeatherBlend, GustDirectionWanderCone)
 {
     const glm::vec3 phases = GustPhases(SplitMix64(7));
@@ -243,7 +222,6 @@ TEST(WeatherBlend, GustDirectionWanderCone)
     }
 }
 
-// Different seeds give different phase offsets (gusts don't sync across days).
 TEST(WeatherBlend, GustPhasesVaryBySeed)
 {
     EXPECT_NE(GustPhases(SplitMix64(1)), GustPhases(SplitMix64(2)));
@@ -254,8 +232,6 @@ TEST(WeatherBlend, GustPhasesVaryBySeed)
     }
 }
 
-// WeatherCapForType finds the cap in whichever slot spawns the type,
-// regardless of slot position, and returns 0 for types not spawned.
 TEST(WeatherBlend, WeatherCapForTypeChecksBothSlots)
 {
     const WeatherDefinition& fog = GetWeatherDefinition(WeatherState::Fog);
