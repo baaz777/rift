@@ -8,11 +8,7 @@
 
 namespace
 {
-// True for the three forecast night-event states (Aurora/MeteorShower/
-// FireflySwarm). Used by reconciliation to detect a release edge (event ->
-// front) so the release also gets the event transition duration, matching
-// the engage edge - both feel like the event's boundary, not a slow front
-// crossfade.
+// Use the event duration for both entering and leaving a forecast night event.
 bool IsNightEventState(WeatherState state)
 {
     return state == WeatherState::Aurora || state == WeatherState::MeteorShower ||
@@ -22,25 +18,20 @@ bool IsNightEventState(WeatherState state)
 
 void WeatherDirector::Update(float deltaTime, TimeManager& time)
 {
-    // Gust envelope: session-constant phases (from the forecast seed),
-    // continuous across transitions and day rollovers (only the base blends;
-    // the phases and clock never reset - see m_GustPhases).
+    // Gust phases and clock persist across transitions and midnight; only base strength blends.
     m_Clock += deltaTime;
     m_WindStrength =
         GustWindStrength(time.GetEffectiveWeatherDefinition().windIntensity, m_Clock, m_GustPhases);
     m_WindDir = GustWindDirection(m_Clock, m_GustPhases);
 
-    // Forecast reconciliation (level-based): compute what the forecast wants
-    // RIGHT now and request it when it differs from the current target. One
-    // rule covers boundary crossings, time.set jumps in both directions, and
-    // event/front precedence (the event wins during its dusk->dawn window).
+    // Reconcile current forecast state so time jumps and ordinary boundary crossings agree.
     if (m_Enabled && m_AutoWeather)
     {
         const int64_t day = time.GetDayCount();
         const int64_t frontIndex = ForecastFrontIndex(m_ForecastSeed, day);
         if (m_ManualHoldSet && frontIndex != m_ManualHoldFront)
         {
-            m_ManualHoldSet = false;  // new front: the world takes over again
+            m_ManualHoldSet = false;  // New front: the world takes over again
         }
         if (!m_ManualHoldSet)
         {
@@ -56,15 +47,13 @@ void WeatherDirector::Update(float deltaTime, TimeManager& time)
             }
             else if (yesterday.hasNightEvent && hour < 5.0f)
             {
-                desired = yesterday.nightEvent;  // overlay spans midnight
+                desired = yesterday.nightEvent;  // Overlay spans midnight
                 eventWindow = true;
             }
             const WeatherState target = m_Active ? m_ToState : time.GetWeather();
             if (desired != target)
             {
-                // Release (event -> front) is also an event edge: without
-                // this, leaving the window would fall through to the slow
-                // front duration while entering used the fast one.
+                // Event release uses the same transition duration as event onset.
                 const bool eventEdge = eventWindow || IsNightEventState(target);
                 StartWeatherChange(time,
                                    desired,
@@ -79,9 +68,6 @@ void WeatherDirector::Update(float deltaTime, TimeManager& time)
         m_Elapsed += deltaTime;
         if (m_Elapsed >= m_Duration)
         {
-            // Transition complete. If a fog hold is engaged, keep publishing
-            // an effective def whose fog multiplier decays over the residual
-            // puff lifetime; otherwise revert to passthrough now.
             m_Active = false;
             if (m_FogHoldActive)
             {
@@ -116,10 +102,8 @@ void WeatherDirector::RequestWeather(TimeManager& time, WeatherState target, flo
 {
     if (m_Enabled)
     {
-        // Arm the manual hold on the front active right now, so
-        // reconciliation does not stomp this request until the front
-        // actually rolls over. A disabled/title hard-set (Enabled false)
-        // must not arm a gameplay hold that would outlive the title world.
+        // Enabled manual requests hold the current front; title-world requests must not retain a
+        // hold.
         m_ManualHoldFront = ForecastFrontIndex(m_ForecastSeed, time.GetDayCount());
         m_ManualHoldSet = true;
     }
@@ -139,22 +123,19 @@ void WeatherDirector::StartWeatherChange(TimeManager& time,
 
     if (!m_Enabled || durationSeconds <= 0.0f)
     {
-        // Hard cut: debug/console-on-title path. Clears any in-flight state.
+        // Hard cut: debug/console-on-title path. clears any in-flight state.
         m_Active = false;
         m_FogHoldActive = false;
         m_FogDecayActive = false;
         m_UseResolvedFrom = false;
-        m_FromState = target;  // no stale from/to pair after a hard cut
+        m_FromState = target;  // No stale from/to pair after a hard cut
         m_ToState = target;
         time.SetWeather(target);
         time.ClearWeatherBlend();
         return;
     }
 
-    // Retarget: continue from the current blended def, and capture the
-    // resolved getter outputs as the exact from-endpoint (sentinel formulas
-    // are not invertible at fractional intensity). Captured before any state
-    // changes; Publish re-applies the capture after every publication.
+    // Capture resolved channels before retargeting; sentinel formulas cannot be inverted reliably.
     if (m_Active)
     {
         m_ResolvedFrom.ambient = time.GetAmbientColor();
@@ -173,17 +154,14 @@ void WeatherDirector::StartWeatherChange(TimeManager& time,
         m_FromDef = GetWeatherDefinition(m_FromState);
         if (m_FogDecayActive)
         {
-            // A fog decay is still publishing a mid-decay multiplier; seed the
-            // new from-endpoint with it so the blend continues from the
-            // on-screen value instead of snapping to the table's.
+            // Retarget from the live fog-decay multiplier to avoid a discontinuity.
             m_FromDef.fogAlphaMultiplier = m_Effective.fogAlphaMultiplier;
         }
         m_FromCelestialFade = m_FromDef.showCelestialBodies ? 1.0f : 0.0f;
         m_FromAuroraFade = m_FromDef.showAurora ? 1.0f : 0.0f;
     }
 
-    // Fog hold: fog -> no-fog keeps the outgoing multiplier so surviving
-    // puffs don't brighten toward the destination's neutral 1.0.
+    // Hold outgoing fog alpha so surviving puffs do not brighten as the weather clears.
     const WeatherDefinition& toDef = GetWeatherDefinition(target);
     m_FogDecayActive = false;
     m_FogHoldActive = WeatherSpawnsFogType(m_FromDef) && !WeatherSpawnsFogType(toDef);
@@ -207,13 +185,10 @@ void WeatherDirector::Reset(TimeManager& time)
     m_FogDecayActive = false;
     m_UseResolvedFrom = false;
     m_Elapsed = 0.0f;
-    m_ManualHoldSet = false;  // world reload: the forecast is free to drive again
+    m_ManualHoldSet = false;  // World reload: the forecast is free to drive again
     time.ClearWeatherBlend();
 
-    // Title pushes wind unconditionally while the director never updates
-    // there - restore the calm defaults so a quit-to-title doesn't freeze
-    // the last gust instant into the backdrop. The clock deliberately
-    // survives (gusts must not re-sync on world loads).
+    // Reset published wind for the title backdrop while retaining the gust clock.
     m_WindDir = glm::normalize(ambience::WEATHER_WIND_BASE_DIR);
     m_WindStrength = 0.5f;
 }
@@ -221,9 +196,7 @@ void WeatherDirector::Reset(TimeManager& time)
 void WeatherDirector::SetForecastSeed(uint64_t seed)
 {
     m_ForecastSeed = seed;
-    // Session-constant gust phases derive from the forecast seed, not the
-    // day count - recompute so a seed change stays consistent with the
-    // freshly-seeded forecast.
+
     m_GustPhases = GustPhases(SplitMix64(m_ForecastSeed));
 }
 
@@ -232,7 +205,7 @@ void WeatherDirector::SetAutoWeather(bool enabled)
     m_AutoWeather = enabled;
     if (enabled)
     {
-        m_ManualHoldSet = false;  // re-enabling autonomy takes over immediately
+        m_ManualHoldSet = false;  // Re-enabling autonomy takes over immediately
     }
 }
 
@@ -298,8 +271,7 @@ void WeatherDirector::Publish(TimeManager& time)
         std::clamp(m_FogDecayElapsed / ambience::WEATHER_FOG_HOLD_DECAY_SECONDS, 0.0f, 1.0f);
     m_Effective = toDef;
     m_Effective.fogAlphaMultiplier = std::lerp(m_FogHoldValue, toDef.fogAlphaMultiplier, decayT);
-    // Getter blending is over (from = null -> passthrough); only the
-    // effective def still differs from the table.
+    // Clear blend endpoints while the effective definition continues fog decay.
     time.SetWeatherBlend(nullptr, nullptr, 1.0f, &m_Effective);
     time.SetWeatherFades(toDef.showCelestialBodies ? 1.0f : 0.0f, toDef.showAurora ? 1.0f : 0.0f);
 }
