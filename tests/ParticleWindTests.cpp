@@ -5,8 +5,7 @@
 
 #include <glm/glm.hpp>
 
-// Phase-2 particle coverage: cap accounting, wind plumbing, dual-stream
-// transition spawning. All headless (no GL context).
+// particle checks cover shared weather caps, wind response, and simultaneous transition streams.
 namespace
 {
 int CountType(const ParticleSystem& ps, ParticleType type)
@@ -23,9 +22,6 @@ int CountType(const ParticleSystem& ps, ParticleType type)
 }
 }  // namespace
 
-// The per-type cap still binds exactly after the count hoist: Fog weather is
-// cap-bound at 2500 at this viewport (same setup as FogOpacityTests) and must
-// neither exceed the cap nor stall below it.
 TEST(ParticleWind, HoistedCapStillBindsExactly)
 {
     ParticleSystem ps;
@@ -42,16 +38,14 @@ TEST(ParticleWind, HoistedCapStillBindsExactly)
         EXPECT_LE(CountType(ps, ParticleType::Fog),
                   GetWeatherDefinition(WeatherState::Fog).maxWeatherParticles);
     }
-    // Cap-bound at steady state: within 5% below the cap (population cycles as
-    // puffs die and respawn), never above.
+    // allow 5% below the cap as particles expire, but never above it.
     EXPECT_GE(CountType(ps, ParticleType::Fog),
               static_cast<int>(GetWeatherDefinition(WeatherState::Fog).maxWeatherParticles * 0.95));
 }
 
 namespace
 {
-// Spawn a burst of weather snow at the given wind and return the velocity
-// ranges of the freshly spawned flakes.
+
 struct VelocityRange
 {
     float minX{1e9f}, maxX{-1e9f}, minY{1e9f}, maxY{-1e9f};
@@ -82,9 +76,8 @@ VelocityRange SpawnSnowBurst(float windStrength, glm::vec2 windDir)
 }
 }  // namespace
 
-// At full strength the boost reproduces today's Blizzard exactly: the Snow
-// type's base spawn velocity (x in +/-6, y in 12..22) scaled by 7.0 / 3.5,
-// with x sign-coherent along the wind instead of random.
+// at full wind, Snow velocity scales base X in +/-6 by 7 and Y in 12-22 by 3.5;
+// X follows the wind sign.
 TEST(ParticleWind, SnowBoostMatchesBlizzardAtFullStrength)
 {
     VelocityRange r = SpawnSnowBurst(1.0f, {-1.0f, 0.0f});
@@ -94,20 +87,16 @@ TEST(ParticleWind, SnowBoostMatchesBlizzardAtFullStrength)
     EXPECT_LE(r.maxY, 22.0f * 3.5f + 1e-3f);
 }
 
-// The old >= 0.7 cliff is gone: strengths just below/above it produce nearly
-// identical velocity ranges (continuous smoothstep, not a 7x step).
 TEST(ParticleWind, SnowBoostHasNoCliff)
 {
     VelocityRange below = SpawnSnowBurst(0.69f, {-1.0f, 0.0f});
     VelocityRange above = SpawnSnowBurst(0.71f, {-1.0f, 0.0f});
-    // At the cliff the old code multiplied by 7x across this boundary. The
-    // smoothstep's slope here allows only a few percent difference.
+
     EXPECT_LT(std::abs(above.minX - below.minX), std::abs(below.minX) * 0.15f);
     EXPECT_LT(std::abs(above.maxY - below.maxY), below.maxY * 0.15f);
 }
 
-// Calm wind leaves the base spawn velocities untouched (multiplier 1.0 below
-// the smoothstep's 0.3 lower edge).
+// wind below 0.3 keeps the spawn-velocity multiplier at one.
 TEST(ParticleWind, SnowCalmWindIsUnboosted)
 {
     VelocityRange r = SpawnSnowBurst(0.2f, {-1.0f, 0.0f});
@@ -116,7 +105,6 @@ TEST(ParticleWind, SnowCalmWindIsUnboosted)
     EXPECT_LE(r.maxY, 22.0f + 1e-3f);
 }
 
-// Wind direction sign drives the horizontal drift: +X wind -> all flakes +X.
 TEST(ParticleWind, SnowFollowsWindSign)
 {
     VelocityRange r = SpawnSnowBurst(1.0f, {1.0f, 0.0f});
@@ -125,17 +113,14 @@ TEST(ParticleWind, SnowFollowsWindSign)
 
 namespace
 {
-// Displacement magnitude of a single zone-spawned particle of the given type
-// after stepping `seconds` at the given wind strength.
+
 float DriftDistanceX(ParticleType type, float windStrength, float seconds)
 {
     ParticleSystem ps;
     ps.SetTimeOfDay(12.0f);
     ps.SetNightFactor(0.0f);
     ps.SetWind({-1.0f, 0.0f}, windStrength);
-    // Exactly ONE particle: the pool mutates order on removal, so tracking
-    // "the first particle of the type" is only identity-stable with a single
-    // live particle in the zone.
+    // track one live particle because pool removal can reorder entries.
     ps.SetMaxParticlesPerZone(1);
 
     const glm::vec2 cameraPos{0.0f, 0.0f};
@@ -144,8 +129,6 @@ float DriftDistanceX(ParticleType type, float windStrength, float seconds)
     zones.emplace_back(cameraPos, viewSize, type);
     ps.SetZones(&zones);
 
-    // Zone spawn rates are a few particles/sec: step until the single
-    // particle appears (bounded) so the helper never returns vacuously flaky.
     float startX = 0.0f;
     bool found = false;
     for (int i = 0; i < 100 && !found; ++i)  // up to 5 s of spawn attempts
@@ -180,8 +163,7 @@ float DriftDistanceX(ParticleType type, float windStrength, float seconds)
 }
 }  // namespace
 
-// Leaf and pollen drift scale with wind strength; the default 0.5 strength
-// reproduces today's numbers (leaf 18 px/s, pollen 8 px/s along the wind).
+// at wind strength 0.5, leaf and pollen drift are 18 and 8 px/s.
 TEST(ParticleWind, LeafAndPollenDriftScaleWithStrength)
 {
     const float leafCalm = DriftDistanceX(ParticleType::DriftingLeaf, 0.5f, 1.0f);
@@ -199,8 +181,7 @@ TEST(ParticleWind, LeafAndPollenDriftScaleWithStrength)
     EXPECT_GT(pollenGust, pollenCalm * 1.25f);
 }
 
-// Sand streak speed scales with strength around the same 0.5 anchor; sand
-// keeps its own +X axis this phase (spawn-edge bias assumes rightward).
+// sand speed scales around strength 0.5; its spawn edge requires positive X drift.
 TEST(ParticleWind, SandSpeedScalesWithStrength)
 {
     ParticleSystem psCalm;
@@ -232,14 +213,12 @@ TEST(ParticleWind, SandSpeedScalesWithStrength)
     const float calm = maxSandVx(psCalm);
     const float gust = maxSandVx(psGust);
     ASSERT_GT(calm, 0.0f) << "test vacuous: no sand spawned";
-    EXPECT_LE(calm, 200.0f + 1e-3f);  // today's spawn range at the 0.5 anchor
+    EXPECT_LE(calm, 200.0f + 1e-3f);  // spawn range at wind strength 0.5
     EXPECT_GT(gust, calm * 1.2f);
     EXPECT_GT(maxSandVx(psGust), 0.0f) << "sand keeps +X axis";
 }
 
-// Mid-transition, BOTH endpoint particle types are present and the mix shifts
-// with the weight: early = mostly outgoing (rain), late = mostly incoming
-// (snow). This is the cross-fade that phase 1 could not do.
+// both endpoint particle types coexist during a weather transition.
 TEST(ParticleWind, TransitionCrossFadesTypes)
 {
     ParticleSystem ps;
@@ -252,7 +231,6 @@ TEST(ParticleWind, TransitionCrossFadesTypes)
     const WeatherDefinition& storm = GetWeatherDefinition(WeatherState::Thunderstorm);
     const WeatherDefinition& blizzard = GetWeatherDefinition(WeatherState::Blizzard);
 
-    // Steady-state rain first.
     ps.SetWeatherState(&storm, 1.0f);
     for (int i = 0; i < 60; ++i)
     {
@@ -260,7 +238,7 @@ TEST(ParticleWind, TransitionCrossFadesTypes)
     }
     ASSERT_GT(CountType(ps, ParticleType::Rain), 0) << "test vacuous: no rain";
 
-    // Early transition (w = 0.15): rain still dominant, snow appearing.
+    // early transition (w = 0.15): rain still dominant, snow appearing.
     ps.SetWeatherState(&blizzard, 1.0f);  // effective def reports destination
     ps.SetWeatherTransition(&storm, &blizzard, 0.15f);
     for (int i = 0; i < 30; ++i)
@@ -272,7 +250,6 @@ TEST(ParticleWind, TransitionCrossFadesTypes)
     EXPECT_GT(rainEarly, 0) << "outgoing stream stopped spawning too early";
     EXPECT_GT(snowEarly, 0) << "incoming stream not spawning";
 
-    // Late transition (w = 0.9): snow dominant.
     ps.SetWeatherTransition(&storm, &blizzard, 0.9f);
     for (int i = 0; i < 60; ++i)
     {
@@ -280,7 +257,6 @@ TEST(ParticleWind, TransitionCrossFadesTypes)
     }
     EXPECT_GT(CountType(ps, ParticleType::Snow), CountType(ps, ParticleType::Rain));
 
-    // Transition ends: back to two streams, snow only (rain decays naturally).
     ps.SetWeatherTransition(nullptr, nullptr, 0.0f);
     for (int i = 0; i < 200; ++i)
     {
@@ -290,10 +266,8 @@ TEST(ParticleWind, TransitionCrossFadesTypes)
     EXPECT_GT(CountType(ps, ParticleType::Snow), 0);
 }
 
-// Per-stream definition: the outgoing stream spawns with ITS OWN size scale,
-// not the destination's. Use an exaggerated synthetic scale so the correct
-// and incorrect size ranges cannot overlap; this keeps the test deterministic
-// even when Aurora's deliberately sparse Wisp rate yields few samples.
+// use disjoint synthetic size ranges to identify each stream's definition
+// reliably even when Wisp spawning yields few samples.
 TEST(ParticleWind, OutgoingStreamUsesOwnSizeScale)
 {
     ParticleSystem psTransition;
@@ -308,9 +282,8 @@ TEST(ParticleWind, OutgoingStreamUsesOwnSizeScale)
     aurora.particleSizeScale = 0.25f;
     aurora.secondaryBaseSpawnRate = 20.0f;
 
-    // Transitioning Aurora -> Clear at small w: outgoing wisps have a
-    // base size in [3,5], so the synthetic outgoing scale caps them at 1.25.
-    // A destination-def bug uses Clear's 1.0 scale and starts at size 3.0.
+    // outgoing Wisp size [3, 5] scales to at most 1.25. using Clear's scale
+    // would produce sizes of at least 3.
     psTransition.SetWeatherState(&clear, 1.0f);
     psTransition.SetWeatherTransition(&aurora, &clear, 0.1f);
     psTransition.Update(1.0f, cameraPos, viewSize);
@@ -327,9 +300,7 @@ TEST(ParticleWind, OutgoingStreamUsesOwnSizeScale)
         << "outgoing stream used the wrong def's size scale";
 }
 
-// Shared-type cap floor under dual streams: Fog -> Blizzard mid-transition
-// must keep the SHARED fog population at the smaller endpoint's cap (2500) -
-// the incoming stream's own 10000 cap must not add headroom.
+// Fog -> Blizzard shares the smaller Fog cap of 2500 across both streams.
 TEST(ParticleWind, DualStreamSharedTypeCapFloors)
 {
     ParticleSystem ps;
@@ -360,8 +331,7 @@ TEST(ParticleWind, DualStreamSharedTypeCapFloors)
 
 namespace
 {
-// Live weather particles of `type` whose position lies in the bottom half of
-// the viewport anchored at `cameraPos`.
+
 int CountTypeInBottomHalf(const ParticleSystem& ps,
                           ParticleType type,
                           glm::vec2 cameraPos,
@@ -381,10 +351,7 @@ int CountTypeInBottomHalf(const ParticleSystem& ps,
 }
 }  // namespace
 
-// A camera sprinting downward must not outrun falling weather: the bottom
-// half of the moving viewport stays populated and the splash band tracks the
-// camera instead of freezing at the spawn-time position (maintainer-reported
-// bug: Blizzard snow landed mid-screen under S+Shift).
+// weather must fill newly exposed viewport space and move its impact band with the camera.
 TEST(ParticleWind, FallingWeatherSurvivesDownwardCameraSprint)
 {
     ParticleSystem ps;
@@ -396,7 +363,6 @@ TEST(ParticleWind, FallingWeatherSurvivesDownwardCameraSprint)
     const glm::vec2 viewSize{640.0f, 480.0f};
     ps.SetWeatherState(&GetWeatherDefinition(WeatherState::Blizzard), 1.0f);
 
-    // Steady state at rest.
     for (int i = 0; i < 100; ++i)
     {
         ps.Update(0.05f, cameraPos, viewSize);
@@ -404,19 +370,17 @@ TEST(ParticleWind, FallingWeatherSurvivesDownwardCameraSprint)
     ASSERT_GT(CountTypeInBottomHalf(ps, ParticleType::Snow, cameraPos, viewSize), 0)
         << "test vacuous: no snow at rest";
 
-    // Sprint downward at 150 px/s (faster than boosted snowfall) for 5 s.
+    // sprint downward at 150 px/s (faster than boosted snowfall) for 5 s.
     for (int i = 0; i < 100; ++i)
     {
         cameraPos.y += 150.0f * 0.05f;
         ps.Update(0.05f, cameraPos, viewSize);
     }
 
-    // Coverage: the revealed bottom half is populated.
     EXPECT_GT(CountTypeInBottomHalf(ps, ParticleType::Snow, cameraPos, viewSize), 20)
         << "bottom half starved: weather outrun by the camera";
 
-    // Band tracking: no live flake's ground line lags above the current band
-    // floor (the stale-band bug put them mid-screen).
+    // each ground line must remain inside the moving impact band.
     const float bandFloor = cameraPos.y + viewSize.y * 0.10f - 1.0f;
     for (const auto& p : ps.GetParticles())
     {
@@ -428,7 +392,6 @@ TEST(ParticleWind, FallingWeatherSurvivesDownwardCameraSprint)
     }
 }
 
-// Same guarantee for rain (Thunderstorm), the other bakedGroundY weather.
 TEST(ParticleWind, RainSurvivesDownwardCameraSprint)
 {
     ParticleSystem ps;
@@ -455,9 +418,7 @@ TEST(ParticleWind, RainSurvivesDownwardCameraSprint)
     EXPECT_GT(CountTypeInBottomHalf(ps, ParticleType::Rain, cameraPos, viewSize), 20)
         << "bottom half starved: rain outrun by the camera";
 
-    // Band tracking for rain's own branch (coverage alone is masked by
-    // rain's short lifetimes): no live drop's ground line lags above the
-    // current band floor.
+    // check rain's ground line directly; its short lifetime can hide a stale band in count checks.
     const float bandFloor = cameraPos.y + viewSize.y * 0.10f - 1.0f;
     for (const auto& p : ps.GetParticles())
     {
@@ -469,9 +430,7 @@ TEST(ParticleWind, RainSurvivesDownwardCameraSprint)
     }
 }
 
-// Static camera keeps today's behavior: flakes die AT the band (never fall
-// far past it), so ground impacts still fire and nothing accumulates below
-// the viewport.
+// with a static camera, flakes stop at the impact band and cannot accumulate below it.
 TEST(ParticleWind, StaticCameraGroundImpactsStillFire)
 {
     ParticleSystem ps;
@@ -487,15 +446,8 @@ TEST(ParticleWind, StaticCameraGroundImpactsStillFire)
     {
         ps.Update(0.05f, cameraPos, viewSize);
     }
-    // UpdateWeatherSpawning runs AFTER the per-particle band-check loop
-    // within Update(), so particles pre-warmed on the very last iteration
-    // have not yet had their own bakedGroundY check dispatched - in real
-    // gameplay that happens on the very next real frame (sub-frame,
-    // invisible); here it needs one more zero-dt call to settle before
-    // asserting, so this measures steady state rather than a
-    // between-iterations artifact. Zero deltaTime advances no positions and
-    // spawns nothing new (spawnTimer needs a full interval to fire), so it
-    // only dispatches the pending check on particles already present.
+    // spawning follows the per-particle band check. one zero-dt update checks the
+    // last pre-warmed particles without moving them or spawning another interval.
     ps.Update(0.0f, cameraPos, viewSize);
     int belowBand = 0;
     for (const auto& p : ps.GetParticles())
@@ -509,8 +461,7 @@ TEST(ParticleWind, StaticCameraGroundImpactsStillFire)
     EXPECT_EQ(belowBand, 0) << "snow fell through the ground band";
 }
 
-// Ash pre-ages like the other streaming types: the fall column populates
-// immediately at spawn, not one entry-strip at a time.
+// pre-aging must populate the fall column immediately.
 TEST(ParticleWind, AshPreAgesAcrossTheColumn)
 {
     ParticleSystem ps;
@@ -523,8 +474,7 @@ TEST(ParticleWind, AshPreAgesAcrossTheColumn)
     ps.SetWeatherState(&GetWeatherDefinition(WeatherState::AshFall), 1.0f);
     ps.Update(1.0f, cameraPos, viewSize);  // one burst of spawns
 
-    // The spawn strip is the top ~10% of the overspray rect; pre-aged ash
-    // must already appear well below it.
+    // the spawn strip occupies the top ~10% of the overspray rectangle; check below it.
     int belowStrip = 0;
     for (const auto& p : ps.GetParticles())
     {
