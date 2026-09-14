@@ -8,11 +8,10 @@
 
 #include <glm/glm.hpp>
 
-// Transition lifecycle, retarget continuity, fog hold/decay, reset,
-// and the disabled-degrade path. All headless.
+// retargeting must preserve published weather values, including during residual fog decay.
 namespace
 {
-// Step the director in fixed frames.
+
 void StepFrames(WeatherDirector& d, TimeManager& t, int frames, float dt = 1.0f / 60.0f)
 {
     for (int i = 0; i < frames; ++i)
@@ -22,8 +21,7 @@ void StepFrames(WeatherDirector& d, TimeManager& t, int frames, float dt = 1.0f 
 }
 }  // namespace
 
-// GetWeather reports the DESTINATION from the first transition frame, and
-// SetWeather is effectively called exactly once, at transition start.
+// GetWeather exposes the destination from the first transition frame.
 TEST(WeatherDirector, LifecycleReportsDestinationFromStart)
 {
     TimeManager time;
@@ -42,7 +40,6 @@ TEST(WeatherDirector, LifecycleReportsDestinationFromStart)
     EXPECT_EQ(time.GetWeather(), WeatherState::Thunderstorm);
 }
 
-// Duration <= 0 is a hard cut: no blend, immediate.
 TEST(WeatherDirector, ZeroDurationHardCuts)
 {
     TimeManager time;
@@ -56,7 +53,6 @@ TEST(WeatherDirector, ZeroDurationHardCuts)
     EXPECT_FALSE(time.HasWeatherBlend());
 }
 
-// Disabled director degrades to a hard set (title-screen console path).
 TEST(WeatherDirector, DisabledDegradesToHardSet)
 {
     TimeManager time;
@@ -69,7 +65,6 @@ TEST(WeatherDirector, DisabledDegradesToHardSet)
     EXPECT_FALSE(time.HasWeatherBlend());
 }
 
-// Same-target request while transitioning is a no-op (no restart).
 TEST(WeatherDirector, SameTargetRequestIsNoOp)
 {
     TimeManager time;
@@ -84,8 +79,6 @@ TEST(WeatherDirector, SameTargetRequestIsNoOp)
     EXPECT_FLOAT_EQ(director.GetTransition().progress, progressBefore);
 }
 
-// Retarget continuity: the resolved getter outputs are identical immediately
-// before and after a mid-transition retarget, at fractional intensity.
 TEST(WeatherDirector, RetargetIsContinuousAtFractionalIntensity)
 {
     TimeManager time;
@@ -112,9 +105,7 @@ TEST(WeatherDirector, RetargetIsContinuousAtFractionalIntensity)
     EXPECT_NEAR(time.GetStarVisibility(), starsBefore, 1e-4f);
 }
 
-// Fog hold: Fog -> Clear holds the outgoing fogAlphaMultiplier through the
-// transition, then decays it toward the destination over the decay window
-// instead of snapping at completion.
+// Fog -> Clear holds fogAlphaMultiplier through the blend, then decays it after completion.
 TEST(WeatherDirector, FogHoldThenDecay)
 {
     TimeManager time;
@@ -134,15 +125,12 @@ TEST(WeatherDirector, FogHoldThenDecay)
     EXPECT_LT(justAfter, 1.0f);    // not snapped to Clear's 1.0
     EXPECT_GE(justAfter, fogMul);  // decaying upward from the held value
 
-    // After the full decay window the effective def reverts to passthrough.
     StepFrames(director, time, static_cast<int>(19.0f * 60.0f));
     EXPECT_FLOAT_EQ(time.GetEffectiveWeatherDefinition().fogAlphaMultiplier, 1.0f);
     EXPECT_FALSE(time.HasWeatherBlend());
 }
 
-// Retargeting during the post-transition fog-decay window must not snap the
-// published fog multiplier: the new transition's from-endpoint seeds from the
-// current decaying value, not the table's.
+// retarget during decay must capture the published fog multiplier to avoid a jump.
 TEST(WeatherDirector, RetargetDuringFogDecayKeepsFogContinuity)
 {
     TimeManager time;
@@ -163,7 +151,6 @@ TEST(WeatherDirector, RetargetDuringFogDecayKeepsFogContinuity)
     EXPECT_NEAR(afterRetarget, decaying, 0.02f) << "fog multiplier snapped on retarget";
 }
 
-// Reset clears everything mid-transition (world-load path).
 TEST(WeatherDirector, ResetClearsTransitionAndBlend)
 {
     TimeManager time;
@@ -177,13 +164,11 @@ TEST(WeatherDirector, ResetClearsTransitionAndBlend)
 
     EXPECT_FALSE(director.IsTransitioning());
     EXPECT_FALSE(time.HasWeatherBlend());
-    // The hard-set destination remains (Reset clears choreography, not state).
+
     EXPECT_EQ(time.GetWeather(), WeatherState::Thunderstorm);
 }
 
-// Reset restores calm wind defaults: Title pushes the director's wind
-// unconditionally without ever updating it, so stale gust values would
-// freeze into the title backdrop after quit-to-title.
+// the title path publishes wind without updating the director; reset must clear stale gusts.
 TEST(WeatherDirector, ResetRestoresCalmWindDefaults)
 {
     TimeManager time;
@@ -202,9 +187,7 @@ TEST(WeatherDirector, ResetRestoresCalmWindDefaults)
         1e-4f);
 }
 
-// Wind: strength tracks the effective def's windIntensity through the gust
-// envelope (bounded by the gust amplitude), advances with the clock, and is
-// deterministic for the same day/clock.
+// wind scales the effective definition by a time-varying, deterministic gust envelope.
 TEST(WeatherDirector, WindTracksEffectiveBaseThroughGusts)
 {
     TimeManager time;
@@ -212,7 +195,6 @@ TEST(WeatherDirector, WindTracksEffectiveBaseThroughGusts)
     WeatherDirector director;
     director.SetEnabled(true);
 
-    // Defaults before any Update: base direction, 0.5 strength.
     EXPECT_NEAR(glm::length(director.GetWindDirection()), 1.0f, 1e-4f);
     EXPECT_FLOAT_EQ(director.GetWindStrength(), 0.5f);
 
@@ -222,7 +204,6 @@ TEST(WeatherDirector, WindTracksEffectiveBaseThroughGusts)
     EXPECT_GE(director.GetWindStrength(), base * (1.0f - ambience::WEATHER_GUST_AMP) - 1e-3f);
     EXPECT_LE(director.GetWindStrength(), base * (1.0f + ambience::WEATHER_GUST_AMP) + 1e-3f);
 
-    // The envelope actually moves over time (not a constant).
     float s0 = director.GetWindStrength();
     StepFrames(director, time, 120);  // 2 s
     float s1 = director.GetWindStrength();
@@ -231,8 +212,6 @@ TEST(WeatherDirector, WindTracksEffectiveBaseThroughGusts)
     EXPECT_TRUE(s0 != s1 || s1 != s2) << "gust envelope is flat";
 }
 
-// Wind strength is continuous across a transition boundary (base blends
-// through the effective def; the envelope phase never resets).
 TEST(WeatherDirector, WindContinuousAcrossTransition)
 {
     TimeManager time;
@@ -252,8 +231,7 @@ TEST(WeatherDirector, WindContinuousAcrossTransition)
     }
 }
 
-// SpawnStreams: null outgoing when idle; both endpoints + eased weight while
-// transitioning; pointers must be stable storage (member/table).
+// stream pointers must refer to stable member or table storage throughout a transition.
 TEST(WeatherDirector, SpawnStreamsExposeTransitionEndpoints)
 {
     TimeManager time;
@@ -280,8 +258,7 @@ TEST(WeatherDirector, SpawnStreamsExposeTransitionEndpoints)
 
 namespace
 {
-// Step the director with the TimeManager clock ALSO advancing (dt real
-// seconds -> dt game hours at the 24 s day).
+
 void StepWithClock(WeatherDirector& d, TimeManager& t, int frames, float dt = 1.0f / 60.0f)
 {
     for (int i = 0; i < frames; ++i)
@@ -292,16 +269,13 @@ void StepWithClock(WeatherDirector& d, TimeManager& t, int frames, float dt = 1.
 }
 }  // namespace
 
-// Autonomy: with auto on, crossing a front boundary changes the weather via
-// a transition, without any console input.
 TEST(WeatherDirector, ForecastChangesWeatherAcrossFrontBoundary)
 {
     TimeManager time;
     time.Initialize();
     WeatherDirector director;
     director.SetEnabled(true);
-    // Pick a seed whose day-6 front differs from Clear (search a few seeds so
-    // the test is robust to pool weights).
+    // find a seed with a non-Clear day-6 front so the test survives pool-weight changes.
     uint64_t seed = 1;
     for (; seed < 200; ++seed)
     {
@@ -315,7 +289,6 @@ TEST(WeatherDirector, ForecastChangesWeatherAcrossFrontBoundary)
     ASSERT_LT(seed, 200u) << "no suitable seed found (pool weights changed?)";
     director.SetForecastSeed(seed);
 
-    // Jump to day 6 noon; reconciliation should request day 6's front.
     time.SetTime(12.0f);
     time.AdvanceTime(24.0f * 6.0f);
     director.Update(1.0f / 60.0f, time);
@@ -324,8 +297,7 @@ TEST(WeatherDirector, ForecastChangesWeatherAcrossFrontBoundary)
     EXPECT_TRUE(director.IsTransitioning());
 }
 
-// Manual hold: a console request suspends the forecast for the rest of the
-// current front; the next front boundary revives it.
+// manual weather holds through the current front; the next front resumes the forecast.
 TEST(WeatherDirector, ManualOverrideHoldsUntilNextFront)
 {
     TimeManager time;
@@ -341,8 +313,6 @@ TEST(WeatherDirector, ManualOverrideHoldsUntilNextFront)
     StepWithClock(director, time, 60);                             // ~1 game hour
     EXPECT_EQ(time.GetWeather(), WeatherState::Sandstorm) << "forecast stomped the manual hold";
 
-    // Advance past the front-0 boundary (fronts are <= 6 days): the hold
-    // clears and reconciliation takes over again.
     time.AdvanceTime(24.0f * 7.0f);
     director.Update(1.0f / 60.0f, time);
     director.Update(1.0f / 60.0f, time);
@@ -350,7 +320,6 @@ TEST(WeatherDirector, ManualOverrideHoldsUntilNextFront)
         << "hold never expired (forecast did not resume)";
 }
 
-// Sticky manual: auto off means the forecast never fires; auto on revives it.
 TEST(WeatherDirector, AutoWeatherToggle)
 {
     TimeManager time;
@@ -367,14 +336,13 @@ TEST(WeatherDirector, AutoWeatherToggle)
 
     director.SetAutoWeather(true);
     director.Update(1.0f / 60.0f, time);
-    // Day 10 may or may not be Clear for this seed; assert reconciliation
-    // RAN by checking the target equals the forecast either way.
+    // compare with the forecast even if day 10 is Clear, so unchanged weather does not hide a
+    // missed update.
     const int64_t day = 10;
     EXPECT_EQ(time.GetWeather(), ForecastForDay(7, day).front);
 }
 
-// Event windows: an event night engages at 20:00 with the event transition
-// duration and yields back to the front by 05:00.
+// night events engage at 20:00 and yield to the front by 05:00.
 TEST(WeatherDirector, EventNightEngagesAndReleases)
 {
     TimeManager time;
@@ -406,8 +374,6 @@ TEST(WeatherDirector, EventNightEngagesAndReleases)
     time.AdvanceTime(24.0f * static_cast<float>(day));
     director.Update(1.0f / 60.0f, time);  // settle pre-event front
 
-    // Step until the clock is inside the event window (past 20:30 for margin):
-    // the event weather must be engaged.
     while (time.GetTimeOfDay() < 20.5f && time.GetTimeOfDay() >= 5.0f)
     {
         time.Update(1.0f / 60.0f);
@@ -415,7 +381,6 @@ TEST(WeatherDirector, EventNightEngagesAndReleases)
     }
     EXPECT_EQ(time.GetWeather(), e.nightEvent) << "event night never engaged";
 
-    // Cross dawn: by 06:00 next day the event has released back to a front.
     while (time.GetTimeOfDay() < 6.0f || time.GetTimeOfDay() >= 20.0f)
     {
         time.Update(1.0f / 60.0f);
@@ -424,8 +389,7 @@ TEST(WeatherDirector, EventNightEngagesAndReleases)
     EXPECT_NE(time.GetWeather(), e.nightEvent) << "event never released at dawn";
 }
 
-// Handoff (a) regression: gust phases are session-constant - wind strength
-// stays continuous across a day rollover (the old per-day phases stepped).
+// session-constant gust phases keep wind continuous across day rollover.
 TEST(WeatherDirector, GustsContinuousAcrossDayRollover)
 {
     TimeManager time;
@@ -449,8 +413,6 @@ TEST(WeatherDirector, GustsContinuousAcrossDayRollover)
     }
 }
 
-// Handoff (c) regression: GetTransition never reports a stale pair after a
-// hard cut.
 TEST(WeatherDirector, GetTransitionFreshAfterHardCut)
 {
     TimeManager time;
