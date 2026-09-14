@@ -1,7 +1,4 @@
-// Tests for the weather.overlay console command, which sets/clears the
-// manual sky overlay weather on TimeManager (Task 4 of the weather-overlay
-// plan). Mirrors the CommandContext construction boilerplate used throughout
-// tests/ConsoleCommandsTests.cpp - no GLFW/renderer involvement.
+// manual sky-overlay commands must leave the base weather channel independent.
 
 #include <gtest/gtest.h>
 
@@ -16,8 +13,7 @@
 
 namespace
 {
-// Build a span<string_view> from string literals, keeping the underlying
-// strings alive in `storage` so the views remain valid for the call.
+// storage keeps the argument strings alive for the span.
 struct ArgPack
 {
     std::vector<std::string> storage;
